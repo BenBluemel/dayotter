@@ -17,7 +17,7 @@ export interface AppointmentQuoteRequest {
  * Shared server quote boundary for public/API/staff callers. Only booking intent
  * enters; all service amounts and promotion rules are read here. Callers must
  * authorize organization access before invoking this internal service.
- * Not yet wired into checkout or existing booking routes.
+ * Appointment cash checkout saves this quote before requesting Stripe.
  */
 export async function quoteAppointmentPrice(
   input: AppointmentQuoteRequest,

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { consumeCredit } from "@/lib/packages/credits";
 import { env } from "@/lib/server/env";
-import { logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
+import { type AppointmentPrice, logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
 import { and, eq, getDb, gte, inArray, lt, schema, sql } from "@dayotter/db";
 import { bookingRequested, newBookingRequest, sendEmail } from "@dayotter/emails";
 import { DateTime } from "luxon";
+import { canonicalJson, decodeAttempt } from "../payments/attempt-terms";
 import {
   SLOT_REVALIDATION_WINDOW_MS,
   combineHostSlots,
@@ -19,6 +20,7 @@ import {
 } from "./booking-logic";
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
+import { persistBookingPricingSnapshot } from "./pricing";
 
 export { BookingError } from "./booking-logic";
 
@@ -155,6 +157,10 @@ export interface CreateBookingInput {
   /** Redeem one prepaid package credit for the attendee instead of charging.
    * Consumed atomically inside the booking transaction (restored on rollback). */
   redeemCredit?: boolean;
+  /** Internal server-owned frozen terms; never accepted from public HTTP input. */
+  pricingQuote?: AppointmentPrice;
+  paymentAttemptId?: string;
+  quotedDurationMinutes?: number;
 }
 
 export async function createBooking(
@@ -189,15 +195,45 @@ export async function createBooking(
 
   validateResponses(eventType.questions, input.responses);
 
+  if (input.paymentAttemptId && (!input.payment || !input.pricingQuote)) {
+    throw new BookingError("A durable payment requires its saved pricing terms", 409);
+  }
+  const quote = input.pricingQuote;
+  if (
+    quote &&
+    (quote.organizationId !== eventType.organizationId ||
+      quote.eventTypeId !== eventType.id ||
+      quote.appointmentStartsAt !== new Date(input.start).toISOString() ||
+      quote.settlement !== "cash" ||
+      input.redeemCredit ||
+      (input.payment
+        ? input.payment.amountPaid !== quote.amountToCollect ||
+          input.payment.currency !== quote.currency
+        : quote.amountToCollect !== 0))
+  ) {
+    throw new BookingError("Booking settlement does not match its saved quote", 409);
+  }
+  if (
+    quote &&
+    quote.basePrice > 0 &&
+    (eventType.recurringCount ?? 1) > 1 &&
+    ((eventType.maxAttendees ?? 1) <= 1 || !eventType.ownerId)
+  ) {
+    throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+  }
   const start = new Date(input.start);
   if (Number.isNaN(start.getTime())) throw new BookingError("Invalid start time", 400);
 
   // Multiple durations: honor the booker's chosen length only if the event type
   // allows it; otherwise fall back to the default duration.
+  if (input.quotedDurationMinutes && !isAllowedDuration(eventType, input.quotedDurationMinutes)) {
+    throw new BookingError("The quoted appointment duration is no longer supported", 409);
+  }
   const duration =
-    input.durationMinutes && isAllowedDuration(eventType, input.durationMinutes)
+    input.quotedDurationMinutes ??
+    (input.durationMinutes && isAllowedDuration(eventType, input.durationMinutes)
       ? input.durationMinutes
-      : eventType.durationMinutes;
+      : eventType.durationMinutes);
   const end = new Date(start.getTime() + duration * 60_000);
 
   // Group event: many bookers share one slot (capacity = maxAttendees). Only
@@ -276,6 +312,29 @@ export async function createBooking(
   let booking: typeof schema.bookings.$inferSelect;
   try {
     booking = await db.transaction(async (tx) => {
+      if (input.paymentAttemptId) {
+        const [attempt] = await tx
+          .select()
+          .from(schema.paymentAttempts)
+          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId))
+          .for("update");
+        if (!attempt || attempt.bookingId || !["prepared", "open"].includes(attempt.state)) {
+          throw new BookingError("Payment attempt is not available for booking", 409);
+        }
+        const saved = decodeAttempt(attempt);
+        const { payment, pricingQuote, paymentAttemptId, quotedDurationMinutes, ...bookingInput } =
+          input;
+        if (
+          !attempt.checkoutSessionId ||
+          attempt.paymentIntentId !== payment?.paymentIntentId ||
+          canonicalJson(saved.input) !== canonicalJson(bookingInput) ||
+          canonicalJson(saved.quote) !== canonicalJson(pricingQuote) ||
+          saved.resolvedDurationMinutes !== quotedDurationMinutes ||
+          attempt.destinationAccountId !== (payment?.destinationAccountId ?? null)
+        ) {
+          throw new BookingError("Payment attempt does not match booking settlement", 409);
+        }
+      }
       // Serialize all cap-relevant bookings for this host within the host-local
       // ISO week. The daily/weekly/focus checks below are count-then-insert, and
       // the unique/no-overlap indexes only stop same-slot collisions - so without
@@ -494,14 +553,40 @@ export async function createBooking(
           responses: input.responses,
           uid,
           recurrenceUid,
-          paymentStatus: input.payment || input.redeemCredit ? "paid" : "none",
-          paymentIntentId: input.payment?.paymentIntentId,
-          amountPaid: input.payment?.amountPaid,
-          paymentCurrency: input.payment?.currency,
-          destinationAccountId: input.payment?.destinationAccountId,
+          paymentStatus:
+            !input.pricingQuote && (input.payment || input.redeemCredit) ? "paid" : "none",
+          paymentIntentId: input.pricingQuote ? undefined : input.payment?.paymentIntentId,
+          amountPaid: input.pricingQuote ? undefined : input.payment?.amountPaid,
+          paymentCurrency: input.pricingQuote ? undefined : input.payment?.currency,
+          destinationAccountId: input.pricingQuote
+            ? undefined
+            : input.payment?.destinationAccountId,
         })
         .returning();
       if (!row) throw new BookingError("Failed to create booking", 500);
+      if (input.pricingQuote) {
+        await persistBookingPricingSnapshot(row.id, input.pricingQuote, tx);
+        if (input.payment) {
+          const [settled] = await tx
+            .update(schema.bookings)
+            .set({
+              paymentStatus: "paid",
+              paymentIntentId: input.payment.paymentIntentId,
+              amountPaid: input.payment.amountPaid,
+              paymentCurrency: input.payment.currency,
+              destinationAccountId: input.payment.destinationAccountId,
+            })
+            .where(eq(schema.bookings.id, row.id))
+            .returning();
+          Object.assign(row, settled);
+        }
+      }
+      if (input.paymentAttemptId) {
+        await tx
+          .update(schema.paymentAttempts)
+          .set({ state: "fulfilled", bookingId: row.id })
+          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId));
+      }
 
       await tx.insert(schema.bookingAttendees).values([
         {

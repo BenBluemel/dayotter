@@ -3,8 +3,13 @@ import { logger } from "@dayotter/core";
 import Stripe from "stripe";
 import { env } from "../server/env";
 import {
-  type PaymentRoute, type StripeContext, PaymentRoutingError,
-  assertCheckoutRoute, assertStripeKeyEnvironment, paymentRoutingConfig, refundRoutingParameters,
+  type PaymentRoute,
+  PaymentRoutingError,
+  type StripeContext,
+  assertCheckoutRoute,
+  assertStripeKeyEnvironment,
+  paymentRoutingConfig,
+  refundRoutingParameters,
 } from "./routing";
 
 /**
@@ -39,7 +44,8 @@ function stripe(): Stripe {
 }
 
 async function stripeForContext(context: StripeContext): Promise<Stripe> {
-  if (context.credentialContext !== "primary") throw new PaymentRoutingError("Unknown Stripe credential context");
+  if (context.credentialContext !== "primary")
+    throw new PaymentRoutingError("Unknown Stripe credential context");
   if (context.environment === "live" && env.NODE_ENV !== "production") {
     throw new PaymentRoutingError("Live Stripe operations require a production runtime");
   }
@@ -48,10 +54,14 @@ async function stripeForContext(context: StripeContext): Promise<Stripe> {
   // Authentication/permission errors can contain credential details. Expose only
   // a safe routing error to callers, which may log or return the error message.
   const account = await gateway.accounts.retrieve().catch(() => {
-    throw new PaymentRoutingError("Unable to verify the Stripe charge account; check account-read access");
+    throw new PaymentRoutingError(
+      "Unable to verify the Stripe charge account; check account-read access",
+    );
   });
   if (account.id !== context.chargeAccountId) {
-    throw new PaymentRoutingError("Stripe credentials do not belong to the expected charge account");
+    throw new PaymentRoutingError(
+      "Stripe credentials do not belong to the expected charge account",
+    );
   }
   return gateway;
 }
@@ -59,8 +69,10 @@ async function stripeForContext(context: StripeContext): Promise<Stripe> {
 async function connectStripe(target?: { accountId: string }): Promise<Stripe> {
   const config = paymentRoutingConfig(env);
   if (config.mode !== "connect") throw new PaymentRoutingError("Stripe Connect is disabled");
-  if (target && (!/^acct_[A-Za-z0-9]+$/.test(target.accountId)
-    || target.accountId === config.chargeAccountId)) {
+  if (
+    target &&
+    (!/^acct_[A-Za-z0-9]+$/.test(target.accountId) || target.accountId === config.chargeAccountId)
+  ) {
     throw new PaymentRoutingError("A separate valid Stripe Connect account is required");
   }
   return stripeForContext(config);
@@ -77,12 +89,16 @@ export interface CheckoutParams {
   metadata: Record<string, string>;
   /** Resolved on the server from service organization and deployment configuration. */
   route: PaymentRoute;
+  /** Durable appointment attempts freeze these before the first external request. */
+  idempotencyKey?: string;
+  expiresAt?: number;
+  clientReferenceId?: string;
 }
 
 /** Create a one-off Checkout Session and return its hosted URL + id. */
 export async function createCheckoutSession(
   params: CheckoutParams,
-): Promise<{ id: string; url: string }> {
+): Promise<{ id: string; url: string; session: Stripe.Checkout.Session }> {
   const route = params.route;
   assertCheckoutRoute(route, paymentRoutingConfig(env), params.amount);
   const gateway = await stripeForContext(route);
@@ -93,47 +109,61 @@ export async function createCheckoutSession(
     }
   }
   // Reserved routing metadata comes from the route, including removal of stale dest.
-  const businessMetadata = { ...params.metadata };
-  delete businessMetadata.dest;
+  const businessMetadata = Object.fromEntries(
+    Object.entries(params.metadata).filter(([key]) => key !== "dest"),
+  );
   const metadata = {
-    ...businessMetadata, paymentMode: route.mode, organizationId: route.organizationId,
-    chargeAccountId: route.chargeAccountId, paymentEnvironment: route.environment,
+    ...businessMetadata,
+    paymentMode: route.mode,
+    organizationId: route.organizationId,
+    chargeAccountId: route.chargeAccountId,
+    paymentEnvironment: route.environment,
     credentialContext: route.credentialContext,
     ...(route.mode === "connect" ? { dest: route.destinationAccountId } : {}),
   };
-  const session = await gateway.checkout.sessions.create({
-    mode: "payment",
-    line_items: [
-      {
-        quantity: 1,
-        price_data: {
-          currency: params.currency,
-          unit_amount: params.amount,
-          product_data: { name: params.productName },
+  const session = await gateway.checkout.sessions.create(
+    {
+      mode: "payment",
+      ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
+      ...(params.clientReferenceId ? { client_reference_id: params.clientReferenceId } : {}),
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: params.currency,
+            unit_amount: params.amount,
+            product_data: { name: params.productName },
+          },
         },
-      },
-    ],
-    success_url: params.successUrl,
-    cancel_url: params.cancelUrl,
-    customer_email: params.customerEmail,
-    metadata,
-    payment_intent_data: {
+      ],
+      success_url: params.successUrl,
+      cancel_url: params.cancelUrl,
+      customer_email: params.customerEmail,
       metadata,
-      // Destination charge: money lands on the host's connected account; the
-      // platform keeps `application_fee_amount`. Refunds reverse both.
-      ...(route.mode === "connect"
-        ? {
-            transfer_data: { destination: route.destinationAccountId },
-            ...(route.applicationFeeAmount > 0 ? { application_fee_amount: route.applicationFeeAmount } : {}),
-          }
-        : {}),
+      payment_intent_data: {
+        metadata,
+        // Destination charge: money lands on the host's connected account; the
+        // platform keeps `application_fee_amount`. Refunds reverse both.
+        ...(route.mode === "connect"
+          ? {
+              transfer_data: { destination: route.destinationAccountId },
+              ...(route.applicationFeeAmount > 0
+                ? { application_fee_amount: route.applicationFeeAmount }
+                : {}),
+            }
+          : {}),
+      },
     },
-  });
-  return { id: session.id, url: session.url ?? "" };
+    params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : undefined,
+  );
+  return { id: session.id, url: session.url ?? "", session };
 }
 
 /** Historical route context is independent of the mode accepting new sales. */
-export async function retrieveSession(id: string, route?: PaymentRoute): Promise<Stripe.Checkout.Session> {
+export async function retrieveSession(
+  id: string,
+  route?: PaymentRoute,
+): Promise<Stripe.Checkout.Session> {
   const gateway = route ? await stripeForContext(route) : stripe();
   return gateway.checkout.sessions.retrieve(id);
 }
@@ -147,9 +177,12 @@ export async function refundPayment(
 ): Promise<boolean> {
   try {
     const gateway = typeof routing === "boolean" ? stripe() : await stripeForContext(routing);
-    const parameters = typeof routing === "boolean"
-      ? (routing ? { reverse_transfer: true, refund_application_fee: true } : {})
-      : refundRoutingParameters(routing);
+    const parameters =
+      typeof routing === "boolean"
+        ? routing
+          ? { reverse_transfer: true, refund_application_fee: true }
+          : {}
+        : refundRoutingParameters(routing);
     await gateway.refunds.create({
       payment_intent: paymentIntentId,
       ...parameters,
@@ -168,7 +201,9 @@ export function constructWebhookEvent(payload: string, signature: string): Strip
   const environment = primaryStripeEnvironment();
   const event = stripe().webhooks.constructEvent(payload, signature, secret);
   if (event.livemode !== (environment === "live")) {
-    throw new PaymentRoutingError("Stripe webhook environment does not match the configured credentials");
+    throw new PaymentRoutingError(
+      "Stripe webhook environment does not match the configured credentials",
+    );
   }
   return event;
 }
@@ -344,7 +379,9 @@ export interface CurrencyBalance {
  *  A host taking payments in multiple currencies has a bucket for each - we must
  *  not collapse to `available[0]` or other-currency funds get stranded. */
 export async function connectedBalances(accountId: string): Promise<CurrencyBalance[]> {
-  const bal = await (await connectStripe({ accountId })).balance.retrieve({ stripeAccount: accountId });
+  const bal = await (await connectStripe({ accountId })).balance.retrieve({
+    stripeAccount: accountId,
+  });
   const byCurrency = new Map<string, CurrencyBalance>();
   for (const a of bal.available) {
     const e = byCurrency.get(a.currency) ?? { currency: a.currency, available: 0, pending: 0 };

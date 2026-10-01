@@ -4,7 +4,8 @@ import { and, eq, getDb, gte, ne, schema } from "@dayotter/db";
 import { bookingCancellation, sendEmail } from "@dayotter/emails";
 import { deleteBookingFromCalendar } from "../calendar/host-calendar";
 import { restoreCredit } from "../packages/credits";
-import { stripeConfigured, refundPayment } from "../payments/stripe";
+import { originalBookingRefundRoute } from "../payments/booking-routing";
+import { refundPayment, stripeConfigured } from "../payments/stripe";
 import { fanOutBookingLifecycle } from "./lifecycle";
 import { clearBookingReminders } from "./reminders";
 
@@ -35,7 +36,21 @@ export async function cancelBooking(uid: string, reason?: string): Promise<boole
   if (stripeConfigured && booking.paymentStatus === "paid" && booking.paymentIntentId) {
     // Destination charge: reverse the transfer so the host's balance is debited
     // too, otherwise the platform eats the refund while the host keeps the funds.
-    refunded = await refundPayment(booking.paymentIntentId, Boolean(booking.destinationAccountId));
+    try {
+      const attempt = await db.query.paymentAttempts.findFirst({
+        where: eq(schema.paymentAttempts.bookingId, booking.id),
+      });
+      refunded = await refundPayment(
+        booking.paymentIntentId,
+        originalBookingRefundRoute(booking, attempt),
+      );
+    } catch {
+      // Failed lookup/binding must not fall back to guessing new payment topology.
+      logger.error("cancelled booking requires payment reconciliation", {
+        event: "cancel_payment_context_failed",
+        bookingId: booking.id,
+      });
+    }
     if (refunded) {
       logger.info("booking payment refunded on cancel", {
         event: "booking_refunded",

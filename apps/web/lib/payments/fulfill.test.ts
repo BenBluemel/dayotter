@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   refund: vi.fn(),
   lookup: vi.fn(),
+  attempt: vi.fn(),
 }));
 vi.mock("./stripe", () => ({ retrieveSession: mocks.retrieve, refundPayment: mocks.refund }));
 vi.mock("./pending", () => ({ claimPendingBooking: mocks.claim }));
@@ -16,14 +17,20 @@ vi.mock("../booking/create-booking", async () => ({
 }));
 vi.mock("@dayotter/db", () => ({
   eq: vi.fn(),
-  schema: { bookings: { paymentIntentId: "payment_intent_id" } },
-  getDb: () => ({ query: { bookings: { findFirst: mocks.lookup } } }),
+  schema: {
+    bookings: { paymentIntentId: "payment_intent_id" },
+    paymentAttempts: { checkoutSessionId: "checkout_session_id", id: "id" },
+  },
+  getDb: () => ({
+    query: { bookings: { findFirst: mocks.lookup }, paymentAttempts: { findFirst: mocks.attempt } },
+  }),
 }));
 import { fulfillCheckout } from "./fulfill";
 
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.lookup.mockResolvedValue(undefined);
+  mocks.attempt.mockResolvedValue(undefined);
   mocks.claim.mockResolvedValue({ eventTypeId: "event", start: "2026-10-15T10:00:00Z" });
   mocks.refund.mockResolvedValue(true);
 });

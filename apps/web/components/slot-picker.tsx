@@ -11,10 +11,11 @@ import { track } from "@/lib/analytics";
 import type { BookingQuestionInput } from "@/lib/booking/event-type-input";
 import { type Locale, t } from "@/lib/i18n/booking";
 import { useBookingLocale } from "@/lib/i18n/use-locale";
+import { canonicalJson } from "@/lib/payments/canonical-json";
 import { ArrowLeft, Check, Lock, Users } from "lucide-react";
 import { DateTime } from "luxon";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 export function SlotPicker({
   eventTypeId,
@@ -63,6 +64,7 @@ export function SlotPicker({
   const [answers, setAnswers] = useState<Record<string, string | boolean>>({});
   const [captchaToken, setCaptchaToken] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const checkoutOperation = useRef<{ input: string; id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Collective member-selection: everyone selected by default. Never empties
   // below one (unselecting the last host is a no-op).
@@ -110,26 +112,72 @@ export function SlotPicker({
 
     setSubmitting(true);
     setError(null);
-    const res = await fetch("/api/book", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        eventTypeId,
-        start: selected.start,
-        attendee: { name, email, timezone: zone },
-        guests: guests.length ? guests : undefined,
-        selectedHostIds: teamHosts.length ? selectedHostIds : undefined,
-        notes: notes || undefined,
-        responses: questions.length ? answers : undefined,
-        durationMinutes: hasDurations ? duration : undefined,
-        location: locations.length > 1 ? chosenLocation : undefined,
-        captchaToken: captchaToken || undefined,
-        linkToken: linkToken || undefined,
-        accessCode: accessCode || undefined,
-        returnPath: typeof window !== "undefined" ? window.location.pathname : undefined,
-      }),
-    });
+    const intent = {
+      eventTypeId,
+      start: selected.start,
+      attendee: { name, email, timezone: zone },
+      guests: guests.length ? guests : undefined,
+      selectedHostIds: teamHosts.length ? selectedHostIds : undefined,
+      notes: notes || undefined,
+      responses: questions.length ? answers : undefined,
+      durationMinutes: hasDurations ? duration : undefined,
+      location: locations.length > 1 ? chosenLocation : undefined,
+      linkToken: linkToken || undefined,
+      accessCode: accessCode || undefined,
+      returnPath: typeof window !== "undefined" ? window.location.pathname : undefined,
+    };
+    const encoded = new TextEncoder().encode(canonicalJson(intent));
+    const identity = Array.from(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", encoded)),
+      (b) => b.toString(16).padStart(2, "0"),
+    ).join("");
+    const storageKey = `dayotter:appointment-checkout:${eventTypeId}`;
+    if (!checkoutOperation.current) {
+      try {
+        const prior = JSON.parse(sessionStorage.getItem(storageKey) ?? "null") as {
+          input: string;
+          id: string;
+        } | null;
+        if (prior?.input === identity && typeof prior.id === "string")
+          checkoutOperation.current = prior;
+      } catch {
+        /* Storage is optional; the in-memory identity still handles request retries. */
+      }
+    }
+    if (checkoutOperation.current?.input !== identity) {
+      checkoutOperation.current = { input: identity, id: crypto.randomUUID() };
+      try {
+        sessionStorage.setItem(storageKey, JSON.stringify(checkoutOperation.current));
+      } catch {
+        /* Optional. */
+      }
+    }
+    let res: Response;
+    try {
+      res = await fetch("/api/book", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...intent,
+          checkoutRequestId: checkoutOperation.current.id,
+          captchaToken: captchaToken || undefined,
+        }),
+      });
+    } catch {
+      setSubmitting(false);
+      setError(t(locale, "bookingFailed"));
+      return;
+    }
     if (!res.ok) {
+      // Only a verified expired Checkout returns 410. The next submit is a new operation.
+      if (res.status === 410) {
+        checkoutOperation.current = null;
+        try {
+          sessionStorage.removeItem(storageKey);
+        } catch {
+          /* Optional. */
+        }
+      }
       const data = await res.json().catch(() => ({}));
       setSubmitting(false);
       track("Booking Failed", { eventTypeId, status: res.status });
@@ -449,6 +497,7 @@ function AccessGate({
 }) {
   const [code, setCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const checkoutOperation = useRef<{ input: string; id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {

@@ -6,9 +6,9 @@ export interface StripeContext {
 }
 
 export type PaymentRoute = StripeContext & { organizationId: string } & (
-  | { mode: "direct" }
-  | { mode: "connect"; destinationAccountId: string; applicationFeeAmount: number }
-);
+    | { mode: "direct" }
+    | { mode: "connect"; destinationAccountId: string; applicationFeeAmount: number }
+  );
 
 export type PaymentRoutingConfig =
   | { mode: "disabled" }
@@ -16,7 +16,10 @@ export type PaymentRoutingConfig =
   | (StripeContext & { mode: "connect"; platformFeePercent: number });
 
 export class PaymentRoutingError extends Error {
-  constructor(message: string, public readonly status = 503) {
+  constructor(
+    message: string,
+    public readonly status = 503,
+  ) {
     super(message);
     this.name = "PaymentRoutingError";
   }
@@ -68,7 +71,7 @@ export function paymentRoutingConfig(input: RoutingEnvironment): PaymentRoutingC
   if (!chargeAccountId || !/^acct_[A-Za-z0-9]+$/.test(chargeAccountId)) {
     throw new PaymentRoutingError("Stripe sales require an explicit STRIPE_ACCOUNT_ID");
   }
-  const context = { chargeAccountId, environment, credentialContext: "primary" as const };
+  const context: StripeContext = { chargeAccountId, environment, credentialContext: "primary" };
   if (mode === "direct") {
     const organizationId = input.STRIPE_DIRECT_ORGANIZATION_ID;
     if (!organizationId || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(organizationId)) {
@@ -97,45 +100,72 @@ export function resolvePaymentRoute(
     throw new PaymentRoutingError("Checkout requires a positive integer cash amount", 400);
   }
   if (config.mode === "disabled") throw new PaymentRoutingError("Cash checkout is disabled");
-  if (!input.organizationId) throw new PaymentRoutingError("Checkout organization is required", 403);
+  if (!input.organizationId)
+    throw new PaymentRoutingError("Checkout organization is required", 403);
   if (config.mode === "direct") {
     if (input.organizationId !== config.organizationId) {
-      throw new PaymentRoutingError("This organization cannot sell through the configured merchant", 403);
+      throw new PaymentRoutingError(
+        "This organization cannot sell through the configured merchant",
+        403,
+      );
     }
     // Do not spread input or destination state: stale Connect fields are ignored.
     return {
-      mode: "direct", organizationId: config.organizationId,
-      chargeAccountId: config.chargeAccountId, environment: config.environment,
+      mode: "direct",
+      organizationId: config.organizationId,
+      chargeAccountId: config.chargeAccountId,
+      environment: config.environment,
       credentialContext: config.credentialContext,
     };
   }
   const destination = input.destination;
-  if (!destination || !/^acct_[A-Za-z0-9]+$/.test(destination.accountId)
-    || destination.accountId === config.chargeAccountId
-    || !destination.chargesEnabled || !destination.transfersEnabled) {
+  if (
+    !destination ||
+    !/^acct_[A-Za-z0-9]+$/.test(destination.accountId) ||
+    destination.accountId === config.chargeAccountId ||
+    !destination.chargesEnabled ||
+    !destination.transfersEnabled
+  ) {
     throw new PaymentRoutingError("A ready Stripe Connect destination is required");
   }
   return {
-    mode: "connect", organizationId: input.organizationId,
-    chargeAccountId: config.chargeAccountId, environment: config.environment,
+    mode: "connect",
+    organizationId: input.organizationId,
+    chargeAccountId: config.chargeAccountId,
+    environment: config.environment,
     credentialContext: config.credentialContext,
     destinationAccountId: destination.accountId,
-    applicationFeeAmount: Math.round(input.amount * config.platformFeePercent / 100),
+    applicationFeeAmount: Math.round((input.amount * config.platformFeePercent) / 100),
   };
 }
 
 /** Recheck a new-sale route at the gateway; historical operations never use this check. */
-export function assertCheckoutRoute(route: PaymentRoute, config: PaymentRoutingConfig, amount: number) {
+export function assertCheckoutRoute(
+  route: PaymentRoute,
+  config: PaymentRoutingConfig,
+  amount: number,
+) {
   const expected = resolvePaymentRoute(config, {
-    organizationId: route.organizationId, amount,
-    destination: route.mode === "connect" ? {
-      accountId: route.destinationAccountId, chargesEnabled: true, transfersEnabled: true,
-    } : undefined,
+    organizationId: route.organizationId,
+    amount,
+    destination:
+      route.mode === "connect"
+        ? {
+            accountId: route.destinationAccountId,
+            chargesEnabled: true,
+            transfersEnabled: true,
+          }
+        : undefined,
   });
-  if (route.mode !== expected.mode || route.chargeAccountId !== expected.chargeAccountId
-    || route.environment !== expected.environment || route.credentialContext !== expected.credentialContext
-    || (route.mode === "connect" && expected.mode === "connect"
-      && route.applicationFeeAmount !== expected.applicationFeeAmount)) {
+  if (
+    route.mode !== expected.mode ||
+    route.chargeAccountId !== expected.chargeAccountId ||
+    route.environment !== expected.environment ||
+    route.credentialContext !== expected.credentialContext ||
+    (route.mode === "connect" &&
+      expected.mode === "connect" &&
+      route.applicationFeeAmount !== expected.applicationFeeAmount)
+  ) {
     throw new PaymentRoutingError("Checkout routing no longer matches deployment configuration");
   }
 }
@@ -143,6 +173,9 @@ export function assertCheckoutRoute(route: PaymentRoute, config: PaymentRoutingC
 /** Preserve historical facts; this function deliberately has no deployment mode input. */
 export function refundRoutingParameters(route: PaymentRoute) {
   return route.mode === "connect"
-    ? { reverse_transfer: true, ...(route.applicationFeeAmount > 0 ? { refund_application_fee: true } : {}) }
+    ? {
+        reverse_transfer: true,
+        ...(route.applicationFeeAmount > 0 ? { refund_application_fee: true } : {}),
+      }
     : {};
 }

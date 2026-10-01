@@ -1,14 +1,15 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slice 1 routing/configuration implemented on `feature/payment-routing`,
-validation pending; all later slices remain proposed.**
+Status: **Slice 1 validated; Slice 2 durable appointment checkout implemented on
+`feature/payment-routing`, validation pending. Slices 3–7 remain proposed except
+for the minimal booking transaction handoff needed by Slice 2.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
 This document preserves the code review and Astra High audit. The source map and
 risks below describe that inspection baseline; the Slice 1 section records the
-subsequent routing changes. Durable payment persistence, recovery, and refund
-lifecycle changes have not been implemented.
+subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. Full
+event/finalization recovery and durable refund lifecycle changes remain proposed.
 
 The investigation inspected source and public Stripe documentation. It did not
 run tests, inspect live Stripe accounts or production data, change Stripe
@@ -17,8 +18,9 @@ to the repository root; line numbers describe the inspected working tree and may
 move. Function names identify the relevant boundaries when lines change.
 
 Read this together with [APPOINTMENT-PROMOTIONS.md](APPOINTMENT-PROMOTIONS.md).
-That foundation exists in the inspected working tree, but promotional pricing is
-not yet integrated into checkout or the live booking creation paths.
+Slice 2 uses that authoritative pricing boundary for new appointment cash checkout
+and saves the exact quote to the resulting booking. Deployment configuration has
+not been changed or production payments enabled.
 
 ## Business objective and design decisions
 
@@ -44,7 +46,8 @@ The intended design is:
    ready.
 
 These are intended architecture decisions. Slice 1 implements only explicit
-routing/configuration and capability gates; the remaining guarantees are proposed.
+routing/configuration and capability gates. Slice 2 adds durable appointment
+checkout terms and the minimum booking handoff; broader recovery remains proposed.
 Light & Balance correctness and simplicity take priority over upstream compatibility.
 The recommendation does not require a general accounting system or two copies of
 the payment workflow.
@@ -56,7 +59,11 @@ and is not the target here.
 
 ## Slice 1 implementation: explicit routing and configuration
 
-Implemented in this working branch, with tests added but not yet run. No deployment
+Slice 1 validation reported 41 focused payment tests and 241 web tests passing
+(with 14 PostgreSQL tests skipped), web/mobile typechecks, scoped Biome, and diff
+checks passing. The validator's explicit `StripeContext` annotation and stale-dest
+metadata filtering fixes were incorporated into this tree without its formatting
+churn. Slice 2 changes have not been mechanically validated. No deployment
 configuration, credentials, Stripe accounts, or payout schedules were changed.
 This slice does **not** establish readiness for live payments.
 
@@ -89,7 +96,7 @@ multi-merchant direct-payment facility.
 - `routing.ts`: `PaymentRoute` carries mode, organization, charge account,
   environment, and nonsecret `credentialContext: "primary"`; Connect additionally
   carries destination and the computed application fee. This is suitable for
-  later persistence, but no PaymentAttempt records exist yet.
+  later persistence, but Slice 2 now persists this context in appointment PaymentAttempt records.
 - `connect.ts`, `checkoutRouteForOrganization`: direct avoids host/Connect lookups;
   Connect requires an owner, a valid stored account, and fresh Stripe charge and
   transfer capability state. Unsupported team ownership fails closed.
@@ -103,8 +110,8 @@ multi-merchant direct-payment facility.
   is not a durable attempt or an authorization substitute.
 - `app/api/book/route.ts`, `POST`: positive cash checkout always resolves a route;
   disabled mode cannot fall through to an unpaid booking. Free bookings and the
-  existing package-credit path remain available. Deposit amounts still use
-  `chargeFor`; authoritative promotional quote integration remains Slice 2.
+  existing package-credit path remain available. Slice 2 now uses `quoteAppointmentPrice` and its deposit-after-discount amount
+  for new appointment cash checkout.
 - `app/api/packages/[id]/buy/route.ts`, `POST`: uses the server-loaded service and
   package organization for merchant selection; purchase/grant hardening remains
   deferred.
@@ -121,11 +128,13 @@ context without consulting the current sales mode. Direct refunds omit reversal
 parameters. Connect refunds reverse the original transfer and refund an application
 fee only when the supplied original route records a positive fee. Legacy boolean
 refund callers still use their saved destination presence, independent of current
-mode; they have not been converted into durable refund operations. A signed
+mode; they have not been converted into durable refund operations. Slice 2 cancellation
+looks up an original attempt for new bookings, preserving its actual fee amount;
+only legacy bookings retain the boolean ambiguity. A signed
 webhook's `livemode` must match the configured key environment, even when sales are
 disabled. Signature verification and existing fulfillment otherwise remain intact.
 
-**Historical limitation:** existing records lack full charge-account/credential
+**Historical limitation:** legacy records lack full charge-account/credential
 facts. There is still only one primary credential context, and legacy Session
 retrieval uses that key. Mode changes with the same charge-owning account preserve
 routing behavior; changing accounts/credentials requires retaining access to the
@@ -147,9 +156,9 @@ Focused tests added: `lib/payments/routing.test.ts`, `connect.test.ts`, and
 `stripe.test.ts` (under `apps/web`). They cover configuration, organization binding,
 stale Connect state, missing/invalid/unready destinations, SDK parameters/account
 identity, historical refunds/retrieval across mode changes, and webhook environment
-checks. Execution, web/mobile typechecks, and scoped formatting/lint validation are
-pending. No schema, promotion pricing/snapshots, durable payment attempts, webhook
-recovery, refund lifecycle, or production activation is included.
+checks. Slice 1 validation passed as reported above. Slice 2's new tests and
+changes remain pending validation; webhook recovery, durable refund lifecycle, and
+production activation remain outside both slices.
 
 ### Focused adversarial review of Slice 1
 
@@ -183,27 +192,30 @@ platform-account and two destination-account reads. Permissions and latency shou
 be verified in an isolated test environment before deployment, not against live
 accounts. No network-based credential checks were performed in this review.
 
-Later-slice findings confirmed by actual call sites, left unchanged:
+Findings from the Slice 1 inspection, with the Slice 2 disposition noted:
 
-- `fulfill.ts`, `fulfillCheckout` still consumes Redis input before durable booking
+- For legacy Sessions, `fulfill.ts`, `fulfillCheckout` still consumes Redis input before durable booking
   commit, uses Session destination metadata, and does not validate persisted
   expected amount/account/routing. Added routing metadata is not yet persisted in
-  booking/payment records. See R1/R5 and Slices 2–3.
-- `cancel-booking.ts`, `cancelBooking`, and failed-booking compensation still use
+  booking/payment records. Slice 2 replaces this path for new appointment Sessions
+  with persisted terms and route facts; durable event/finalization recovery remains Slice 3.
+- For legacy payments, `cancel-booking.ts`, `cancelBooking`, and failed-booking compensation still use
   destination-presence booleans; they cannot recover original fee or credential
   identity. Typed zero-fee Connect routes omit fee refunds, while legacy boolean
   calls retain their previous flags. Refund failure/crash recovery remains R2 and
-  Slice 4, including verification of zero-fee legacy behavior.
+  Slice 4, including verification of zero-fee legacy behavior. New appointment
+  attempts supply the original typed route and fee to the existing refund calls.
 - `packages/fulfill.ts`, `fulfillPackagePurchase` still grants from metadata without
   paid-status enforcement or original purchase account facts. R3/R4 and Slice 5
   remain required before package readiness.
-- `app/api/book/route.ts`, `POST`, loads mutable price/active/organization state
+- Before Slice 2, `app/api/book/route.ts`, `POST`, loaded mutable price/active/organization state
   separately from `createBooking`'s later validation. Concurrent service edits
   can change the terms or turn a previously free/inactive branch into a payable
   booking before creation. Route validation prevents wrong-merchant Checkout;
   it does not provide atomic pricing/booking terms. Slice 2 must bind the quote,
   purpose, and settlement decision rather than treating this initial read as an
-  immutable snapshot.
+  immutable snapshot. Slice 2 now binds the quote and cash intent before Stripe;
+  the separate package-credit branch remains outside durable cash-operation identity.
 - Public booking pages still derive displayed cash amounts from `paymentsEnabled`:
   disabled mode hides the amount while the API now rejects positive cash sales.
   Wrong-organization direct bookings may also display a checkout price before the
@@ -213,6 +225,163 @@ Later-slice findings confirmed by actual call sites, left unchanged:
   can break historical processing or move Pro billing into a different account;
   its existing missing-customer retry does not preserve old account ownership.
   Account/credential cutover must retain historical context as described below.
+
+## Slice 2 implementation: durable appointment checkout terms
+
+### Records and coherent pricing
+
+`packages/db/src/schema/payment-attempts.ts`, migration
+`0064_payment_attempts.sql`, and generated Drizzle snapshot/journal add
+`payment_attempts`. This is appointment cash checkout only; packages retain their
+existing purchase path. A record is committed **before** requesting Stripe.
+
+Each attempt stores:
+
+- A stable request key, request-input fingerprint, purpose `appointment`, and
+  organization/service identity.
+- AES-GCM encrypted booking intent (including access code and intake answers),
+  original return path, and resolved duration. The existing `ENCRYPTION_KEY` is
+  required before creating an attempt; credentials are never stored in it.
+- The complete authoritative `AppointmentPrice` JSON: base/effective price,
+  promotion attribution and original rule values/window, appointment start,
+  settlement, currency, and amount to collect after deposit capping. A canonical
+  SHA-256 quote hash binds this copy to Session/PaymentIntent metadata.
+- Explicit cash/paid expectations; original direct/Connect mode, charge account,
+  test/live environment, primary credential context, destination, and original
+  application-fee amount. Direct stores no destination and a zero fee.
+- Immutable product/redirect parameters, creation time, creation-retry deadline,
+  fixed expiration, eventual Session/PaymentIntent identifiers, and booking link.
+
+`apps/web/lib/payments/attempts.ts`, `prepareAppointmentAttempt`, serializes one
+request identity using a PostgreSQL advisory transaction lock. A REPEATABLE READ
+transaction loads the service, calls the unchanged `quoteAppointmentPrice`, reads
+Connect ownership through the same transaction, and inserts the attempt. Service,
+price, owner, and promotion reads therefore share one committed database revision.
+Fresh Stripe destination capabilities are checked for Connect. Serialization/key
+conflicts retry only the database preparation, at most three tries; no external
+Checkout request has happened at that point.
+
+The record's financial/request/redirect/expiry fields are immutable. Migration
+triggers reject edits and direct deletion, make Stripe identifiers/booking link
+write-once, and constrain lifecycle transitions. Checks bind quote JSON to scalar
+organization/service/amount/currency, and reject impossible topology/fee facts.
+Unique indexes cover request identity, account/environment-scoped Session and
+PaymentIntent IDs, and the associated booking. Parent organization/service/booking
+deletion is restricted where it would erase financial context. No legacy records
+are backfilled or guessed.
+
+### Stable operation identity and expiration
+
+`app/api/book/route.ts`, `POST`, accepts a UUID `checkoutRequestId`, bound to a
+canonical fingerprint of the validated booking input and normalized return path.
+Reusing a key with changed input returns 409. Without a UUID, exact canonical input
+gets a deterministic fallback key; these older callers must supply a new operation
+UUID after expiry to request a new checkout. This is cash-operation deduplication,
+not a slot hold, attendee authorization, or booking uniqueness policy.
+
+`components/slot-picker.tsx` reuses the operation UUID for unchanged intent and
+network retries. Session storage retains only the UUID and input hash across a
+page return/reload, not personal data. A verified 410 expiration clears it so the
+next submit explicitly starts a new operation. Changed input starts a distinct
+operation; old open Sessions are not superseded automatically by this slice.
+
+`appointmentCheckout` always uses saved terms and a stable Stripe key
+`appointment-checkout:<attempt-id>:v1`, with identical product, amount, currency,
+route, metadata, URLs, and expiration on a retry. Creation responses are bound in
+a separate database transaction. If Stripe accepted the request before response
+persistence failed, replay uses the same key; a verified Session can also bind via
+its `attemptId` metadata if its ID was not locally saved.
+
+Sessions have a fixed **two-hour** `expires_at`. Unknown creation may be replayed
+only during the first **15 minutes** after attempt creation, well within Stripe's
+finite idempotency retention and valid expiration range. The key, quote, and expiry
+are never rolled forward. After that window, an unbound attempt becomes
+`requires_review`; it must be reconciled, not recreated automatically. A known
+Session is retrieved using its original account context even if sales mode changes.
+A new/replayed creation still must pass Slice 1's current configuration checks;
+mode/account/environment/fee changes fail closed rather than rerouting the attempt.
+
+These bounds follow Stripe's [Checkout creation reference](https://docs.stripe.com/api/checkout/sessions/create)
+and [idempotent request reference](https://docs.stripe.com/api/idempotent_requests).
+No real Stripe account, credentials, or API calls were used during implementation.
+
+### Lifecycle and saved-quote handoff
+
+| State | Meaning / transition |
+| --- | --- |
+| `prepared` | Immutable terms committed; Session may not yet be locally known. Same operation may retry creation within the deadline. |
+| `open` | A verified Session is bound; fulfillment may still be pending. This does not assert that Stripe's current Session status is open or paid. |
+| `expired` | Stripe returned an expired Session; this operation is terminal and never creates a replacement. Local time alone does not prove unpaid expiration. |
+| `fulfilled` | Booking, original pricing snapshot, captured settlement, and attempt link committed together. This does not prove finalization work completed. |
+| `requires_review` | Creation is old/ambiguous or paid booking creation failed. This is not evidence of a successful refund. Automatic checkout/booking retries stop. |
+
+`fulfill.ts`, `fulfillCheckout`, loads a known attempt by Session ID or resolves its
+metadata identity, then verifies the saved credential account. It validates purpose,
+mode, quote hash, organization, account/environment/context, destination, collection
+amount/currency, expiration, Session identity, and paid status/PaymentIntent before
+booking creation. It never calls the pricing loader or selects promotions again.
+`attempt-terms.ts` checks immutable snapshot integrity/arithmetic without looking
+up current rules.
+
+`create-booking.ts`, `createBooking`, receives internal-only saved quote/attempt
+identity and resolved duration. Its transaction locks/rechecks the attempt, inserts
+an initially unsettled booking, persists `persistBookingPricingSnapshot`, records
+payment, and binds the booking to the attempt. A second handler cannot bind another
+booking for the same attempt. Unsupported changes to the quoted duration fail
+closed. The current scheduling/access/intake checks still run; this is not a hold.
+
+Post-commit finalization failure cannot trigger a refund of a booking whose
+attempt link already committed. Retries can return that booking, but unfinished
+calendar/reminder/email work is **not** yet durably resumed. Legacy token Sessions
+retain the previous Redis branch and its historical failure modes; new appointment
+Sessions never write or destructively claim Redis booking input.
+
+Zero-cash authoritative quotes skip Stripe and save a booking snapshot. Existing
+approval behavior is retained; no paid status is invented. Automatic package-credit
+selection remains the existing separate path, without applying cash promotions.
+Commercial recurring series are rejected before new cash checkout (group events
+retain their existing non-series behavior); no paid-series allocation is added.
+
+`booking-routing.ts`, `originalBookingRefundRoute`, and cancellation lookup use
+saved original route/fee facts for new paid bookings, including zero-fee Connect.
+A failed lookup or inconsistent booking binding cannot fall back to the legacy
+boolean. The existing best-effort refund lifecycle remains unchanged; durable
+refund tasks, statuses, idempotency, and cancellation crash recovery are deferred.
+
+### Remaining dependencies and validation
+
+Slice 3 still needs a durable event inbox/outbox and finalization work, verified
+actual PaymentIntent transfer/fee facts, async-payment/expiration event handling,
+background reconciliation of unbound attempts, and truthful return/status pages.
+Creation ambiguity, process crashes, or post-commit effects must not be mistaken
+for complete recovery merely because input now survives in PostgreSQL.
+
+Best-effort failed-booking compensation records `requires_review` before calling
+Stripe once with original routing; crash/failure/pending-refund recovery is Slice 4.
+Package purchase verification, redemption authorization, concurrent cash-versus-
+credit operation selection, exact credit restoration, and package refund policy
+remain Slice 5. Current credit booking selection is not covered by the new cash
+request identity. Old Redis Sessions, mixed-account credentials, client changes
+that leave an old Session payable, encrypted-intent retention/key rotation, and
+service/account deletion policies need deliberate cutover decisions.
+
+Public page price labels still use the older static display calculation. Saved
+checkout/booking terms are authoritative, but promotion-aware quote presentation
+and truthful disabled/wrong-merchant capability display still need later UI work.
+Production payments remain disabled by default and have not been enabled here.
+
+New focused tests: `attempt-terms.test.ts`, `attempts.test.ts`,
+`attempts.database.test.ts`, `fulfill-durable.test.ts`, and
+`booking-routing.test.ts` under `apps/web/lib/payments`; gateway identity/expiry
+coverage extends `stripe.test.ts`. PostgreSQL tests use only an explicitly supplied
+loopback `PAYMENTS_TEST_DATABASE_URL` ending in `/dayotter_payments_test`, create
+and drop a randomly named disposable database, and apply real migrations. They
+cover immutable terms/identifiers, concurrent request preparation, coherent admin
+revisions, frozen replay after configuration edits, and snapshot-before-settlement
+handoff. Unit tests cover response-loss replay, exact key/parameters, expiration,
+Session mismatch rejection, encrypted intent recovery without Redis, routing/fee
+preservation, and post-commit failure handling. These tests have been implemented
+but not executed; full typechecks, builds, and lint/Biome are deferred.
 
 ## Inspection baseline: source map
 
@@ -697,7 +866,9 @@ and webhook versions.
 
 ## Migration and cutover
 
-1. Apply migration 0063 before code querying its tables. Preserve handwritten
+1. Apply migrations 0063 and 0064 before code querying their tables. Even free
+   booking requests now check durable attempt identity, so 0064 is required before
+   deploying this Slice 2 code. Preserve handwritten
    snapshot triggers and the ordering of referenced indexes/foreign keys. Add new
    payment structures additively.
 2. Audit existing records before introducing uniqueness constraints. Missing
@@ -732,14 +903,14 @@ and webhook versions.
 
 ## Implementation slices and required validation
 
-Slice 1 code and focused tests have been added, with validation pending. Tests for
-Slices 2–7 remain proposed. Each slice should be independently reviewable; a
+Slice 1 validation has passed as reported above. Slice 2 code and focused tests
+have been added, with validation pending. Tests for Slices 3–7 remain proposed. Each slice should be independently reviewable; a
 routing flag alone is not the live-payment readiness milestone.
 
 | Slice | Implementation boundary | Tests / evidence required |
 | --- | --- | --- |
-| 1. Explicit topology and capabilities (implemented; validation pending) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
-| 2. Durable checkout and quotes | Replace Redis-only intent with saved appointment/package terms; stable creation identity and expiration. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
+| 1. Explicit topology and capabilities (validated) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
+| 2. Durable checkout and quotes (appointment implementation; validation pending) | Saved appointment terms, stable creation identity and expiration, minimal snapshot/booking transaction handoff. Package intent work remains deferred. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
 | 3. Transactional fulfillment and event recovery | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
 | 4. Refund lifecycle | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
 | 5. Package entitlement integrity | Verified redemption, exact grant linkage, restoration constraints, purchase fulfillment/refund policy. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |

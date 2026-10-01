@@ -20,3 +20,5 @@ export * from "./crm";
 export * from "./plugins";
 export * from "./security";
 export * from "./support";
+
+export * from "./payment-attempts";

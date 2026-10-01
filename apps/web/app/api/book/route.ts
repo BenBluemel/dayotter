@@ -1,11 +1,11 @@
 import { BookingError, type CreateBookingInput, createBooking } from "@/lib/booking/create-booking";
-import { chargeFor } from "@/lib/booking/money";
 import { creditBalance } from "@/lib/packages/credits";
-import { checkoutRouteForOrganization } from "@/lib/payments/connect";
-import { stashPendingBooking } from "@/lib/payments/pending";
-import { createCheckoutSession } from "@/lib/payments/stripe";
+import {
+  appointmentCheckout,
+  findAppointmentAttempt,
+  prepareAppointmentAttempt,
+} from "@/lib/payments/attempts";
 import { PaymentRoutingError } from "@/lib/payments/routing";
-import { env } from "@/lib/server/env";
 import { clientIp, enforceRateLimit, verifyCaptcha } from "@/lib/server/rate-limit";
 import { schema as db, eq, getDb } from "@dayotter/db";
 import { NextResponse } from "next/server";
@@ -45,6 +45,8 @@ const schema = z.object({
   accessCode: z.string().max(64).optional(),
   /** Where to send the booker if they abandon Stripe Checkout. */
   returnPath: z.string().max(400).optional(),
+  /** Stable browser operation identity; its booking input is bound on first use. */
+  checkoutRequestId: z.string().uuid().optional(),
 });
 
 export async function POST(request: Request) {
@@ -86,75 +88,48 @@ export async function POST(request: Request) {
     accessCode: parsed.data.accessCode,
   };
 
-  // Paid event type → collect payment via Stripe Checkout first; the booking is
-  // only created once the payment succeeds (in /booking/paid + the webhook).
-  const et = await getDb().query.eventTypes.findFirst({
-    where: eq(db.eventTypes.id, parsed.data.eventTypeId),
-    columns: {
-      title: true,
-      price: true,
-      currency: true,
-      depositAmount: true,
-      isActive: true,
-      ownerId: true,
-      organizationId: true,
-    },
-  });
-  const amount = chargeFor(et?.price ?? null, et?.depositAmount ?? null);
-  if (et?.isActive && amount > 0) {
-    // Prepaid package: if the booker holds a credit for this event type, spend
-    // one and book directly instead of sending them to Stripe Checkout.
-    const credits = await creditBalance(parsed.data.eventTypeId, parsed.data.attendee.email);
-    if (credits > 0) {
-      try {
+  const requestedPath = parsed.data.returnPath;
+  const returnPath =
+    requestedPath?.startsWith("/") && !requestedPath.startsWith("//") ? requestedPath : "/";
+  try {
+    // Resume an existing cash operation before consulting mutable prices or credits.
+    const previous = await findAppointmentAttempt(input, returnPath, parsed.data.checkoutRequestId);
+    if (previous) return NextResponse.json(await appointmentCheckout(previous));
+    const et = await getDb().query.eventTypes.findFirst({
+      where: eq(db.eventTypes.id, input.eventTypeId),
+      columns: { price: true, isActive: true },
+    });
+    if (et?.isActive && (et.price ?? 0) > 0) {
+      const credits = await creditBalance(input.eventTypeId, input.attendee.email);
+      if (credits > 0) {
         const { uid, redirectUrl } = await createBooking({ ...input, redeemCredit: true });
         return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
-      } catch (err) {
-        if (err instanceof BookingError) {
-          return NextResponse.json({ error: err.message }, { status: err.status });
-        }
-        console.error("[api/book] credit booking error:", err);
-        return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
       }
     }
-    try {
-      const route = await checkoutRouteForOrganization(et.organizationId, et.ownerId, amount);
-      const token = await stashPendingBooking(input);
-      const appUrl = env.APP_URL;
-      const returnPath = parsed.data.returnPath?.startsWith("/") ? parsed.data.returnPath : "/";
-      const { url } = await createCheckoutSession({
-        amount,
-        currency: et.currency ?? "usd",
-        productName: et.title,
-        successUrl: `${appUrl}/booking/paid?session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${appUrl}${returnPath}`,
-        customerEmail: parsed.data.attendee.email,
-        // The gateway records resolved routing metadata for historical fulfillment/refunds.
-        metadata: { token },
-        route,
-      });
-      // Funnel: record that a paid checkout was started (best-effort), so
-      // analytics can show the paid-step drop-off, not just page→booking.
+    const prepared = await prepareAppointmentAttempt(
+      input,
+      returnPath,
+      parsed.data.checkoutRequestId,
+    );
+    if (prepared.attempt) {
+      const checkout = await appointmentCheckout(prepared.attempt);
       await getDb()
         .insert(db.bookingPageViews)
-        .values({ eventTypeId: parsed.data.eventTypeId, kind: "checkout" })
+        .values({ eventTypeId: input.eventTypeId, kind: "checkout" })
         .catch(() => {});
-      return NextResponse.json({ checkoutUrl: url });
-    } catch (err) {
-      if (err instanceof PaymentRoutingError) return NextResponse.json({ error: err.message }, { status: err.status });
-      console.error("[api/book] checkout error:", err);
-      return NextResponse.json({ error: "Couldn't start checkout" }, { status: 502 });
+      return NextResponse.json(checkout);
     }
-  }
-
-  try {
-    const { uid, redirectUrl } = await createBooking(input);
+    // Zero-cash quotes do not create a Stripe Session. Preserve existing approval policy.
+    const { uid, redirectUrl } = await createBooking({
+      ...input,
+      pricingQuote: prepared.quote,
+      quotedDurationMinutes: prepared.durationMinutes,
+    });
     return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
   } catch (err) {
-    if (err instanceof BookingError) {
+    if (err instanceof BookingError || err instanceof PaymentRoutingError)
       return NextResponse.json({ error: err.message }, { status: err.status });
-    }
-    console.error("[api/book] unexpected error:", err);
-    return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
+    console.error("[api/book] checkout error:", err);
+    return NextResponse.json({ error: "Couldn't start booking checkout" }, { status: 502 });
   }
 }

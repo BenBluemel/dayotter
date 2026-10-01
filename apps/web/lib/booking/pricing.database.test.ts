@@ -72,7 +72,7 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
     const journal = JSON.parse(
       await readFile(new URL("meta/_journal.json", directory), "utf8"),
     ) as { entries: { tag: string }[] };
-    for (const { tag } of journal.entries.filter((e) => !e.tag.startsWith("0063_"))) {
+    for (const { tag } of journal.entries.filter((e) => Number(e.tag.slice(0, 4)) < 63)) {
       const migration = await readFile(new URL(`${tag}.sql`, directory), "utf8");
       for (const statement of migration.split("--> statement-breakpoint")) {
         if (statement.trim()) await db.$client.query(statement);
@@ -115,6 +115,12 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
       throw error;
     } finally {
       client.release();
+    }
+    for (const { tag } of journal.entries.filter((e) => Number(e.tag.slice(0, 4)) > 63)) {
+      const migration = await readFile(new URL(`${tag}.sql`, directory), "utf8");
+      for (const statement of migration.split("--> statement-breakpoint")) {
+        if (statement.trim()) await db.$client.query(statement);
+      }
     }
     await db.insert(schema.appointmentPromotions).values([
       {
