@@ -1,5 +1,6 @@
 import { PageHeader } from "@/components/page-header";
 import { SettingsNav } from "@/components/settings-nav";
+import { connectEnabled } from "@/lib/payments/stripe";
 import type { ReactNode } from "react";
 
 export default function SettingsLayout({ children }: { children: ReactNode }) {
@@ -11,7 +12,7 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
         description="Manage your account, preferences, and calendars."
       />
       <div className="lg:grid lg:grid-cols-[196px_minmax(0,1fr)] lg:gap-10">
-        <SettingsNav />
+        <SettingsNav connectEnabled={connectEnabled} />
         <div className="min-w-0">{children}</div>
       </div>
     </>

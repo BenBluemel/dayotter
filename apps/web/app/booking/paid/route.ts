@@ -1,5 +1,5 @@
 import { fulfillCheckout } from "@/lib/payments/fulfill";
-import { paymentsEnabled } from "@/lib/payments/stripe";
+import { stripeConfigured } from "@/lib/payments/stripe";
 import { env } from "@/lib/server/env";
 import { logger } from "@dayotter/core";
 import { NextResponse } from "next/server";
@@ -11,7 +11,7 @@ export const dynamic = "force-dynamic";
 export async function GET(request: Request) {
   const appUrl = env.APP_URL;
   const sessionId = new URL(request.url).searchParams.get("session_id");
-  if (!paymentsEnabled || !sessionId) return NextResponse.redirect(`${appUrl}/`);
+  if (!stripeConfigured || !sessionId) return NextResponse.redirect(`${appUrl}/`);
 
   try {
     const { uid, pending } = await fulfillCheckout(sessionId);

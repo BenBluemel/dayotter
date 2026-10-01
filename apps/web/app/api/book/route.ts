@@ -1,9 +1,10 @@
 import { BookingError, type CreateBookingInput, createBooking } from "@/lib/booking/create-booking";
 import { chargeFor } from "@/lib/booking/money";
 import { creditBalance } from "@/lib/packages/credits";
-import { hostDestinationAccount } from "@/lib/payments/connect";
+import { checkoutRouteForOrganization } from "@/lib/payments/connect";
 import { stashPendingBooking } from "@/lib/payments/pending";
-import { createCheckoutSession, paymentsEnabled } from "@/lib/payments/stripe";
+import { createCheckoutSession } from "@/lib/payments/stripe";
+import { PaymentRoutingError } from "@/lib/payments/routing";
 import { env } from "@/lib/server/env";
 import { clientIp, enforceRateLimit, verifyCaptcha } from "@/lib/server/rate-limit";
 import { schema as db, eq, getDb } from "@dayotter/db";
@@ -87,63 +88,62 @@ export async function POST(request: Request) {
 
   // Paid event type → collect payment via Stripe Checkout first; the booking is
   // only created once the payment succeeds (in /booking/paid + the webhook).
-  if (paymentsEnabled) {
-    const et = await getDb().query.eventTypes.findFirst({
-      where: eq(db.eventTypes.id, parsed.data.eventTypeId),
-      columns: {
-        title: true,
-        price: true,
-        currency: true,
-        depositAmount: true,
-        isActive: true,
-        ownerId: true,
-      },
-    });
-    const amount = chargeFor(et?.price ?? null, et?.depositAmount ?? null);
-    if (et?.isActive && amount > 0) {
-      // Prepaid package: if the booker holds a credit for this event type, spend
-      // one and book directly instead of sending them to Stripe Checkout.
-      const credits = await creditBalance(parsed.data.eventTypeId, parsed.data.attendee.email);
-      if (credits > 0) {
-        try {
-          const { uid, redirectUrl } = await createBooking({ ...input, redeemCredit: true });
-          return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
-        } catch (err) {
-          if (err instanceof BookingError) {
-            return NextResponse.json({ error: err.message }, { status: err.status });
-          }
-          console.error("[api/book] credit booking error:", err);
-          return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
-        }
-      }
+  const et = await getDb().query.eventTypes.findFirst({
+    where: eq(db.eventTypes.id, parsed.data.eventTypeId),
+    columns: {
+      title: true,
+      price: true,
+      currency: true,
+      depositAmount: true,
+      isActive: true,
+      ownerId: true,
+      organizationId: true,
+    },
+  });
+  const amount = chargeFor(et?.price ?? null, et?.depositAmount ?? null);
+  if (et?.isActive && amount > 0) {
+    // Prepaid package: if the booker holds a credit for this event type, spend
+    // one and book directly instead of sending them to Stripe Checkout.
+    const credits = await creditBalance(parsed.data.eventTypeId, parsed.data.attendee.email);
+    if (credits > 0) {
       try {
-        const token = await stashPendingBooking(input);
-        const appUrl = env.APP_URL;
-        const returnPath = parsed.data.returnPath?.startsWith("/") ? parsed.data.returnPath : "/";
-        const destinationAccountId = await hostDestinationAccount(et.ownerId);
-        const { url } = await createCheckoutSession({
-          amount,
-          currency: et.currency ?? "usd",
-          productName: et.title,
-          successUrl: `${appUrl}/booking/paid?session_id={CHECKOUT_SESSION_ID}`,
-          cancelUrl: `${appUrl}${returnPath}`,
-          customerEmail: parsed.data.attendee.email,
-          // Echo the destination account back on the session so fulfillment can
-          // record it on the booking (needed for reverse-transfer refunds).
-          metadata: { token, ...(destinationAccountId ? { dest: destinationAccountId } : {}) },
-          destinationAccountId,
-        });
-        // Funnel: record that a paid checkout was started (best-effort), so
-        // analytics can show the paid-step drop-off, not just page→booking.
-        await getDb()
-          .insert(db.bookingPageViews)
-          .values({ eventTypeId: parsed.data.eventTypeId, kind: "checkout" })
-          .catch(() => {});
-        return NextResponse.json({ checkoutUrl: url });
+        const { uid, redirectUrl } = await createBooking({ ...input, redeemCredit: true });
+        return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
       } catch (err) {
-        console.error("[api/book] checkout error:", err);
-        return NextResponse.json({ error: "Couldn't start checkout" }, { status: 502 });
+        if (err instanceof BookingError) {
+          return NextResponse.json({ error: err.message }, { status: err.status });
+        }
+        console.error("[api/book] credit booking error:", err);
+        return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
       }
+    }
+    try {
+      const route = await checkoutRouteForOrganization(et.organizationId, et.ownerId, amount);
+      const token = await stashPendingBooking(input);
+      const appUrl = env.APP_URL;
+      const returnPath = parsed.data.returnPath?.startsWith("/") ? parsed.data.returnPath : "/";
+      const { url } = await createCheckoutSession({
+        amount,
+        currency: et.currency ?? "usd",
+        productName: et.title,
+        successUrl: `${appUrl}/booking/paid?session_id={CHECKOUT_SESSION_ID}`,
+        cancelUrl: `${appUrl}${returnPath}`,
+        customerEmail: parsed.data.attendee.email,
+        // The gateway records resolved routing metadata for historical fulfillment/refunds.
+        metadata: { token },
+        route,
+      });
+      // Funnel: record that a paid checkout was started (best-effort), so
+      // analytics can show the paid-step drop-off, not just page→booking.
+      await getDb()
+        .insert(db.bookingPageViews)
+        .values({ eventTypeId: parsed.data.eventTypeId, kind: "checkout" })
+        .catch(() => {});
+      return NextResponse.json({ checkoutUrl: url });
+    } catch (err) {
+      if (err instanceof PaymentRoutingError) return NextResponse.json({ error: err.message }, { status: err.status });
+      console.error("[api/book] checkout error:", err);
+      return NextResponse.json({ error: "Couldn't start checkout" }, { status: 502 });
     }
   }
 

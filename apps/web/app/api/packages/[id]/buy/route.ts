@@ -1,5 +1,6 @@
-import { hostDestinationAccount } from "@/lib/payments/connect";
+import { checkoutRouteForOrganization } from "@/lib/payments/connect";
 import { createCheckoutSession, paymentsEnabled } from "@/lib/payments/stripe";
+import { PaymentRoutingError } from "@/lib/payments/routing";
 import { env } from "@/lib/server/env";
 import { jsonError } from "@/lib/server/http";
 import { enforceRateLimit } from "@/lib/server/rate-limit";
@@ -37,31 +38,38 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   if (!pkg || !pkg.isActive) return jsonError("Package not available", 404);
   if (pkg.priceAmount <= 0) return jsonError("This package isn't for sale", 400);
 
-  // Route the sale to the host's connected account (the event-type owner).
+  // The service's actual organization selects the merchant; Connect uses its owner.
   const et = await getDb().query.eventTypes.findFirst({
     where: eq(schema.eventTypes.id, pkg.eventTypeId),
-    columns: { ownerId: true },
+    columns: { ownerId: true, organizationId: true },
   });
-  const destinationAccountId = et ? await hostDestinationAccount(et.ownerId) : undefined;
+  if (!et || et.organizationId !== pkg.organizationId) return jsonError("Package merchant is invalid", 403);
 
-  const appUrl = env.APP_URL;
-  const session = await createCheckoutSession({
-    amount: pkg.priceAmount,
-    currency: pkg.currency,
-    productName: `${pkg.name} - ${pkg.sessionCount} sessions`,
-    successUrl: `${appUrl}/packages/thanks`,
-    cancelUrl: `${appUrl}`,
-    customerEmail: parsed.data.clientEmail,
-    destinationAccountId,
-    metadata: {
-      kind: "package",
-      packageId: pkg.id,
-      organizationId: pkg.organizationId,
-      eventTypeId: pkg.eventTypeId,
-      clientEmail: parsed.data.clientEmail.toLowerCase(),
-      totalCredits: String(pkg.sessionCount),
-    },
-  });
+  try {
+    const route = await checkoutRouteForOrganization(et.organizationId, et.ownerId, pkg.priceAmount);
 
-  return NextResponse.json({ checkoutUrl: session.url });
+    const appUrl = env.APP_URL;
+    const session = await createCheckoutSession({
+      amount: pkg.priceAmount,
+      currency: pkg.currency,
+      productName: `${pkg.name} - ${pkg.sessionCount} sessions`,
+      successUrl: `${appUrl}/packages/thanks`,
+      cancelUrl: `${appUrl}`,
+      customerEmail: parsed.data.clientEmail,
+      route,
+      metadata: {
+        kind: "package",
+        packageId: pkg.id,
+        organizationId: pkg.organizationId,
+        eventTypeId: pkg.eventTypeId,
+        clientEmail: parsed.data.clientEmail.toLowerCase(),
+        totalCredits: String(pkg.sessionCount),
+      },
+    });
+
+    return NextResponse.json({ checkoutUrl: session.url });
+  } catch (err) {
+    if (err instanceof PaymentRoutingError) return jsonError(err.message, err.status);
+    throw err;
+  }
 }

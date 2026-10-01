@@ -7,7 +7,7 @@ import { getEntitlements, primaryOrg } from "@/lib/billing/entitlements";
 import { FEATURE_LABEL, FEATURE_TIER, type Feature } from "@/lib/billing/features";
 import { seatCount, syncSubscriptionById } from "@/lib/billing/subscription";
 import {
-  paymentsEnabled,
+  stripeConfigured,
   proPriceId,
   retrieveSession,
   subscriptionsEnabled,
@@ -125,7 +125,7 @@ export default async function BillingPage({
           ) : (
             <p className="text-sm text-[var(--color-faint)]">
               Billing isn't fully configured yet. Set{" "}
-              {[!paymentsEnabled && "STRIPE_SECRET_KEY", !proPriceId && "STRIPE_PRICE_PRO"]
+              {[!stripeConfigured && "STRIPE_SECRET_KEY", !proPriceId && "STRIPE_PRICE_PRO"]
                 .filter(Boolean)
                 .join(" and ")}{" "}
               in this server's environment to enable subscriptions.

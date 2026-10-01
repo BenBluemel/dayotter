@@ -4,7 +4,7 @@ import { and, eq, getDb, gte, ne, schema } from "@dayotter/db";
 import { bookingCancellation, sendEmail } from "@dayotter/emails";
 import { deleteBookingFromCalendar } from "../calendar/host-calendar";
 import { restoreCredit } from "../packages/credits";
-import { paymentsEnabled, refundPayment } from "../payments/stripe";
+import { stripeConfigured, refundPayment } from "../payments/stripe";
 import { fanOutBookingLifecycle } from "./lifecycle";
 import { clearBookingReminders } from "./reminders";
 
@@ -32,7 +32,7 @@ export async function cancelBooking(uid: string, reason?: string): Promise<boole
 
   // Refund a paid booking (best-effort, after the claim so only the winner pays).
   let refunded = false;
-  if (paymentsEnabled && booking.paymentStatus === "paid" && booking.paymentIntentId) {
+  if (stripeConfigured && booking.paymentStatus === "paid" && booking.paymentIntentId) {
     // Destination charge: reverse the transfer so the host's balance is debited
     // too, otherwise the platform eats the refund while the host keeps the funds.
     refunded = await refundPayment(booking.paymentIntentId, Boolean(booking.destinationAccountId));

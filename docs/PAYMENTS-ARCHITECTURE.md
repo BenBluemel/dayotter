@@ -1,11 +1,14 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **investigation and proposed implementation plan; not implemented**.
+Status: **Slice 1 routing/configuration implemented on `feature/payment-routing`,
+validation pending; all later slices remain proposed.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
-This document preserves the code review and Astra High audit. It does not claim
-that the proposed routing, persistence, refund, webhook, or UI changes exist.
+This document preserves the code review and Astra High audit. The source map and
+risks below describe that inspection baseline; the Slice 1 section records the
+subsequent routing changes. Durable payment persistence, recovery, and refund
+lifecycle changes have not been implemented.
 
 The investigation inspected source and public Stripe documentation. It did not
 run tests, inspect live Stripe accounts or production data, change Stripe
@@ -40,8 +43,9 @@ The intended design is:
    silent fallback to collecting money on the platform when a recipient is not
    ready.
 
-These are proposed architecture decisions, not implemented guarantees. Light &
-Balance correctness and simplicity take priority over upstream compatibility.
+These are intended architecture decisions. Slice 1 implements only explicit
+routing/configuration and capability gates; the remaining guarantees are proposed.
+Light & Balance correctness and simplicity take priority over upstream compatibility.
 The recommendation does not require a general accounting system or two copies of
 the payment workflow.
 
@@ -50,7 +54,167 @@ Light & Balance's account credentials. Stripe Connect also has a product term
 "direct charges" for charges on connected accounts; that is a different topology
 and is not the target here.
 
-## Current implementation: source map
+## Slice 1 implementation: explicit routing and configuration
+
+Implemented in this working branch, with tests added but not yet run. No deployment
+configuration, credentials, Stripe accounts, or payout schedules were changed.
+This slice does **not** establish readiness for live payments.
+
+### Deployment configuration
+
+`apps/web/lib/server/env.ts` declares these fields. The pure
+`paymentRoutingConfig` in `apps/web/lib/payments/routing.ts` validates enabled
+configuration at use, so builds can run without payment credentials.
+
+| Field | Implemented semantics |
+| --- | --- |
+| `STRIPE_PAYMENT_MODE` | `disabled` (default), `direct`, or `connect`. A secret key alone never enables booking/package cash checkout. |
+| `STRIPE_PAYMENT_ENVIRONMENT` | Required `test` or `live` for enabled modes. Live operations require a production Node runtime; production may still use test credentials. |
+| `STRIPE_ACCOUNT_ID` | Required charge-owning `acct_…` identity. The gateway retrieves the credential-owning account and checks this ID before new checkout. |
+| `STRIPE_DIRECT_ORGANIZATION_ID` | Required organization UUID in direct mode. Only server-loaded services/packages belonging to this organization may sell through the configured merchant. |
+| `STRIPE_SECRET_KEY` | Account-scoped secret or restricted key with the expected test/live prefix. Organization-scoped keys are unsupported. Account-read access is required for identity checks. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret required for enabled checkout. Prefix validation cannot prove endpoint/account ownership; deployment must supply the correct endpoint secret. |
+| `NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY` | If supplied, its test/live prefix must match. |
+| `STRIPE_PLATFORM_FEE_PERCENT` | Connect only; finite 0–100, defaults to zero. Direct ignores even stale or invalid fee configuration. |
+
+The smallest merchant binding uses existing service/package organization IDs and
+one deployment organization UUID, without schema changes or per-organization key
+storage. It assumes the configured organization represents the sole direct
+merchant and the configured account is that business's account. Package checkout
+also checks that package and service organization IDs agree. It is not a general
+multi-merchant direct-payment facility.
+
+### Routing boundary and callers
+
+- `routing.ts`: `PaymentRoute` carries mode, organization, charge account,
+  environment, and nonsecret `credentialContext: "primary"`; Connect additionally
+  carries destination and the computed application fee. This is suitable for
+  later persistence, but no PaymentAttempt records exist yet.
+- `connect.ts`, `checkoutRouteForOrganization`: direct avoids host/Connect lookups;
+  Connect requires an owner, a valid stored account, and fresh Stripe charge and
+  transfer capability state. Unsupported team ownership fails closed.
+- `stripe.ts`, `createCheckoutSession`: revalidates configuration and charge-account
+  identity, rechecks Connect readiness, and constructs parameters explicitly.
+  Direct never sets transfers, application fees, or connected-account headers,
+  even with stale Connect fields. Connect retains destination charges and fee
+  rounding, and never falls back to an ordinary platform payment.
+- Session and PaymentIntent metadata include routing identity. Reserved routing
+  fields are overwritten and stale `dest` is removed for direct payments. Metadata
+  is not a durable attempt or an authorization substitute.
+- `app/api/book/route.ts`, `POST`: positive cash checkout always resolves a route;
+  disabled mode cannot fall through to an unpaid booking. Free bookings and the
+  existing package-credit path remain available. Deposit amounts still use
+  `chargeFor`; authoritative promotional quote integration remains Slice 2.
+- `app/api/packages/[id]/buy/route.ts`, `POST`: uses the server-loaded service and
+  package organization for merchant selection; purchase/grant hardening remains
+  deferred.
+
+### Historical operations and Connect capability gates
+
+`stripeConfigured` means credentials exist; `paymentsEnabled` means new cash sales
+are selected; `connectEnabled` gates Connect capabilities. Historical return and
+webhook processing, cancellation refunds, and Pro billing use credential presence
+rather than the current booking-payment mode.
+
+`stripe.ts`, `retrieveSession` and `refundPayment` accept original typed route
+context without consulting the current sales mode. Direct refunds omit reversal
+parameters. Connect refunds reverse the original transfer and refund an application
+fee only when the supplied original route records a positive fee. Legacy boolean
+refund callers still use their saved destination presence, independent of current
+mode; they have not been converted into durable refund operations. A signed
+webhook's `livemode` must match the configured key environment, even when sales are
+disabled. Signature verification and existing fulfillment otherwise remain intact.
+
+**Historical limitation:** existing records lack full charge-account/credential
+facts. There is still only one primary credential context, and legacy Session
+retrieval uses that key. Mode changes with the same charge-owning account preserve
+routing behavior; changing accounts/credentials requires retaining access to the
+old account in a later legacy-context resolver or settling its obligations first.
+A supplied typed route with a different account fails identity checks instead of
+being silently reinterpreted. This slice does not provide mixed-account processing.
+
+All Connect SDK account-management, balance, and payout helpers require explicit
+Connect configuration. Web/mobile navigation hides Payouts outside Connect; the
+web page and backend status/withdraw/onboarding/dashboard routes also gate those
+capabilities. `/api/me` exposes `connectEnabled`. The payout-status endpoint keeps
+its legacy `paymentsEnabled` response field as a Connect capability indicator.
+Connect target helpers also reject malformed/missing targets and the charge-owning
+platform account before issuing account-context requests.
+Existing Connect manual payouts and minimum withdrawal remain unchanged in Connect;
+direct payout scheduling and bank payouts belong to Stripe.
+
+Focused tests added: `lib/payments/routing.test.ts`, `connect.test.ts`, and
+`stripe.test.ts` (under `apps/web`). They cover configuration, organization binding,
+stale Connect state, missing/invalid/unready destinations, SDK parameters/account
+identity, historical refunds/retrieval across mode changes, and webhook environment
+checks. Execution, web/mobile typechecks, and scoped formatting/lint validation are
+pending. No schema, promotion pricing/snapshots, durable payment attempts, webhook
+recovery, refund lifecycle, or production activation is included.
+
+### Focused adversarial review of Slice 1
+
+The repository-wide Checkout search found two new-purchase gateways: ordinary
+appointment/package `createCheckoutSession`, and cloud Pro
+`createSubscriptionCheckout` (including its missing-customer retry). There are no
+other Stripe client constructors or Checkout creation calls in application code.
+`STRIPE_PAYMENT_MODE` governs appointment/package sales, not cloud Pro billing;
+Pro remains separately gated by cloud edition, credentials, recurring Price, and
+organization admin authorization. It never acquires Connect routing. Light &
+Balance's self-hosted edition has no public Pro checkout route enabled.
+
+Review fixes in `stripe.ts`, with regressions in `stripe.test.ts`:
+
+- Centralized primary-key environment/runtime checks cover legacy Session
+  retrieval, Pro checkout/retry/portal, refunds, subscription reads, and webhook
+  verification, without consulting current sales mode. Live keys fail closed
+  outside a production Node runtime.
+- Account-identity lookup failures expose a generic routing error, without raw
+  SDK error text/cause that might include credential details in caller logs.
+- Connect account-target helpers reject the primary platform account and missing
+  or malformed IDs, preventing a bad stored target or omitted header from exposing
+  platform balances/payouts. Creating a new connected account has no target.
+
+The account identity lookup is lazy; it makes no startup/build network request.
+It introduces a fail-closed runtime dependency on Stripe's account endpoint and
+account-read permission (including restricted keys). An unavailable/forbidden
+lookup prevents checkout; it does not select a different account. Connect checkout
+currently checks owner readiness and then rechecks at the gateway, causing two
+platform-account and two destination-account reads. Permissions and latency should
+be verified in an isolated test environment before deployment, not against live
+accounts. No network-based credential checks were performed in this review.
+
+Later-slice findings confirmed by actual call sites, left unchanged:
+
+- `fulfill.ts`, `fulfillCheckout` still consumes Redis input before durable booking
+  commit, uses Session destination metadata, and does not validate persisted
+  expected amount/account/routing. Added routing metadata is not yet persisted in
+  booking/payment records. See R1/R5 and Slices 2–3.
+- `cancel-booking.ts`, `cancelBooking`, and failed-booking compensation still use
+  destination-presence booleans; they cannot recover original fee or credential
+  identity. Typed zero-fee Connect routes omit fee refunds, while legacy boolean
+  calls retain their previous flags. Refund failure/crash recovery remains R2 and
+  Slice 4, including verification of zero-fee legacy behavior.
+- `packages/fulfill.ts`, `fulfillPackagePurchase` still grants from metadata without
+  paid-status enforcement or original purchase account facts. R3/R4 and Slice 5
+  remain required before package readiness.
+- `app/api/book/route.ts`, `POST`, loads mutable price/active/organization state
+  separately from `createBooking`'s later validation. Concurrent service edits
+  can change the terms or turn a previously free/inactive branch into a payable
+  booking before creation. Route validation prevents wrong-merchant Checkout;
+  it does not provide atomic pricing/booking terms. Slice 2 must bind the quote,
+  purpose, and settlement decision rather than treating this initial read as an
+  immutable snapshot.
+- Public booking pages still derive displayed cash amounts from `paymentsEnabled`:
+  disabled mode hides the amount while the API now rejects positive cash sales.
+  Wrong-organization direct bookings may also display a checkout price before the
+  API rejects their merchant. Server-authoritative pricing/capability presentation
+  belongs to the later entry-point integration; the API remains the routing gate.
+- Pro and legacy payments still share the primary credential. Changing that key
+  can break historical processing or move Pro billing into a different account;
+  its existing missing-customer retry does not preserve old account ownership.
+  Account/credential cutover must retain historical context as described below.
+
+## Inspection baseline: source map
 
 ### Checkout, deposits, and booking creation
 
@@ -277,25 +441,14 @@ be reconstructed reliably from a deposit and today's mutable event price.
 
 ### Explicit routing boundary
 
-Keep one shared Stripe gateway with a small route resolver. An illustrative type
-(not existing code) is:
-
-```ts
-type PaymentRoute =
-  | { mode: "direct"; chargeAccountId: string }
-  | {
-      mode: "connect";
-      chargeAccountId: string;
-      destinationAccountId: string;
-      applicationFeeAmount: number;
-    };
-```
-
-Persist live/test identity and a nonsecret credential-context reference as well.
-Never store raw API keys in attempt records. Direct mode omits Connect transfer,
-application-fee, and connected-account request parameters, regardless of stale
-Connect IDs on users. Connect mode requires an explicitly supported recipient;
-missing or unready routing is an error, including for unsupported team ownership.
+Slice 1 adds the shared gateway boundary in
+`apps/web/lib/payments/routing.ts` (`PaymentRoute`, `StripeContext`,
+`resolvePaymentRoute`, `assertCheckoutRoute`) and connects both cash checkout
+callers through `connect.ts`, `checkoutRouteForOrganization`. The concrete route
+includes organization, charge account, mode, test/live identity, and a nonsecret
+credential-context reference, plus destination and fee for Connect. Never store
+raw keys in future attempt records. The Slice 1 section above records implemented
+configuration and fail-closed behavior; persistence remains proposed.
 
 Choose the route once for an attempt. Retrieval, fulfillment, refunds, and
 reconciliation use that saved context rather than the current deployment mode.
@@ -486,10 +639,11 @@ of a PaymentIntent must not accidentally decide product policy.
 
 ## Proposed configuration and direct-mode UI
 
-Add deployment-level `STRIPE_PAYMENT_MODE=disabled|direct|connect`, validated in
-`apps/web/lib/server/env.ts`. With Stripe configured, require an explicit mode;
-existing deployments should select Connect during migration, not silently switch
-money destinations.
+Slice 1 adds deployment-level `STRIPE_PAYMENT_MODE=disabled|direct|connect` in
+`apps/web/lib/server/env.ts`, defaulting to disabled. Existing deployments must
+explicitly select Connect and provide the required account/environment fields
+before new sales resume; a key alone no longer enables checkout. See the concrete
+configuration table above. No deployment configuration has been changed.
 
 In direct mode:
 
@@ -501,8 +655,8 @@ In direct mode:
 - Separate acceptance of new purchases from processing historical events/refunds.
 - Keep DayOtter Pro subscriptions/portal independently enabled and scoped.
 
-The exact organization/account configuration field names remain implementation
-choices. No proposed environment variables have been added by this review.
+Slice 1 uses `STRIPE_DIRECT_ORGANIZATION_ID` and `STRIPE_ACCOUNT_ID` for this
+binding; broader multi-account credential management remains deferred.
 
 Hide Payouts, withdrawal controls/minimums, Connect onboarding, connected balances,
 and Express links on web and mobile. Gate backend Connect/withdraw/dashboard
@@ -578,13 +732,13 @@ and webhook versions.
 
 ## Implementation slices and required validation
 
-These are proposed tests for future implementation. The investigation did not run
-them. Each slice should be independently reviewable; a routing flag alone is not
-the live-payment readiness milestone.
+Slice 1 code and focused tests have been added, with validation pending. Tests for
+Slices 2–7 remain proposed. Each slice should be independently reviewable; a
+routing flag alone is not the live-payment readiness milestone.
 
 | Slice | Implementation boundary | Tests / evidence required |
 | --- | --- | --- |
-| 1. Explicit topology and capabilities | Configuration, route resolver, saved routing identity, Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
+| 1. Explicit topology and capabilities (implemented; validation pending) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
 | 2. Durable checkout and quotes | Replace Redis-only intent with saved appointment/package terms; stable creation identity and expiration. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
 | 3. Transactional fulfillment and event recovery | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
 | 4. Refund lifecycle | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |

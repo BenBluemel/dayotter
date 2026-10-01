@@ -2,7 +2,7 @@ import { syncOrgSubscription, syncSubscriptionById } from "@/lib/billing/subscri
 import { fulfillPackagePurchase } from "@/lib/packages/fulfill";
 import { syncConnectAccountStatus } from "@/lib/payments/connect";
 import { fulfillCheckout } from "@/lib/payments/fulfill";
-import { constructWebhookEvent, paymentsEnabled } from "@/lib/payments/stripe";
+import { constructWebhookEvent, stripeConfigured } from "@/lib/payments/stripe";
 import { logger } from "@dayotter/core";
 import { NextResponse } from "next/server";
 import type Stripe from "stripe";
@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
 /** Stripe webhook - the reliable backstop that confirms a paid booking even if
  *  the booker closes the success tab. Signature-verified; idempotent. */
 export async function POST(request: Request) {
-  if (!paymentsEnabled) return NextResponse.json({ ok: true });
+  if (!stripeConfigured) return NextResponse.json({ ok: true });
 
   const signature = request.headers.get("stripe-signature");
   if (!signature) return NextResponse.json({ error: "Missing signature" }, { status: 400 });

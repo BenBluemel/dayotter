@@ -1,6 +1,6 @@
 import { aiEnabled } from "@/lib/ai/llm";
 import { getEntitlements } from "@/lib/billing/entitlements";
-import { paymentsEnabled } from "@/lib/payments/stripe";
+import { connectEnabled, paymentsEnabled } from "@/lib/payments/stripe";
 import { jsonError, withUser } from "@/lib/server/http";
 import { and, eq, getDb, schema } from "@dayotter/db";
 import { NextResponse } from "next/server";
@@ -46,5 +46,5 @@ export const GET = withUser(async (u) => {
     hasHours: (defaultSchedule?.availabilityRules.length ?? 0) > 0,
     hasEventType: activeEvents.length > 0,
   };
-  return NextResponse.json({ user, branding, setup, aiEnabled, paymentsEnabled, entitlements });
+  return NextResponse.json({ user, branding, setup, aiEnabled, paymentsEnabled, connectEnabled, entitlements });
 });

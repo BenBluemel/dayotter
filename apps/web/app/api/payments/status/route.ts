@@ -2,7 +2,7 @@ import {
   type CurrencyBalance,
   WITHDRAW_MINIMUM,
   connectedBalances,
-  paymentsEnabled,
+  connectEnabled,
   platformFeePercent,
   retrieveConnectStatus,
 } from "@/lib/payments/stripe";
@@ -18,8 +18,8 @@ export const dynamic = "force-dynamic";
  * the balance + onboarding flags the web page hands to <PayoutsPanel>.
  */
 export const GET = withUser(async (u) => {
-  if (!paymentsEnabled) {
-    return NextResponse.json({ paymentsEnabled: false });
+  if (!connectEnabled) {
+    return NextResponse.json({ paymentsEnabled: false, connectEnabled: false });
   }
 
   const db = getDb();
@@ -52,6 +52,7 @@ export const GET = withUser(async (u) => {
 
   return NextResponse.json({
     paymentsEnabled: true,
+    connectEnabled: true,
     connected: Boolean(user?.stripeAccountId),
     chargesEnabled,
     payoutsEnabled,

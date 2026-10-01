@@ -10,11 +10,11 @@ import { usePathname } from "next/navigation";
  * pill rail on large screens (so the settings pane fills the width instead of
  * stranding a narrow column against the left edge).
  */
-export function SettingsNav() {
+export function SettingsNav({ connectEnabled = false }: { connectEnabled?: boolean }) {
   const pathname = usePathname();
   return (
     <nav className="mb-6 flex gap-1 overflow-x-auto border-b border-[var(--color-border)] lg:sticky lg:top-8 lg:mb-0 lg:max-h-[calc(100dvh-4rem)] lg:flex-col lg:gap-0.5 lg:self-start lg:overflow-visible lg:border-b-0 lg:pt-1">
-      {SETTINGS_NAV.map(({ href, label }) => {
+      {SETTINGS_NAV.filter((item) => connectEnabled || item.href !== "/settings/payouts").map(({ href, label }) => {
         const active = pathname === href || pathname.startsWith(`${href}/`);
         return (
           <Link

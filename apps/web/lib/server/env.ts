@@ -54,7 +54,12 @@ const schema = z.object({
   // Optional AI scheduling (Claude). AI features are hidden unless set.
   ANTHROPIC_API_KEY: z.string().optional(),
 
-  // Optional Stripe payments - paid bookings are disabled unless set.
+  // New cash sales require an explicit mode; credentials can remain for historical payments/Pro.
+  STRIPE_PAYMENT_MODE: z.enum(["disabled", "direct", "connect"]).default("disabled"),
+  STRIPE_PAYMENT_ENVIRONMENT: z.enum(["test", "live"]).optional(),
+  STRIPE_ACCOUNT_ID: z.string().optional(),
+  STRIPE_DIRECT_ORGANIZATION_ID: z.string().optional(),
+  STRIPE_PLATFORM_FEE_PERCENT: z.string().optional(),
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
   NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: z.string().optional(),
