@@ -4,6 +4,8 @@ export * from "./auth";
 export * from "./calendar";
 export * from "./scheduling";
 export * from "./booking";
+export * from "./promotions";
+export * from "./booking-pricing";
 export * from "./team";
 export * from "./workflow";
 export * from "./preferences";

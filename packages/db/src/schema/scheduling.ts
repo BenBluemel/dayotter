@@ -242,6 +242,7 @@ export const eventTypes = pgTable(
   },
   (t) => [
     uniqueIndex("event_types_owner_slug_idx").on(t.ownerId, t.slug),
+    uniqueIndex("event_types_id_org_idx").on(t.id, t.organizationId),
     index("event_types_org_idx").on(t.organizationId),
   ],
 );

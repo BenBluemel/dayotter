@@ -66,7 +66,7 @@ export async function fulfillCheckout(
         paymentIntentId: pi,
         err,
       });
-      await refundPayment(pi);
+      await refundPayment(pi, Boolean(destinationAccountId));
       throw err;
     }
     throw err;

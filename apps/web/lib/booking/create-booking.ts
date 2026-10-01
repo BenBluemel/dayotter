@@ -11,7 +11,12 @@ import {
   eventTypeHostSlots,
   isAllowedDuration,
 } from "./availability";
-import { BookingError, mapInsertError, validateResponses } from "./booking-logic";
+import {
+  BookingError,
+  assertExclusiveSettlement,
+  mapInsertError,
+  validateResponses,
+} from "./booking-logic";
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
 
@@ -155,6 +160,7 @@ export interface CreateBookingInput {
 export async function createBooking(
   input: CreateBookingInput,
 ): Promise<{ uid: string; redirectUrl: string | null }> {
+  assertExclusiveSettlement(input);
   const db = getDb();
 
   const eventType = await db.query.eventTypes.findFirst({

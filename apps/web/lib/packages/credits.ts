@@ -28,7 +28,9 @@ export async function creditBalance(eventTypeId: string, clientEmail: string): P
 /**
  * Atomically spend one credit for a client's event type, oldest grant first.
  * Returns true if a credit was consumed, false if they had none left. Safe
- * against concurrent bookings - the decrement is a single conditional UPDATE.
+ * against concurrent bookings: lock the selected grant and recheck its balance
+ * on the outer UPDATE. Without the lock/outer predicate, concurrent statements
+ * can select the same last credit before either UPDATE commits.
  */
 export async function consumeCredit(
   eventTypeId: string,
@@ -44,9 +46,11 @@ export async function consumeCredit(
       WHERE event_type_id = ${eventTypeId}
         AND client_email = ${email}
         AND used_credits < total_credits
-      ORDER BY created_at ASC
+      ORDER BY created_at ASC, id ASC
       LIMIT 1
+      FOR UPDATE
     )
+      AND used_credits < total_credits
     RETURNING id
   `);
   return (updated.rows?.length ?? 0) > 0;

@@ -9,6 +9,19 @@ export class BookingError extends Error {
   }
 }
 
+/** Public routes cannot send payment facts, but internal callers must also fail closed. */
+export function assertExclusiveSettlement(input: {
+  payment?: unknown;
+  redeemCredit?: boolean;
+}): void {
+  if (input.payment != null && input.redeemCredit) {
+    throw new BookingError(
+      "A booking cannot both redeem a package credit and take a cash payment",
+      400,
+    );
+  }
+}
+
 interface IntakeQuestion {
   id: string;
   label: string;

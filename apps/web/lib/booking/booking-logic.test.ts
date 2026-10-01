@@ -1,5 +1,23 @@
+import {
+  BookingError,
+  assertExclusiveSettlement,
+  mapInsertError,
+  validateResponses,
+} from "@/lib/booking/booking-logic";
 import { describe, expect, it } from "vitest";
-import { BookingError, mapInsertError, validateResponses } from "./booking-logic";
+
+describe("assertExclusiveSettlement", () => {
+  it("rejects mixed payment and credit before either can be consumed", () => {
+    expect(() =>
+      assertExclusiveSettlement({ payment: { amountPaid: 100 }, redeemCredit: true }),
+    ).toThrow(BookingError);
+  });
+  it("allows credit, payment, and free cash inputs independently", () => {
+    for (const input of [{}, { payment: { amountPaid: 0 } }, { redeemCredit: true }]) {
+      expect(() => assertExclusiveSettlement(input)).not.toThrow();
+    }
+  });
+});
 
 const q = (id: string, type: string, required: boolean) => ({
   id,
