@@ -1,15 +1,12 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slice 1 validated; Slice 2 durable appointment checkout implemented on
-`feature/payment-routing`, validation pending. Slices 3–7 remain proposed except
-for the minimal booking transaction handoff needed by Slice 2.**
+Status: **Slices 1–2 validated (Slice 2: `6dfc4f3`); Slice 3 transactional appointment fulfillment and recovery implemented on `feature/payment-routing`, validated. Slices 4–7 remain proposed.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
 This document preserves the code review and Astra High audit. The source map and
 risks below describe that inspection baseline; the Slice 1 section records the
-subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. Full
-event/finalization recovery and durable refund lifecycle changes remain proposed.
+subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. The Slice 3 section records durable success observations, transactional booking fulfillment, event recovery and bounded finalization tracking. Durable refunds and per-effect delivery guarantees remain proposed.
 
 The investigation inspected source and public Stripe documentation. It did not
 run tests, inspect live Stripe accounts or production data, change Stripe
@@ -47,7 +44,7 @@ The intended design is:
 
 These are intended architecture decisions. Slice 1 implements only explicit
 routing/configuration and capability gates. Slice 2 adds durable appointment
-checkout terms and the minimum booking handoff; broader recovery remains proposed.
+checkout terms and the minimum booking handoff; Slice 3 adds appointment recovery described below.
 Light & Balance correctness and simplicity take priority over upstream compatibility.
 The recommendation does not require a general accounting system or two copies of
 the payment workflow.
@@ -63,7 +60,7 @@ Slice 1 validation reported 41 focused payment tests and 241 web tests passing
 (with 14 PostgreSQL tests skipped), web/mobile typechecks, scoped Biome, and diff
 checks passing. The validator's explicit `StripeContext` annotation and stale-dest
 metadata filtering fixes were incorporated into this tree without its formatting
-churn. Slice 2 changes have not been mechanically validated. No deployment
+churn. Slice 2 passed 55 focused payment tests, 19 PostgreSQL integration tests, 274 full web tests, web/DB typechecks, scoped Biome and diff checks. No deployment
 configuration, credentials, Stripe accounts, or payout schedules were changed.
 This slice does **not** establish readiness for live payments.
 
@@ -156,7 +153,7 @@ Focused tests added: `lib/payments/routing.test.ts`, `connect.test.ts`, and
 `stripe.test.ts` (under `apps/web`). They cover configuration, organization binding,
 stale Connect state, missing/invalid/unready destinations, SDK parameters/account
 identity, historical refunds/retrieval across mode changes, and webhook environment
-checks. Slice 1 validation passed as reported above. Slice 2's new tests and
+checks. Slice 1 validation passed as reported above. Slice 2's tests and
 changes remain pending validation; webhook recovery, durable refund lifecycle, and
 production activation remain outside both slices.
 
@@ -350,14 +347,11 @@ refund tasks, statuses, idempotency, and cancellation crash recovery are deferre
 
 ### Remaining dependencies and validation
 
-Slice 3 still needs a durable event inbox/outbox and finalization work, verified
-actual PaymentIntent transfer/fee facts, async-payment/expiration event handling,
-background reconciliation of unbound attempts, and truthful return/status pages.
+At the Slice 2 checkpoint, event recovery, PaymentIntent verification and truthful return pages were deferred. The Slice 3 implementation below now resolves those appointment concerns with an inbox, authenticated Intent/charge verification, a bounded recovery pass and durable finalization progress. Periodic scheduling and per-effect delivery remain operational/architectural dependencies.
 Creation ambiguity, process crashes, or post-commit effects must not be mistaken
 for complete recovery merely because input now survives in PostgreSQL.
 
-Best-effort failed-booking compensation records `requires_review` before calling
-Stripe once with original routing; crash/failure/pending-refund recovery is Slice 4.
+The Slice 2 interim failed-booking path attempted one best-effort refund after recording review. Slice 3 replaces that behavior for new durable attempts with a retained paid obligation requiring review; no ambiguous automatic refund is issued. Durable compensation/refund recovery is Slice 4.
 Package purchase verification, redemption authorization, concurrent cash-versus-
 credit operation selection, exact credit restoration, and package refund policy
 remain Slice 5. Current credit booking selection is not covered by the new cash
@@ -903,15 +897,14 @@ and webhook versions.
 
 ## Implementation slices and required validation
 
-Slice 1 validation has passed as reported above. Slice 2 code and focused tests
-have been added, with validation pending. Tests for Slices 3–7 remain proposed. Each slice should be independently reviewable; a
+Slices 1–2 passed validation. Slice 3 implementation and adversarial tests are recorded below. Slices 4–7 remain proposed. Each slice should be independently reviewable; a
 routing flag alone is not the live-payment readiness milestone.
 
 | Slice | Implementation boundary | Tests / evidence required |
 | --- | --- | --- |
 | 1. Explicit topology and capabilities (validated) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
-| 2. Durable checkout and quotes (appointment implementation; validation pending) | Saved appointment terms, stable creation identity and expiration, minimal snapshot/booking transaction handoff. Package intent work remains deferred. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
-| 3. Transactional fulfillment and event recovery | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
+| 2. Durable checkout and quotes (appointment implementation; validated) | Saved appointment terms, stable creation identity and expiration, minimal snapshot/booking transaction handoff. Package intent work remains deferred. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
+| 3. Transactional fulfillment and event recovery (appointment implementation; bounded finalization) | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
 | 4. Refund lifecycle | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
 | 5. Package entitlement integrity | Verified redemption, exact grant linkage, restoration constraints, purchase fulfillment/refund policy. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |
 | 6. Remaining pricing entry points | Staff/API policy, unpaid reprice, explicit settled adjustments, occurrence settlement. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
@@ -950,3 +943,84 @@ enabled creation/settlement path rather than enabling the calculator alone.
 
 Recheck relevant API/SDK details during implementation. These references establish
 provider semantics; the source map and risks above describe the inspected code.
+
+## Slice 3 implementation: observed payment, transactional fulfillment and recovery
+
+This section describes implemented and mechanically validated appointment code. It supersedes the Slice 2 interim fulfillment path and the baseline Redis audit for **new durable appointment attempts only**. Packages, legacy Redis Sessions and durable refunds are unchanged. Production payments remain disabled by deployment configuration; this work does not enable them.
+
+### Database and state transitions
+
+`packages/db/src/schema/payment-attempts.ts` and migration `0065_payment_fulfillment.sql` extend `payment_attempts` with write-once `success_facts` and `payment_succeeded_at`, recovery progress/backoff, and review codes. Existing Slice 2 fulfilled rows retain their historical absence of these new observations/finalization context. The migration does not manufacture Stripe facts or replay their old finalization.
+
+- `prepared/open → payment_succeeded`: successful Stripe payment has been verified and committed; booking is now owed.
+- `payment_succeeded → fulfilling`: work has started. This is a progress marker, **not an exclusive process lease or completion**. After a crash it remains discoverable and retryable.
+- `payment_succeeded/fulfilling → fulfilled`: booking, attendees, pricing snapshot, paid fields, immutable attempt→booking binding and encrypted finalization context commit in one transaction.
+- Transient booking/database errors return unbound work to `payment_succeeded`, with bounded retry backoff. Availability/configuration/settlement contradictions requiring human resolution become `requires_review`; their saved success facts and customer obligation remain retained.
+- Unpaid Session expiration/failure becomes `expired/payment_failed`. A later verified success may still establish an obligation; old failure events cannot erase observed success. Creation ambiguity alone may automatically leave review after original-identity payment verification; other review codes need explicit resolution.
+
+The replacement PostgreSQL trigger preserves immutable Slice 2 financial terms and write-once Session/Intent/booking IDs. Success facts, observation time, finalization context and start time are also write-once. State transitions and new booking bindings are guarded in PostgreSQL. New bindings require observed success and pending durable context. Attempts and receipts cannot be deleted.
+
+`payment_events` is a small encrypted signed-event inbox with unique `(environment, charge_account_id, stripe_event_id)`, immutable payload/hash/relationship, retry progress and terminal completion/review. This is appointment-only, not a new general queue subsystem. Apply 0065 **before** this application code. Existing 0064 observations/terms remain preserved. Stop/drain the old Slice 2 appointment fulfillment handlers for this cutover: their booking-binding path does not record the new required success facts and will fail the strengthened guard. Do not run mixed Slice 2/Slice 3 fulfillment against the upgraded schema or roll paid work back to the old handler; Stripe can retry deliveries during the controlled restart. No deployment was performed here.
+
+### Verified Stripe facts and identity
+
+`apps/web/lib/payments/payment-success.ts:verifiedPaymentFacts` validates the original account-scoped Session plus the SDK-retrieved PaymentIntent with expanded latest charge. It checks Session/Intent IDs, metadata relationship/quote hash/organization, amount/currency, test/live environment, original account/credential context, destination and application fee, absence of incompatible `on_behalf_of`, successful Intent status and fully received amount, and a paid/captured matching non-refunded charge. Direct routing rejects even a stale transfer or an explicitly supplied zero application fee. Zero-fee Connect remains a destination payment with fee amount zero.
+
+`stripe.ts:retrievePaymentIntent` and `sessionForPaymentIntent` use the saved route, authenticated account identity check and original environment; they do not select a new merchant from current sales mode. Browser parameters/metadata alone are never evidence of payment. An unpaid completed Checkout or a processing/requires-action/requires-capture Intent does not satisfy settled success. Incomplete authenticated evidence and transient API/configuration access failures remain retryable. Contradictory financial identity/terms enter review without overwriting established identifiers.
+
+`payment-work.ts:observePaymentSuccess` independently commits normalized facts (Session, Intent, charge, received amount, currency, environment/account/context, original topology/destination/fee). Duplicate observations compare against the already stored facts under `FOR UPDATE`. Fulfillment uses this immutable evidence and Slice 2's saved quote/input/duration; it does not rerun promotion selection or compute a new route/fee. Current availability and booking policy may reject the saved appointment into review; they cannot substitute new financial terms or a different duration.
+
+### Concurrency and webhook/browser behavior
+
+`payment-work.ts:fulfillObservedPayment` converges callers on `create-booking.ts:createBooking`. Its transaction locks the attempt row, validates original settlement, inserts the pricing snapshot before paid fields, and calls `payment-finalization.ts:bindPaidBooking` in the same transaction. The lock and write-once binding prevent two bookings from surviving concurrent workers, webhook/browser races or retries. A losing caller reads the already bound booking. There are no session advisory locks held outside database transactions and no correctness dependency on Redis. No durable payment path automatically issues a best-effort refund for a booking failure: compensation requires review/durable refund work in Slice 4.
+
+`payment-events.ts:receiveAppointmentEvent` runs after the existing raw-body SDK signature/environment verification and stores the encrypted receipt **before** Stripe retrieval or fulfillment. It accepts Checkout completed/async-success/async-failure/expired and Intent-success events. Known durable Session/Intent IDs missing metadata cannot fall through to legacy Redis. Before Session binding, an immutable `client_reference_id` matching a saved attempt also selects the durable path, in both webhook intake and browser reconciliation; missing quote/routing metadata then requires review. Unknown durable UUIDs fail retryably; malformed relationships reject. Historical/package/Pro events without a durable relationship retain the existing explicit handler boundary.
+
+`processAppointmentEvent` re-reads canonical Stripe objects under the saved account. Completed-but-unpaid events are acknowledged as waiting, with the open attempt still discoverable. Valid async success drives the same observation/fulfillment path. Pending receipt/transient work returns HTTP 500 so Stripe retries remain useful. Fulfilled/already-fulfilled events return 200; contradictions return 200 **only after durable review recording** and are discoverable separately. Failed intake/DB writes do not receive permanent success. Duplicate inbox processing is harmless through immutable evidence, guarded receipt progress and transactional booking binding.
+
+`/booking/paid` requests authenticated reconciliation, returns the bound booking when known, and otherwise reports processing or review. It no longer sends transient errors to a page claiming an automatic refund. Processing copy does not assert payment receipt or email delivery prematurely. The browser is optional; success-URL visits cannot establish successful payment.
+
+### Recovery and crash windows
+
+`recovery.ts:recoverAppointmentPayments` is a bounded PostgreSQL pass over pending event receipts, prepared/open/observed/in-progress attempts and pending/interrupted finalization. It retries API reads, original Session creation only within Slice 2's fixed idempotency window, and booking obligations. It never creates a replacement financial intent to repair ambiguous creation. Signed webhooks and browser reconciliation drive individual records; operators can run a pass now using:
+
+```bash
+pnpm --filter @dayotter/worker exec tsx --tsconfig ../web/tsconfig.json ../web/scripts/recover-payments.ts
+```
+
+`scripts/recover-payments.ts` requires an explicit `DATABASE_URL`, existing payment/encryption configuration, and uses the saved historical route. It logs counts rather than payloads/secrets. Periodic deployment/worker scheduling and monitoring are **not implemented** in this slice and must be arranged before live operation; no production command/configuration was changed during this work. Review queries should include attempts with `state = 'requires_review'` **or non-null `review_code`** and finalization `requires_review`, plus pending inbox failures.
+
+| Crash point | Durable next action |
+| --- | --- |
+| Before receipt/observation commit | Stripe delivery retry; recovery re-reads prepared/open Session with its saved terms. |
+| After receipt, before success observation | Pending inbox reprocesses original event/account relationship. |
+| After success observation, before booking | `payment_succeeded/fulfilling` retains paid obligation; retry requires no Redis or new quote. |
+| During booking transaction | Entire booking/snapshot/attempt binding/context rolls back; paid observation remains. |
+| Immediately after booking commit | Existing binding returns same booking; pending finalization is discoverable. |
+| Before external invocation | Atomic pending→running claim permits one invocation. |
+| During/after an external effect, before invocation status commit | Running state and saved start time remain; after ten minutes recovery records ambiguous review and **does not automatically replay**. |
+
+### Bounded ancillary finalization and remaining gap
+
+`payment-finalization.ts:finalizePaymentBooking` atomically claims `pending → running`, tracks the start time, and invokes the existing `finalizeConfirmedBooking` once. Concurrent callers leave an active invocation alone. Successful return records `attempted`; a thrown/interrupted invocation records `requires_review`. Ten minutes is a conservative ambiguity threshold, not proof the original worker is dead; even a slow original invocation never causes automatic duplicate invocation. Existing fulfilled Slice 2 rows with no context are not backfilled or replayed. A booking changed/cancelled before first invocation is reviewed instead of finalizing stale details.
+
+**`attempted` is not a delivery guarantee.** The existing finalizer and helpers catch individual calendar/Zoom/reminder/email/webhook/plugin/automation/travel failures; a Redis queue request with unlimited retries can also leave an invocation running until an operator intervenes; missing email configuration can also return without delivery. This slice keeps financial/booking truth independent of these failures and persists enough context/progress for review, but does not make every external effect resumable or exactly once. A full per-effect outbox with provider idempotency, completion tracking and reconciliation is still required for guaranteed ancillary delivery. Cancellation/rescheduling racing external invocation likewise needs lifecycle-aware per-effect handling later. Do not blindly rerun the whole finalizer to resolve ambiguity.
+
+### Slice 4 and operational dependencies
+
+Durable refund/compensation lifecycle, paid slot-conflict resolution, provider reconciliation and operator review tooling remain next-slice work. An external refund after success observation is not automatically fenced against booking fulfillment in this slice; Slice 4 must reconcile later refund/dispute facts and coordinate compensation with the same attempt/booking transaction boundary. Original success facts remain true historical observations even if a later refund occurs; duplicates of an already bound booking do not reject it merely because its charge was subsequently refunded. Legacy Redis/payment-intent lookup/refund behavior retains its original weaker crash/concurrency guarantees and is not claimed to be hardened. Package entitlements, holds, resources and recurring paid-series semantics remain excluded. Periodic recovery, review monitoring and external-effect delivery guarantees are prerequisites to assess before enabling production payments.
+
+### Slice 3 validation checkpoint
+
+On 2026-10-01 (America/Boise), validation passed on the complete Slice 3 tree:
+
+- Focused payment tests plus all database regressions: **149 passed** (including **51 PostgreSQL tests**: 32 fulfillment/concurrency/upgrade tests, 5 intent tests, 14 promotion/pricing tests).
+- Full `@dayotter/web` suite with both guarded test database URLs enabled: **349 passed, none skipped**, 45 files. Both test commands used `--maxWorkers=1 --minWorkers=1`.
+- `NODE_OPTIONS=--max-old-space-size=4096 pnpm --filter @dayotter/web typecheck`: passed.
+- `pnpm --filter @dayotter/db typecheck`: passed.
+- Scoped Biome over the 26 changed TypeScript/TSX files and `git diff --check`: passed.
+- Generated snapshot comparison changed only `payment_attempts` and the new `payment_events`; the 0065 snapshot chain and migration journal match. Integration setup applied every repository migration, including the handwritten guards, and exercised upgrade of a real 0064 fulfilled fixture.
+
+Tests used a disposable PostgreSQL 17 container with a free loopback-only port, tmpfs storage and no mounts/volumes. Test URLs existed only in validation process environments; each database suite created/migrated/dropped its own guarded disposable database. No deployed database, real Stripe credentials or production configuration was used. The container was removed after validation.
+
+Final review specifically exercised duplicate receipts/events, twelve concurrent fulfillment calls, browser/webhook racing, commit/rollback boundaries, interrupted finalization, acknowledged unpaid receipts followed by observed success, conflicting identifiers/terms/environment/account, delayed settlement, API/DB/provider failures, cross-attempt payment identity conflicts, legacy distinction and current routing configuration changes. Ordinary formatting/test fixture fixes were incorporated. The review also removed connection-holding session locks, guarded stale ambiguity/failure decisions, classified identity uniqueness failures as review and sanitized new Stripe read errors. This is a Slice 3 checkpoint, not authorization to enable live payments or a claim of completed durable refunds/per-effect delivery.

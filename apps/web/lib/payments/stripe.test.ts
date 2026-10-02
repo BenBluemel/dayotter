@@ -4,6 +4,8 @@ import { paymentRoutingConfig, resolvePaymentRoute } from "./routing";
 const mocks = vi.hoisted(() => ({
   checkout: vi.fn(),
   retrieve: vi.fn(),
+  intent: vi.fn(),
+  sessions: vi.fn(),
   account: vi.fn(),
   refund: vi.fn(),
   balance: vi.fn(),
@@ -14,7 +16,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../server/env", () => ({ env: mocks.env }));
 vi.mock("stripe", () => ({
   default: class {
-    checkout = { sessions: { create: mocks.checkout, retrieve: mocks.retrieve } };
+    checkout = {
+      sessions: { create: mocks.checkout, retrieve: mocks.retrieve, list: mocks.sessions },
+    };
+    paymentIntents = { retrieve: mocks.intent };
     accounts = { retrieve: mocks.account };
     refunds = { create: mocks.refund };
     balance = { retrieve: mocks.balance };
@@ -29,7 +34,9 @@ import {
   createConnectedPayout,
   createSubscriptionCheckout,
   refundPayment,
+  retrievePaymentIntent,
   retrieveSession,
+  sessionForPaymentIntent,
 } from "./stripe";
 
 const organizationId = "00000000-0000-4000-8000-000000000001";
@@ -70,6 +77,49 @@ beforeEach(() => {
       ? { id, charges_enabled: true, capabilities: { transfers: "active" } }
       : { id: "acct_merchant" },
   );
+});
+
+it("verifies the original merchant and expands the charge while current sales are disabled", async () => {
+  const saved = route();
+  mocks.env.STRIPE_PAYMENT_MODE = "disabled";
+  mocks.env.STRIPE_ACCOUNT_ID = "acct_new_deployment";
+  mocks.env.STRIPE_PAYMENT_ENVIRONMENT = "live";
+  mocks.intent.mockResolvedValue({ id: "pi_saved" });
+  await expect(retrievePaymentIntent("pi_saved", saved)).resolves.toMatchObject({ id: "pi_saved" });
+  expect(mocks.intent).toHaveBeenCalledWith("pi_saved", { expand: ["latest_charge"] });
+  mocks.account.mockResolvedValue({ id: "acct_wrong" });
+  await expect(retrievePaymentIntent("pi_saved", saved)).rejects.toThrow("expected charge account");
+});
+it("new payment verification errors do not expose Stripe credential details", async () => {
+  const saved = route();
+  mocks.intent.mockRejectedValue(new Error(`Invalid API key: ${mocks.env.STRIPE_SECRET_KEY}`));
+  const error = await retrievePaymentIntent("pi_saved", saved).catch((value: unknown) => value);
+  expect(String(error)).not.toContain(mocks.env.STRIPE_SECRET_KEY);
+  expect(error).toMatchObject({ status: 503 });
+  expect(error).not.toHaveProperty("cause");
+  mocks.sessions.mockRejectedValue(new Error(`Invalid API key: ${mocks.env.STRIPE_SECRET_KEY}`));
+  const relationshipError = await sessionForPaymentIntent("pi_saved", saved).catch(
+    (value: unknown) => value,
+  );
+  expect(String(relationshipError)).not.toContain(mocks.env.STRIPE_SECRET_KEY);
+  expect(relationshipError).toMatchObject({ status: 503 });
+});
+
+it("looks up the unique Checkout Session under saved context, without connected-account headers", async () => {
+  const saved = route();
+  mocks.env.STRIPE_PAYMENT_MODE = "disabled";
+  mocks.sessions.mockResolvedValue({ data: [{ id: "cs_saved" }], has_more: false });
+  await expect(sessionForPaymentIntent("pi_saved", saved)).resolves.toMatchObject({
+    id: "cs_saved",
+  });
+  expect(mocks.sessions).toHaveBeenCalledWith({ payment_intent: "pi_saved", limit: 2 });
+});
+it("distinguishes an unavailable relationship from contradictory duplicate Sessions", async () => {
+  const saved = route();
+  mocks.sessions.mockResolvedValue({ data: [], has_more: false });
+  await expect(sessionForPaymentIntent("pi_saved", saved)).rejects.toMatchObject({ status: 503 });
+  mocks.sessions.mockResolvedValue({ data: [{ id: "cs_one" }, { id: "cs_two" }], has_more: false });
+  await expect(sessionForPaymentIntent("pi_saved", saved)).rejects.toMatchObject({ status: 409 });
 });
 
 describe("Stripe routing at the SDK boundary", () => {

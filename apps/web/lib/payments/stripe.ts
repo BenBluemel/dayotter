@@ -3,6 +3,7 @@ import { logger } from "@dayotter/core";
 import Stripe from "stripe";
 import { env } from "../server/env";
 import {
+  PaymentContradictionError,
   type PaymentRoute,
   PaymentRoutingError,
   type StripeContext,
@@ -166,6 +167,40 @@ export async function retrieveSession(
 ): Promise<Stripe.Checkout.Session> {
   const gateway = route ? await stripeForContext(route) : stripe();
   return gateway.checkout.sessions.retrieve(id);
+}
+
+/** Verify settlement under the original merchant; sales mode is deliberately irrelevant. */
+export async function retrievePaymentIntent(
+  id: string,
+  route: PaymentRoute,
+): Promise<Stripe.PaymentIntent> {
+  return (await stripeForContext(route)).paymentIntents
+    .retrieve(id, { expand: ["latest_charge"] })
+    .catch(() => {
+      throw new PaymentRoutingError("Stripe payment verification is temporarily unavailable");
+    });
+}
+
+/** Recover an unbound Session from its immutable PaymentIntent identity. */
+export async function sessionForPaymentIntent(
+  id: string,
+  route: PaymentRoute,
+): Promise<Stripe.Checkout.Session> {
+  const sessions = await (await stripeForContext(route)).checkout.sessions
+    .list({
+      payment_intent: id,
+      limit: 2,
+    })
+    .catch(() => {
+      throw new PaymentRoutingError(
+        "Stripe payment relationship retrieval is temporarily unavailable",
+      );
+    });
+  if (sessions.data.length > 1 || sessions.has_more)
+    throw new PaymentContradictionError("PaymentIntent has conflicting Checkout Sessions");
+  if (!sessions.data.length)
+    throw new PaymentRoutingError("PaymentIntent Session is not yet available");
+  return sessions.data[0]!;
 }
 
 /** Refund a captured payment (best-effort). Returns true on success. For a

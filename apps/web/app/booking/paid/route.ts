@@ -14,13 +14,14 @@ export async function GET(request: Request) {
   if (!stripeConfigured || !sessionId) return NextResponse.redirect(`${appUrl}/`);
 
   try {
-    const { uid, pending } = await fulfillCheckout(sessionId);
+    const { uid, state } = await fulfillCheckout(sessionId);
     if (uid) return NextResponse.redirect(`${appUrl}/booking/${uid}`);
-    // Payment succeeded but the booking row isn't ready yet (webhook mid-flight).
+    if (state === "requires_review")
+      return NextResponse.redirect(`${appUrl}/booking/payment-review`);
+    // Neither payment settlement nor fulfillment is inferred from the redirect.
     return NextResponse.redirect(`${appUrl}/booking/processing`);
-    // (unreachable branch kept intentionally simple)
   } catch (err) {
     logger.error("payment success handler failed", { event: "payment_success_failed", err });
-    return NextResponse.redirect(`${appUrl}/booking/payment-failed`);
+    return NextResponse.redirect(`${appUrl}/booking/processing`);
   }
 }

@@ -18,7 +18,7 @@ vi.mock("./connect", () => ({
     };
   },
 }));
-import { fixtureSession } from "./attempt-fixtures";
+import { fixturePaymentIntent, fixtureSession } from "./attempt-fixtures";
 import { bindAttemptSession, findAppointmentAttempt, prepareAppointmentAttempt } from "./attempts";
 
 // Only a disposable loopback test database. Never DATABASE_URL or production fallback.
@@ -160,6 +160,15 @@ describe.skipIf(!testUrl)("durable appointment intents PostgreSQL integration", 
       status: "complete" as const,
     };
     const bound = await bindAttemptSession(attempt!, session, db);
+    const { verifiedPaymentFacts } = await import("./payment-success");
+    await db
+      .update(schema.paymentAttempts)
+      .set({
+        state: "payment_succeeded",
+        paymentSucceededAt: new Date(),
+        successFacts: verifiedPaymentFacts(bound, session, fixturePaymentIntent(bound, session)),
+      })
+      .where(eq(schema.paymentAttempts.id, bound.id));
     const { persistBookingPricingSnapshot } = await import("../booking/pricing");
     const bookingId = randomUUID();
     await db.transaction(async (tx) => {
@@ -192,7 +201,12 @@ describe.skipIf(!testUrl)("durable appointment intents PostgreSQL integration", 
         .where(eq(schema.bookings.id, bookingId));
       await tx
         .update(schema.paymentAttempts)
-        .set({ state: "fulfilled", bookingId })
+        .set({
+          state: "fulfilled",
+          bookingId,
+          finalizationContext: "encrypted-test-context",
+          finalizationState: "pending",
+        })
         .where(eq(schema.paymentAttempts.id, bound.id));
     });
     const stored = await db.query.paymentAttempts.findFirst({

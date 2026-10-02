@@ -1,35 +1,39 @@
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, inArray, isNull, schema } from "@dayotter/db";
+import { eq, getDb, schema } from "@dayotter/db";
 import type Stripe from "stripe";
 import { BookingError, createBooking } from "../booking/create-booking";
-import { type PaymentAttempt, decodeAttempt, validateAttemptSession } from "./attempt-terms";
-import { bindAttemptSession } from "./attempts";
+import { PAYMENT_ATTEMPT_ID_PATTERN, type PaymentAttempt, decodeAttempt } from "./attempt-terms";
+import { reconcileSession } from "./payment-events";
+import { requirePaymentReview } from "./payment-work";
 import { claimPendingBooking } from "./pending";
-import { PaymentRoutingError } from "./routing";
+import { PaymentContradictionError, PaymentRoutingError } from "./routing";
 import { refundPayment, retrieveSession } from "./stripe";
 
 /**
  * Turn a paid Checkout Session into a confirmed booking. New appointment Sessions
  * use durable saved terms and a transactional attempt/booking binding. Older
  * Sessions retain the legacy Redis GETDEL path and PaymentIntent lookup below.
- * Durable webhook and post-commit finalization recovery remain Slice 3.
+ * Durable event receipts and success observations make new attempts recoverable.
  *
  * Returns the booking uid, or `pending: true` when the other handler is mid-flight.
  */
 export async function fulfillCheckout(
   sessionId: string,
-): Promise<{ uid: string | null; pending: boolean }> {
+): Promise<{ uid: string | null; pending: boolean; state?: string }> {
   const db = getDb();
   const known = await db.query.paymentAttempts.findFirst({
     where: eq(schema.paymentAttempts.checkoutSessionId, sessionId),
   });
   const session = await retrieveSession(sessionId, known ? decodeAttempt(known).route : undefined);
-  if (known || session.metadata?.attemptId) {
-    const attempt =
-      known ??
-      (await db.query.paymentAttempts.findFirst({
-        where: eq(schema.paymentAttempts.id, session.metadata!.attemptId!),
-      }));
+  const reference = session.metadata?.attemptId || session.client_reference_id;
+  const referenced =
+    !known && reference && PAYMENT_ATTEMPT_ID_PATTERN.test(reference)
+      ? await db.query.paymentAttempts.findFirst({
+          where: eq(schema.paymentAttempts.id, reference),
+        })
+      : null;
+  if (known || referenced || session.metadata?.attemptId) {
+    const attempt = known ?? referenced;
     if (!attempt) throw new PaymentRoutingError("Durable checkout intent is missing");
     // Response-loss recovery must verify the saved credential/account even when no Session ID was bound.
     const verified = known
@@ -94,67 +98,28 @@ export async function fulfillCheckout(
   }
 }
 
-/** Minimal saved-terms handoff; durable event/finalization recovery remains Slice 3. */
+/** Browser reconciliation uses authenticated Stripe reads, just like event processing. */
 async function fulfillDurableAppointment(
   attempt: PaymentAttempt,
   session: Stripe.Checkout.Session,
 ) {
-  const terms = decodeAttempt(attempt);
-  const saved = await bindAttemptSession(attempt, session);
-  if (session.payment_status !== "paid") return { uid: null, pending: true };
-  const pi = validateAttemptSession(saved, session, true)!;
-  const db = getDb();
-  if (saved.bookingId) {
-    const booking = await db.query.bookings.findFirst({
-      where: eq(schema.bookings.id, saved.bookingId),
-    });
-    if (!booking || booking.paymentIntentId !== pi)
-      throw new PaymentRoutingError("Saved booking settlement is inconsistent");
-    return { uid: booking.uid, pending: false };
-  }
-  if (!["prepared", "open"].includes(saved.state))
-    throw new PaymentRoutingError("Payment attempt requires reconciliation");
   try {
-    const result = await createBooking({
-      ...terms.input,
-      paymentAttemptId: saved.id,
-      pricingQuote: terms.quote,
-      quotedDurationMinutes: terms.resolvedDurationMinutes,
-      payment: {
-        paymentIntentId: pi,
-        amountPaid: saved.amount,
-        currency: saved.currency,
-        destinationAccountId: saved.destinationAccountId ?? undefined,
-      },
+    const state = await reconcileSession(attempt, session);
+    const saved = await getDb().query.paymentAttempts.findFirst({
+      where: eq(schema.paymentAttempts.id, attempt.id),
     });
-    return { uid: result.uid, pending: false };
-  } catch (err) {
-    // Booking creation binds the attempt in the same transaction. Never compensate
-    // a booking committed before finalization failed, or a concurrent winner.
-    const latest = await db.query.paymentAttempts.findFirst({
-      where: eq(schema.paymentAttempts.id, saved.id),
-    });
-    if (latest?.bookingId) {
-      const booking = await db.query.bookings.findFirst({
-        where: eq(schema.bookings.id, latest.bookingId),
+    if (saved?.bookingId) {
+      const booking = await getDb().query.bookings.findFirst({
+        where: eq(schema.bookings.id, saved.bookingId),
       });
-      if (booking) return { uid: booking.uid, pending: false };
+      if (booking && booking.paymentIntentId === saved.paymentIntentId)
+        return { uid: booking.uid, pending: false, state };
     }
-    if (err instanceof BookingError) {
-      const claimed = await db
-        .update(schema.paymentAttempts)
-        .set({ state: "requires_review" })
-        .where(
-          and(
-            eq(schema.paymentAttempts.id, saved.id),
-            inArray(schema.paymentAttempts.state, ["prepared", "open"]),
-            isNull(schema.paymentAttempts.bookingId),
-          ),
-        )
-        .returning();
-      // Retain the existing best-effort compensation, using original typed routing.
-      // This state is NOT proof of a refund; retries/reconciliation are Slice 4.
-      if (claimed.length) await refundPayment(pi, terms.route);
+    return { uid: null, pending: true, state };
+  } catch (err) {
+    if (err instanceof PaymentContradictionError) {
+      await requirePaymentReview(attempt.id, "stripe_terms_contradiction");
+      return { uid: null, pending: true, state: "requires_review" };
     }
     throw err;
   }

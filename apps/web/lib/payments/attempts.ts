@@ -164,12 +164,11 @@ export async function bindAttemptSession(
       .for("update");
     if (!current) throw new PaymentRoutingError("Checkout intent is missing");
     const pi = validateAttemptSession(current, session);
-    const state =
-      current.state === "fulfilled" || current.state === "requires_review"
-        ? current.state
-        : session.status === "expired"
-          ? "expired"
-          : "open";
+    const state = !["prepared", "open"].includes(current.state)
+      ? current.state
+      : session.status === "expired"
+        ? "expired"
+        : "open";
     const [updated] = await tx
       .update(schema.paymentAttempts)
       .set({
@@ -209,7 +208,7 @@ export async function appointmentCheckout(attempt: PaymentAttempt) {
   if (!mayCreateSession(attempt)) {
     await getDb()
       .update(schema.paymentAttempts)
-      .set({ state: "requires_review" })
+      .set({ state: "requires_review", reviewCode: "creation_ambiguous" })
       .where(
         and(
           eq(schema.paymentAttempts.id, attempt.id),

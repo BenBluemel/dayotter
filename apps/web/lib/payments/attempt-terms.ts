@@ -4,7 +4,9 @@ import type Stripe from "stripe";
 import { z } from "zod";
 import type { CreateBookingInput } from "../booking/create-booking";
 import { canonicalJson } from "./canonical-json";
-import { type PaymentRoute, PaymentRoutingError } from "./routing";
+import { PaymentContradictionError, type PaymentRoute } from "./routing";
+
+export const PAYMENT_ATTEMPT_ID_PATTERN = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 
 export type PaymentAttempt = typeof schema.paymentAttempts.$inferSelect;
 export const CHECKOUT_LIFETIME_SECONDS = 2 * 60 * 60;
@@ -71,11 +73,11 @@ export function attemptRoute(attempt: PaymentAttempt): PaymentRoute {
   };
   if (attempt.paymentMode === "direct") {
     if (attempt.destinationAccountId || attempt.applicationFeeAmount !== 0)
-      throw new PaymentRoutingError("Invalid saved direct routing");
+      throw new PaymentContradictionError("Invalid saved direct routing");
     return { ...context, mode: "direct" };
   }
   if (!attempt.destinationAccountId || attempt.destinationAccountId === attempt.chargeAccountId)
-    throw new PaymentRoutingError("Invalid saved Connect routing");
+    throw new PaymentContradictionError("Invalid saved Connect routing");
   return {
     ...context,
     mode: "connect",
@@ -111,7 +113,7 @@ export function decodeAttempt(attempt: PaymentAttempt) {
     quote.amountToCollect !== attempt.amount ||
     quote.currency !== attempt.currency
   ) {
-    throw new PaymentRoutingError("Saved checkout intent and pricing terms disagree");
+    throw new PaymentContradictionError("Saved checkout intent and pricing terms disagree");
   }
   // Integrity check of immutable numbers only; never run quote/promotion selection at fulfillment.
   const p = quote.promotion;
@@ -129,7 +131,7 @@ export function decodeAttempt(attempt: PaymentAttempt) {
         new Date(quote.appointmentStartsAt) >= new Date(p.endsAt) ||
         (p.discount.kind === "fixed" && p.discount.currency !== quote.currency)))
   ) {
-    throw new PaymentRoutingError("Invalid saved pricing arithmetic");
+    throw new PaymentContradictionError("Invalid saved pricing arithmetic");
   }
   return {
     input,
@@ -170,7 +172,7 @@ export function validateAttemptSession(
     (attempt.paymentIntentId && pi !== attempt.paymentIntentId) ||
     (requirePaid && (session.status !== "complete" || session.payment_status !== "paid" || !pi))
   ) {
-    throw new PaymentRoutingError("Stripe Session does not match the saved checkout terms");
+    throw new PaymentContradictionError("Stripe Session does not match the saved checkout terms");
   }
   return pi;
 }

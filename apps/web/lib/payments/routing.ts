@@ -37,6 +37,14 @@ interface RoutingEnvironment {
   NODE_ENV?: string;
 }
 
+/** Permanent disagreement with saved commercial facts, distinct from credential/config outages. */
+export class PaymentContradictionError extends PaymentRoutingError {
+  constructor(message: string) {
+    super(message, 409);
+    this.name = "PaymentContradictionError";
+  }
+}
+
 export function assertStripeKeyEnvironment(key: string | undefined, environment: "test" | "live") {
   // Account-scoped secret/restricted keys only; organization keys require a
   // different account-context design. Never echo credential values in errors.

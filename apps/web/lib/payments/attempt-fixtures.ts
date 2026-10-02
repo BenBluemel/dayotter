@@ -63,6 +63,15 @@ export function fixtureAttempt(): PaymentAttempt {
     createdAt,
     creationDeadline: new Date(createdAt.getTime() + 900000),
     expiresAt: new Date(createdAt.getTime() + 7200000),
+    paymentSucceededAt: null,
+    successFacts: null,
+    nextRecoveryAt: createdAt,
+    recoveryFailures: 0,
+    reviewCode: null,
+    finalizationContext: null,
+    finalizationState: null,
+    finalizationReviewCode: null,
+    finalizationStartedAt: null,
     state: "prepared",
     checkoutSessionId: null,
     checkoutUrl: null,
@@ -95,4 +104,49 @@ export function fixtureSession(attempt: PaymentAttempt): Stripe.Checkout.Session
       ...(attempt.destinationAccountId ? { dest: attempt.destinationAccountId } : {}),
     },
   } as unknown as Stripe.Checkout.Session;
+}
+
+export function fixturePaidSession(attempt: PaymentAttempt): Stripe.Checkout.Session {
+  return {
+    ...fixtureSession(attempt),
+    id: attempt.checkoutSessionId ?? `cs_${attempt.id.replaceAll("-", "")}`,
+    status: "complete",
+    payment_status: "paid",
+    payment_intent: attempt.paymentIntentId ?? `pi_${attempt.id.replaceAll("-", "")}`,
+  };
+}
+
+export function fixturePaymentIntent(
+  attempt: PaymentAttempt,
+  session = fixturePaidSession(attempt),
+): Stripe.PaymentIntent {
+  const piId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent!.id;
+  return {
+    id: piId,
+    status: "succeeded",
+    amount: attempt.amount,
+    amount_received: attempt.amount,
+    currency: attempt.currency,
+    livemode: attempt.environment === "live",
+    metadata: { ...session.metadata },
+    application_fee_amount: attempt.paymentMode === "connect" ? attempt.applicationFeeAmount : null,
+    transfer_data: attempt.destinationAccountId
+      ? { destination: attempt.destinationAccountId }
+      : null,
+    on_behalf_of: null,
+    latest_charge: {
+      id: `ch_${attempt.id.replaceAll("-", "")}`,
+      livemode: attempt.environment === "live",
+      paid: true,
+      captured: true,
+      status: "succeeded",
+      payment_intent: piId,
+      amount: attempt.amount,
+      currency: attempt.currency,
+      amount_refunded: 0,
+    },
+  } as unknown as Stripe.PaymentIntent;
 }

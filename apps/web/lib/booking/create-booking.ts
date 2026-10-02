@@ -6,6 +6,7 @@ import { and, eq, getDb, gte, inArray, lt, schema, sql } from "@dayotter/db";
 import { bookingRequested, newBookingRequest, sendEmail } from "@dayotter/emails";
 import { DateTime } from "luxon";
 import { canonicalJson, decodeAttempt } from "../payments/attempt-terms";
+import { bindPaidBooking } from "../payments/payment-finalization";
 import {
   SLOT_REVALIDATION_WINDOW_MS,
   combineHostSlots,
@@ -318,7 +319,13 @@ export async function createBooking(
           .from(schema.paymentAttempts)
           .where(eq(schema.paymentAttempts.id, input.paymentAttemptId))
           .for("update");
-        if (!attempt || attempt.bookingId || !["prepared", "open"].includes(attempt.state)) {
+        if (
+          !attempt ||
+          attempt.bookingId ||
+          !attempt.successFacts ||
+          !attempt.paymentSucceededAt ||
+          !["payment_succeeded", "fulfilling"].includes(attempt.state)
+        ) {
           throw new BookingError("Payment attempt is not available for booking", 409);
         }
         const saved = decodeAttempt(attempt);
@@ -326,6 +333,8 @@ export async function createBooking(
           input;
         if (
           !attempt.checkoutSessionId ||
+          attempt.successFacts?.amount !== payment?.amountPaid ||
+          attempt.successFacts?.currency !== payment?.currency ||
           attempt.paymentIntentId !== payment?.paymentIntentId ||
           canonicalJson(saved.input) !== canonicalJson(bookingInput) ||
           canonicalJson(saved.quote) !== canonicalJson(pricingQuote) ||
@@ -582,10 +591,15 @@ export async function createBooking(
         }
       }
       if (input.paymentAttemptId) {
-        await tx
-          .update(schema.paymentAttempts)
-          .set({ state: "fulfilled", bookingId: row.id })
-          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId));
+        await bindPaidBooking(tx, input.paymentAttemptId, {
+          booking: row,
+          eventType,
+          host,
+          attendee: input.attendee,
+          guests,
+          notes: input.notes,
+          appUrl,
+        });
       }
 
       await tx.insert(schema.bookingAttendees).values([
@@ -678,6 +692,8 @@ export async function createBooking(
     }
     return { uid, redirectUrl: eventType.redirectUrl ?? null };
   }
+
+  if (input.paymentAttemptId) return { uid, redirectUrl: eventType.redirectUrl ?? null };
 
   // Confirmed immediately: run every confirmed-booking side-effect (meeting link,
   // host calendar, reminders, workflows, travel, confirmation emails, recurring
