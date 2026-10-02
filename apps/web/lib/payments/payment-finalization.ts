@@ -61,30 +61,44 @@ export async function finalizePaymentBooking(attemptId: string, db: Database = g
     const context = decryptJson<FinalizeContext>(attempt.finalizationContext);
     context.booking.startsAt = new Date(context.booking.startsAt);
     context.booking.endsAt = new Date(context.booking.endsAt);
-    const current = await db.query.bookings.findFirst({
-      where: eq(schema.bookings.id, attempt.bookingId),
+    // Share cancellation's attempt -> booking lock order. Reading the booking
+    // and then claiming outside this transaction could start a stale finalizer
+    // after cancellation/refund had already been accepted.
+    const claimed = await db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select()
+        .from(schema.paymentAttempts)
+        .where(eq(schema.paymentAttempts.id, attempt.id))
+        .for("update");
+      if (locked?.finalizationState !== "pending") return [];
+      const [current] = await tx
+        .select()
+        .from(schema.bookings)
+        .where(eq(schema.bookings.id, attempt.bookingId!))
+        .for("update");
+      if (
+        !current ||
+        current.id !== context.booking.id ||
+        current.paymentIntentId !== attempt.paymentIntentId ||
+        current.status !== "confirmed" ||
+        current.startsAt.getTime() !== context.booking.startsAt.getTime() ||
+        current.endsAt.getTime() !== context.booking.endsAt.getTime()
+      ) {
+        await tx
+          .update(schema.paymentAttempts)
+          .set({
+            finalizationState: "requires_review",
+            finalizationReviewCode: "booking_changed_before_finalization",
+          })
+          .where(eq(schema.paymentAttempts.id, attempt.id));
+        return [];
+      }
+      return tx
+        .update(schema.paymentAttempts)
+        .set({ finalizationState: "running", finalizationStartedAt: new Date() })
+        .where(eq(schema.paymentAttempts.id, attempt.id))
+        .returning();
     });
-    if (
-      !current ||
-      current.id !== context.booking.id ||
-      current.paymentIntentId !== attempt.paymentIntentId ||
-      current.status !== "confirmed" ||
-      current.startsAt.getTime() !== context.booking.startsAt.getTime() ||
-      current.endsAt.getTime() !== context.booking.endsAt.getTime()
-    ) {
-      await review("booking_changed_before_finalization");
-      return;
-    }
-    const claimed = await db
-      .update(schema.paymentAttempts)
-      .set({ finalizationState: "running", finalizationStartedAt: new Date() })
-      .where(
-        and(
-          eq(schema.paymentAttempts.id, attempt.id),
-          eq(schema.paymentAttempts.finalizationState, "pending"),
-        ),
-      )
-      .returning();
     if (!claimed.length) return;
     ownsInvocation = true;
     await finalizeConfirmedBooking(context);

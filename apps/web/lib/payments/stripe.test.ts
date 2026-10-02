@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { paymentRoutingConfig, resolvePaymentRoute } from "./routing";
 
 const mocks = vi.hoisted(() => ({
@@ -8,6 +8,9 @@ const mocks = vi.hoisted(() => ({
   sessions: vi.fn(),
   account: vi.fn(),
   refund: vi.fn(),
+  refundRead: vi.fn(),
+  refundList: vi.fn(),
+  charge: vi.fn(),
   balance: vi.fn(),
   payout: vi.fn(),
   webhook: vi.fn(),
@@ -21,25 +24,35 @@ vi.mock("stripe", () => ({
     };
     paymentIntents = { retrieve: mocks.intent };
     accounts = { retrieve: mocks.account };
-    refunds = { create: mocks.refund };
+    refunds = { create: mocks.refund, retrieve: mocks.refundRead, list: mocks.refundList };
+    charges = { retrieve: mocks.charge };
     balance = { retrieve: mocks.balance };
     payouts = { create: mocks.payout };
     webhooks = { constructEvent: mocks.webhook };
   },
 }));
+import { directRefundAttempt, fixtureRefundOperation } from "./refund-fixtures";
 import {
   connectedBalances,
   constructWebhookEvent,
   createCheckoutSession,
   createConnectedPayout,
+  createOperationRefund,
   createSubscriptionCheckout,
+  listOperationRefunds,
   refundPayment,
+  retrieveOperationRefund,
   retrievePaymentIntent,
   retrieveSession,
   sessionForPaymentIntent,
 } from "./stripe";
 
 const organizationId = "00000000-0000-4000-8000-000000000001";
+const originalEncryptionKey = process.env.ENCRYPTION_KEY;
+afterAll(() => {
+  if (originalEncryptionKey === undefined) Reflect.deleteProperty(process.env, "ENCRYPTION_KEY");
+  else process.env.ENCRYPTION_KEY = originalEncryptionKey;
+});
 const ready = { accountId: "acct_host", chargesEnabled: true, transfersEnabled: true };
 const params = {
   amount: 5000,
@@ -57,6 +70,7 @@ const route = () =>
   });
 
 beforeEach(() => {
+  process.env.ENCRYPTION_KEY = "ab".repeat(32);
   vi.clearAllMocks();
   for (const key of Object.keys(mocks.env)) delete mocks.env[key];
   Object.assign(mocks.env, {
@@ -77,6 +91,75 @@ beforeEach(() => {
       ? { id, charges_enabled: true, capabilities: { transfers: "active" } }
       : { id: "acct_merchant" },
   );
+});
+
+describe("durable refund SDK boundary", () => {
+  it.each(["direct", "connect", "connect-zero"])(
+    "uses immutable %s route, fee and Stripe key despite deployment changes",
+    async (mode) => {
+      const operation = fixtureRefundOperation(
+        mode === "direct" ? directRefundAttempt() : undefined,
+      );
+      operation.chargeAccountId = "acct_merchant";
+      if (mode === "connect-zero") operation.applicationFeeAmount = 0;
+      operation.firstSubmittedAt = new Date();
+      mocks.env.STRIPE_PAYMENT_MODE = "disabled";
+      mocks.env.STRIPE_ACCOUNT_ID = "acct_new_deployment";
+      mocks.env.STRIPE_PLATFORM_FEE_PERCENT = "99";
+      await createOperationRefund(operation);
+      const [request, options] = mocks.refund.mock.calls[0]!;
+      expect(request).toEqual({
+        charge: operation.chargeId,
+        amount: operation.amount,
+        reason: "requested_by_customer",
+        metadata: { refundOperationId: operation.id, paymentAttemptId: operation.attemptId },
+        ...(mode === "direct" ? {} : { reverse_transfer: true }),
+        ...(mode === "connect" ? { refund_application_fee: true } : {}),
+      });
+      expect(options).toEqual({ idempotencyKey: operation.idempotencyKey });
+      await createOperationRefund(operation);
+      expect(mocks.refund.mock.calls[1]![1]).toEqual(options);
+      expect(options).not.toHaveProperty("stripeAccount");
+    },
+  );
+  it("retrieves known refunds under the original account with reversal evidence", async () => {
+    const operation = fixtureRefundOperation(directRefundAttempt());
+    operation.chargeAccountId = "acct_merchant";
+    mocks.refundRead.mockResolvedValue({ id: "re_saved" });
+    mocks.charge.mockResolvedValue({ id: operation.chargeId });
+    const evidence = await retrieveOperationRefund(operation, "re_saved");
+    expect(evidence.chargeAccountId).toBe("acct_merchant");
+    expect(mocks.refundRead).toHaveBeenCalledWith("re_saved", { expand: ["transfer_reversal"] });
+    expect(mocks.charge).toHaveBeenCalledWith(operation.chargeId, {
+      expand: ["transfer", "application_fee"],
+    });
+  });
+  it("refuses new creation after the replay window and refuses another merchant/environment", async () => {
+    const operation = fixtureRefundOperation(directRefundAttempt());
+    operation.chargeAccountId = "acct_merchant";
+    operation.firstSubmittedAt = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    await expect(createOperationRefund(operation)).rejects.toMatchObject({ status: 409 });
+    operation.firstSubmittedAt = new Date();
+    mocks.account.mockResolvedValue({ id: "acct_other" });
+    await expect(createOperationRefund(operation)).rejects.toThrow("expected charge account");
+    mocks.env.STRIPE_SECRET_KEY = "sk_live_fixture";
+    await expect(createOperationRefund(operation)).rejects.toThrow("expected payment environment");
+    expect(mocks.refund).not.toHaveBeenCalled();
+  });
+  it("lists refunds by original charge, rejects incomplete listing and sanitizes errors", async () => {
+    const operation = fixtureRefundOperation(directRefundAttempt());
+    operation.chargeAccountId = "acct_merchant";
+    mocks.refundList.mockResolvedValue({ data: [], has_more: false });
+    await expect(listOperationRefunds(operation)).resolves.toEqual([]);
+    expect(mocks.refundList).toHaveBeenCalledWith({ charge: operation.chargeId, limit: 100 });
+    mocks.refundList.mockResolvedValue({ data: [], has_more: true });
+    await expect(listOperationRefunds(operation)).rejects.toMatchObject({ status: 409 });
+    operation.firstSubmittedAt = new Date();
+    mocks.refund.mockRejectedValue(new Error(`Invalid API key: ${mocks.env.STRIPE_SECRET_KEY}`));
+    const error = await createOperationRefund(operation).catch((value: unknown) => value);
+    expect(String(error)).not.toContain(mocks.env.STRIPE_SECRET_KEY);
+    expect(error).not.toHaveProperty("cause");
+  });
 });
 
 it("verifies the original merchant and expands the charge while current sales are disabled", async () => {

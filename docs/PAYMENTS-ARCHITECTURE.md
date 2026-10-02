@@ -1,12 +1,12 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slices 1–2 validated (Slice 2: `6dfc4f3`); Slice 3 transactional appointment fulfillment and recovery implemented on `feature/payment-routing`, validated. Slices 4–7 remain proposed.**
+Status: **Slices 1–3 validated (Slice 3: `4ec3d98`); Slice 4 full appointment cancellation refunds implemented on `feature/payment-routing`, NOT YET mechanically validated. Slices 5–7 remain proposed.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
 This document preserves the code review and Astra High audit. The source map and
 risks below describe that inspection baseline; the Slice 1 section records the
-subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. The Slice 3 section records durable success observations, transactional booking fulfillment, event recovery and bounded finalization tracking. Durable refunds and per-effect delivery guarantees remain proposed.
+subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. The Slice 3 section records durable success observations, transactional booking fulfillment, event recovery and bounded finalization tracking. The Slice 4 section records the implemented, unvalidated cancellation/refund lifecycle. Per-effect delivery guarantees remain proposed.
 
 The investigation inspected source and public Stripe documentation. It did not
 run tests, inspect live Stripe accounts or production data, change Stripe
@@ -905,7 +905,7 @@ routing flag alone is not the live-payment readiness milestone.
 | 1. Explicit topology and capabilities (validated) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
 | 2. Durable checkout and quotes (appointment implementation; validated) | Saved appointment terms, stable creation identity and expiration, minimal snapshot/booking transaction handoff. Package intent work remains deferred. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
 | 3. Transactional fulfillment and event recovery (appointment implementation; bounded finalization) | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
-| 4. Refund lifecycle | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
+| 4. Refund lifecycle (implemented, unvalidated; full appointment cancellation only) | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
 | 5. Package entitlement integrity | Verified redemption, exact grant linkage, restoration constraints, purchase fulfillment/refund policy. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |
 | 6. Remaining pricing entry points | Staff/API policy, unpaid reprice, explicit settled adjustments, occurrence settlement. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
 | 7. Cutover and compatibility | Additive migration, legacy processing, web/mobile/docs/deployment updates. | Legacy missing snapshots/duplicate audit; old Connect plus new direct records; outstanding old Sessions; account-context change; connected-balance obligations; rollback preserving new financial work; direct routes expose no withdrawal capability. |
@@ -946,7 +946,7 @@ provider semantics; the source map and risks above describe the inspected code.
 
 ## Slice 3 implementation: observed payment, transactional fulfillment and recovery
 
-This section describes implemented and mechanically validated appointment code. It supersedes the Slice 2 interim fulfillment path and the baseline Redis audit for **new durable appointment attempts only**. Packages, legacy Redis Sessions and durable refunds are unchanged. Production payments remain disabled by deployment configuration; this work does not enable them.
+This section describes implemented and mechanically validated appointment code. It supersedes the Slice 2 interim fulfillment path and the baseline Redis audit for **new durable appointment attempts only**. At the Slice 3 checkpoint, packages, legacy Redis Sessions and refunds were unchanged; the Slice 4 section below supersedes that refund limitation for verified durable paid bookings. Production payments remain disabled by deployment configuration; this work does not enable them.
 
 ### Database and state transitions
 
@@ -1024,3 +1024,111 @@ On 2026-10-01 (America/Boise), validation passed on the complete Slice 3 tree:
 Tests used a disposable PostgreSQL 17 container with a free loopback-only port, tmpfs storage and no mounts/volumes. Test URLs existed only in validation process environments; each database suite created/migrated/dropped its own guarded disposable database. No deployed database, real Stripe credentials or production configuration was used. The container was removed after validation.
 
 Final review specifically exercised duplicate receipts/events, twelve concurrent fulfillment calls, browser/webhook racing, commit/rollback boundaries, interrupted finalization, acknowledged unpaid receipts followed by observed success, conflicting identifiers/terms/environment/account, delayed settlement, API/DB/provider failures, cross-attempt payment identity conflicts, legacy distinction and current routing configuration changes. Ordinary formatting/test fixture fixes were incorporated. The review also removed connection-holding session locks, guarded stale ambiguity/failure decisions, classified identity uniqueness failures as review and sanitized new Stripe read errors. This is a Slice 3 checkpoint, not authorization to enable live payments or a claim of completed durable refunds/per-effect delivery.
+
+
+## Slice 4 implementation: durable full cancellation refunds (UNVALIDATED)
+
+This section describes the code built on validated Slice 3 commit `4ec3d98dfb36c51bd795d1d617326fb344a83ad9`. Implementation and manual diff review are complete; **tests, PostgreSQL integration/concurrency tests, typechecks, Biome and builds have NOT been run for Slice 4**. No production runtime/configuration, real Stripe credentials, deployed database or local Compose file was used. Do not treat this checkpoint as authorization to enable payments.
+
+### Boundary and historical refund terms
+
+`packages/db/src/schema/refund-operations.ts` and migration `0066_refund_operations.sql` add `refund_operations`. This supports **one full cancellation refund of the captured appointment payment** per attempt/booking/charge. It does not implement partial refunds, refunding an outstanding service balance, paid-series policy, package-credit restoration or compensation of an unbound paid appointment that could not be booked. Those paid obligations remain in Slice 3 review pending an explicit resolution policy/tool.
+
+Immutable columns retain organization, booking, original attempt, cancellation purpose, verified PaymentIntent/charge identity, captured amount/currency, Stripe test/live environment, charge account/primary credential context, direct/Connect mode, destination, actual saved application fee, stable operation UUID and Stripe idempotency key. The amount is `payment_attempts.success_facts.amount`, including a captured deposit where applicable; current service prices, promotions, deposit settings, fees or remaining balance are never recalculated. Stripe Refund ID, first submission time and successful observation time are write-once. No secret or booking-input copy is stored in a refund row.
+
+Unique indexes on attempt, booking, account/environment/charge and idempotency key prevent independent full refunds or cumulative application operations exceeding this captured payment. The refund's scoped identity is also unique. The insert trigger checks the snapshot against the verified payment attempt and the same organization's cancelled paid booking. A caller cannot insert another organization's financial terms or an excessive amount. Terms/deletion/identifier/terminal-state guards retain obligations. No historical records are automatically backfilled during migration.
+
+Apply 0066 before the new application code and drain old cancellation/refund handlers during cutover. Old Slice 3 cancellation cannot satisfy the new transaction-end obligation guard; an already in-flight legacy refund may still reach Stripe and must be reconciled as external history rather than recreated. Do not run old cancellation code against the upgraded schema or roll refund processing back after accepting new durable obligations. No cutover/deployment was performed in this pass.
+
+### Cancellation transaction and fulfillment coordination
+
+`apps/web/lib/payments/refunds.ts:decideBookingCancellation` takes the existing authorized capability UID, locks **attempt → booking**, validates settlement binding through `booking-routing.ts:originalBookingRefundRoute`, changes booking status and inserts/discovers its unique refund obligation in **one PostgreSQL transaction**, before any Stripe request. Repeated requests find the same operation even when the booking is already cancelled. A failure inserting the operation rolls cancellation back. An inconsistent durable settlement prevents cancellation and external refund execution, rather than guessing financial truth.
+
+Deferred database guards require a newly cancelled verified paid booking to have an obligation at commit, and newly refunded booking status to have a succeeded operation. Another deferred guard requires operation success and booking refunded status to commit together. Once an operation exists, the booking cannot be resurrected/rerouted or regress from refunded to paid. Attempt binding remains immutable; Slice 3 recovery returns that same booking, including its cancellation state, and never creates a replacement.
+
+`payment-finalization.ts:finalizePaymentBooking` now claims pending work while holding the same attempt → booking locks and checking current booking status. Cancellation marks pending finalization as review so it cannot start afterwards. If provider work was already running, cancellation retains `cancelled_during_finalization` review and continues its independent refund obligation. A transient booking/finalization failure still does **not** automatically decide that a refund is owed.
+
+### Operation lifecycle and Stripe execution
+
+| State | Meaning and next action |
+| --- | --- |
+| `owed` | Cancellation/refund decision committed; Stripe may not have been called. |
+| `submitting` | First outbound creation time durably recorded; outcome may be unresolved. This is not completion or a process lease. |
+| `pending` | Refund ID known and Stripe reports pending. Retrieve again; never create a replacement. |
+| `retryable` | Stripe/config/read/database failure left unresolved work; retry/reconcile with backoff and original identity. |
+| `succeeded` | Account-scoped refund/charge and required Connect reversal/fee facts verified; booking refunded status committed together. |
+| `requires_review` | Contradictory identity/terms, external/partial refund, expired creation ambiguity, failed/canceled refund, or customer-action requirement. Obligation remains retained and visible; no automatic replacement request. |
+
+`refunds.ts:executeRefundOperation` performs Stripe I/O outside database transactions. Multiple workers may issue the same outbound request, but always with identical immutable parameters and `appointment-refund:<operation-id>:v1`. Row locks serialize identifier binding and financial completion; stale pending/error observations cannot regress another worker's success. Review/complete records do not automatically reopen. A later contradictory observation may flag a succeeded row with a review code without erasing its established success.
+
+`stripe.ts:createOperationRefund` refunds the original **charge** for its exact captured amount and a fixed `requested_by_customer` API reason. Customer cancellation text remains on the booking; it is not sent to Stripe. The primary credential's environment/runtime and authenticated account identity must match the historical route. Current sales mode, configured merchant ID, Connect readiness and current platform fee do not select a new refund merchant. Account access/config outages remain recoverable; replacing the primary key with a different merchant fails closed and needs original account access restored. There is still only one primary credential context.
+
+Before creating an unknown refund, recovery lists refunds on the original charge. A matching operation metadata UUID is only correlation: completion must also verify charge/Intent identity, amount/currency, original account/environment and reversal facts. External, partial, conflicting or incompletely listed refunds enter review; the application never computes a guessed remainder. Known Refund IDs are retrieved without another create. An ID is retained immediately after an authenticated creation/list response, even if the subsequent verification read fails; contradictions cannot replace it or mark the booking refunded.
+
+Creation may replay only for **20 hours from the first durably recorded submission**, comfortably within Stripe's minimum 24-hour idempotency retention. The gateway rechecks this deadline after account verification before sending. If Stripe accepted a request before a timeout/crash, recovery finds its original refund or replays that same key within the window. After the window, a found matching refund can still reconcile, but an unresolved absence becomes review; the key/time are never rotated. A list/charge race with another worker's accepted refund retries reconciliation rather than creating another obligation or declaring a contradiction.
+
+These parameters follow Stripe's [refund creation API](https://docs.stripe.com/api/refunds/create), [refund states](https://docs.stripe.com/api/refunds/object), [idempotent request semantics](https://docs.stripe.com/api/idempotent_requests), and [transfer reversal relationship](https://docs.stripe.com/api/transfer_reversals/object).
+
+### Direct, Connect and application fees
+
+`refund-terms.ts:refundRoute` reconstructs only immutable operation routing. Direct creation omits reversal/fee flags and connected-account headers. Connect creation includes `reverse_transfer: true`; `refund_application_fee: true` appears **only** for the actual saved positive application fee. Zero-fee Connect retains its transfer reversal without the fee-refund flag. No current fee percentage is consulted.
+
+`stripe.ts:retrieveOperationRefund` retrieves the Refund with expanded transfer reversal and the original Charge with expanded transfer/application fee. `refund-terms.ts:verifyRefundEvidence` checks the write-once Refund ID, operation/attempt metadata, charge/Intent relationship, exact amount/currency, authenticated account/context and charge environment/captured facts. A succeeded Connect refund requires a full matching destination transfer reversal. A positive application fee must show the original fee amount fully refunded. Missing/contradictory evidence goes to review instead of claiming completion. Pending is not refunded; failed/canceled/requires-action states retain the known identity for operator reconciliation, including possible reversed-transfer/platform-balance consequences. No automatic second refund is generated to fix a failed first refund.
+
+The expanded transfer/fee/reversal verification and required restricted-key read permissions deserve particular validation attention. Unavailable reads do not authorize a different account/route or a guessed success.
+
+### Recovery, webhook and browser behavior
+
+`refunds.ts:recoverRefundOperations` selects bounded due owed/submitting/pending/retryable records independently of Redis. It also repairs a bounded set of pre-0066 cancelled bookings **only where Slice 3 already stored verified payment facts**; an already-refunded row without an operation enters explicit review. An inconsistent pre-upgrade booking binding is marked `refund_obligation_binding_requires_review` on its attempt, displayed as review, and excluded from repeated repair scans so other obligations can recover. Slice 2/legacy rows lacking charge observations are never synthesized into durable refund snapshots.
+
+`apps/web/scripts/recover-payments.ts` now runs appointment recovery followed by refund recovery. The existing operator command is:
+
+```bash
+pnpm --filter @dayotter/worker exec tsx --tsconfig ../web/tsconfig.json ../web/scripts/recover-payments.ts
+```
+
+It requires the explicitly configured database and original payment credentials; it logs only counts. Periodic invocation/review monitoring remains an operational deployment task. No scheduling, deployment or runtime change was made. Query refund review work using `state = 'requires_review' OR review_code IS NOT NULL`; include retryable failures and their next recovery time when diagnosing stalled work. Review resolution tooling is not implemented in this slice.
+
+Refund-related webhook events do **not** directly bind/advance operations in Slice 4. Existing webhook signature handling remains unchanged. Authenticated retrieval plus bounded PostgreSQL recovery is the authoritative refund path, so correctness does not depend on delivery of refund webhooks or trusting metadata supplied by an event/browser. Unknown refund events cannot mutate an unrelated operation. Automatic observation of arbitrary dashboard-issued refunds/disputes on unbound paid attempts remains outside this full-booking-cancellation implementation; it must be resolved before offering broader external compensation/reconciliation guarantees.
+
+`cancel-booking.ts:cancelBookingWithResult` accepts cancellation, executes/re-drives durable work and returns safe public refund state. The boolean `cancelBooking` wrapper retains existing Otter/series count semantics. `/api/bookings/[uid]/cancel` returns success for repeated cancellation of an existing booking and reports `processing`, `refunded` or `requires_review`; no raw errors or internal financial IDs are returned. Series responses report the target booking's refund state, not a guarantee about every occurrence. The booking page reads the operation and displays processing/review independently of the cancelled status. Database failure before cancellation commit does not accept cancellation; failure after commit leaves discoverable debt even if the request itself fails.
+
+### Crash review and remaining limits
+
+| Window | Durable result / recovery |
+| --- | --- |
+| Before cancellation transaction commit | Neither decision nor obligation commits; retry authorized cancellation. |
+| After cancellation/obligation commit, before Stripe | Owed operation is discoverable; already-cancelled requests still reuse it. |
+| During create / timeout | Submission time/key survive; list/retrieve/replay same original operation within the window. |
+| Stripe accepted, before Refund ID save | Metadata + original charge list recovers identity, or same key replays. |
+| Refund ID saved, before success verification/commit | Retrieve known ID; keep booking paid until verified transaction completes. |
+| During success transaction | Operation and booking status roll back together; retry known Refund. |
+| Immediately after success commit | Duplicate calls return persisted refunded state; no new create. |
+| Config change / server restart / Redis loss | Original operation snapshot and PostgreSQL discovery remain authoritative. |
+| Cleanup/finalization failure | Cancellation/payment/refund truth remains committed; financial work is not replayed because calendar/email cleanup failed. |
+
+Cancellation calendar/reminder/email/webhook/focus-block cleanup remains best effort and is not an outbox. A process crash can omit cleanup; an already-running booking finalizer/rescheduler may race cleanup and require provider reconciliation. Failures do not erase the refund operation, delete the booking, reopen it, or authorize another refund. Do not replay a whole finalizer to repair individual provider effects. Legacy boolean refunds still have their historical weaker failure semantics and zero-fee ambiguity where actual fees were never retained. Package restoration, paid recurring series, pre-booking compensation decisions, arbitrary partial refunds, external disputes and universal effect delivery remain excluded.
+
+For this implementation's full-cancellation boundary, **once refund debt commits, it remains discoverable until verified success or explicit review**; cancelled status, retry, timeout, restart or mode/config changes cannot consume/delete that debt. This is an intended invariant backed by implemented guards/tests, not a claim that unrun tests have passed.
+
+### Tests implemented and required validation
+
+Added `apps/web/lib/payments/refunds.database.test.ts` with guarded disposable PostgreSQL setup, complete clean migration application, real 0065→0066 upgrade, concurrent/duplicate cancellation and worker recovery, rollback/crash boundaries, saved-key retries, pending/failed/ambiguous states, terminal contradictions, direct/zero-fee/positive-fee Connect history, financial guards/tenant binding, fulfillment/finalization races, cleanup failures and explicit legacy behavior. Each database suite creates/drops a random `dayotter_payments_test_*` database under a loopback-only `dayotter_payments_test` admin URL. No database or test container was launched in this implementation pass.
+
+Added `refund-terms.test.ts`, shared `refund-fixtures.ts`, cancellation route response tests, and durable refund SDK cases in `stripe.test.ts`. They cover exact financial/context/reversal evidence, all supported refund statuses, stable idempotency parameters, historical mode/config changes, bounded creation, sanitized errors and truthful duplicate API responses. **All Slice 4 tests are written but unrun.**
+
+The later validation pass must use only disposable PostgreSQL 17 infrastructure, loopback binding, ephemeral storage and test-only credentials. Set both guarded test URLs only in the validation process. Run sequentially:
+
+```bash
+# With PAYMENTS_TEST_DATABASE_URL and PROMOTIONS_TEST_DATABASE_URL pointing only at guarded disposable DBs:
+pnpm --filter @dayotter/web test lib/payments app/api/bookings --maxWorkers=1 --minWorkers=1
+pnpm --filter @dayotter/web test lib/payments/refunds.database.test.ts lib/payments/fulfillment.database.test.ts lib/payments/attempts.database.test.ts lib/booking/pricing.database.test.ts --maxWorkers=1 --minWorkers=1
+pnpm --filter @dayotter/web test --maxWorkers=1 --minWorkers=1
+NODE_OPTIONS=--max-old-space-size=4096 pnpm --filter @dayotter/web typecheck
+pnpm --filter @dayotter/db typecheck
+# Scope Biome to the changed TS/TSX files in the Slice 4 commit:
+pnpm exec biome check <changed-TS-and-TSX-files>
+git diff --check HEAD^ HEAD
+```
+
+Pay special attention to deferred-trigger SQL syntax/order, transaction-end cancellation/completion guarantees, migration compatibility with both Slice 2 and Slice 3 fixtures, lock order under concurrency, stale Stripe reads after another worker succeeds, transfer/fee expansion shapes/permissions, safe creation-window boundaries, and the distinction between original captured deposits and total service price. Fix ordinary mechanical/test-fixture/format failures during validation; financial/concurrency/migration changes require careful review. Remove disposable infrastructure after that validation. No command above was executed for this Slice 4 checkpoint.

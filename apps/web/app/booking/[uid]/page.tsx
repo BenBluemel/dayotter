@@ -4,6 +4,7 @@ import { Card, CardBody } from "@/components/ui/card";
 import { getHostPixels } from "@/lib/booking/branding";
 import { googleCalendarUrl } from "@/lib/booking/ics";
 import { formatMoney } from "@/lib/booking/money";
+import { bookingRefundState } from "@/lib/payments/refunds";
 import { eq, getDb, schema } from "@dayotter/db";
 import {
   CalendarPlus,
@@ -38,6 +39,7 @@ export default async function BookingPage({ params }: { params: Promise<{ uid: s
     .filter((r) => r.value !== undefined && r.value !== "" && r.value !== false);
 
   const cancelled = booking.status === "cancelled";
+  const refund = cancelled ? await bookingRefundState(booking.id) : "none";
   const rejected = booking.status === "rejected";
   // Opt-in bookings sit in `pending` until the host approves them: nothing is on
   // any calendar yet, so we show "request sent" rather than "you're booked".
@@ -110,7 +112,13 @@ export default async function BookingPage({ params }: { params: Promise<{ uid: s
               {booking.amountPaid && booking.paymentStatus !== "none" ? (
                 <p className="flex items-center gap-2">
                   <CreditCard size={15} className="text-[var(--color-muted)]" />
-                  {booking.paymentStatus === "refunded" ? "Refunded " : "Paid "}
+                  {refund === "requires_review"
+                    ? "Refund needs review · Paid "
+                    : refund === "processing"
+                      ? "Refund processing · Paid "
+                      : booking.paymentStatus === "refunded"
+                        ? "Refunded "
+                        : "Paid "}
                   {formatMoney(booking.amountPaid, booking.paymentCurrency ?? "usd")}
                 </p>
               ) : null}

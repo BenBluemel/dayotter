@@ -2,6 +2,7 @@ import { withdrawMinimum } from "@/lib/booking/money";
 import { logger } from "@dayotter/core";
 import Stripe from "stripe";
 import { env } from "../server/env";
+import { REFUND_REPLAY_WINDOW_MS, type RefundOperation, refundRoute } from "./refund-terms";
 import {
   PaymentContradictionError,
   type PaymentRoute,
@@ -227,6 +228,75 @@ export async function refundPayment(
     logger.error("stripe refund failed", { event: "stripe_refund_failed", err });
     return false;
   }
+}
+
+/** Durable refunds use only the frozen merchant context; no connected-account headers. */
+export async function retrieveRefundCharge(operation: RefundOperation): Promise<Stripe.Charge> {
+  const gateway = await stripeForContext(refundRoute(operation));
+  return gateway.charges
+    .retrieve(operation.chargeId, { expand: ["transfer", "application_fee"] })
+    .catch(() => {
+      throw new PaymentRoutingError("Refund charge verification is temporarily unavailable");
+    });
+}
+
+export async function listOperationRefunds(operation: RefundOperation) {
+  const gateway = await stripeForContext(refundRoute(operation));
+  const page = await gateway.refunds.list({ charge: operation.chargeId, limit: 100 }).catch(() => {
+    throw new PaymentRoutingError("Refund reconciliation is temporarily unavailable");
+  });
+  // Full cancellation supports exactly one financial operation. External/partial
+  // refunds and an incomplete listing require review, never a guessed remainder.
+  if (page.has_more)
+    throw new PaymentContradictionError("Refund listing requires manual reconciliation");
+  return page.data;
+}
+
+export async function createOperationRefund(operation: RefundOperation): Promise<Stripe.Refund> {
+  const gateway = await stripeForContext(refundRoute(operation));
+  // Recheck after account verification: a slow API read must not outlive the safe
+  // replay window and accidentally reuse a key Stripe may already have pruned.
+  if (
+    !operation.firstSubmittedAt ||
+    Date.now() >= operation.firstSubmittedAt.getTime() + REFUND_REPLAY_WINDOW_MS
+  )
+    throw new PaymentContradictionError("Refund creation replay window has ended");
+  return gateway.refunds
+    .create(
+      {
+        charge: operation.chargeId,
+        amount: operation.amount,
+        reason: "requested_by_customer",
+        metadata: { refundOperationId: operation.id, paymentAttemptId: operation.attemptId },
+        ...refundRoutingParameters(refundRoute(operation)),
+      },
+      { idempotencyKey: operation.idempotencyKey },
+    )
+    .catch(() => {
+      // Even a timeout/500 may have accepted the request. Keep the obligation and
+      // reconcile/replay the SAME parameters/key, never manufacture a replacement.
+      throw new PaymentRoutingError("Refund submission is unresolved; reconciliation will retry");
+    });
+}
+
+export async function retrieveOperationRefund(operation: RefundOperation, refundId: string) {
+  const gateway = await stripeForContext(refundRoute(operation));
+  const refund = await gateway.refunds
+    .retrieve(refundId, { expand: ["transfer_reversal"] })
+    .catch(() => {
+      throw new PaymentRoutingError("Refund status verification is temporarily unavailable");
+    });
+  const charge = await gateway.charges
+    .retrieve(operation.chargeId, { expand: ["transfer", "application_fee"] })
+    .catch(() => {
+      throw new PaymentRoutingError("Refund charge verification is temporarily unavailable");
+    });
+  return {
+    refund,
+    charge,
+    chargeAccountId: operation.chargeAccountId,
+    environment: operation.environment,
+  };
 }
 
 /** Verify + parse a webhook payload. Throws if the signature is invalid. */

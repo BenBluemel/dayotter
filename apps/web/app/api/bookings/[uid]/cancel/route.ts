@@ -1,4 +1,4 @@
-import { cancelBooking, cancelBookingSeries } from "@/lib/booking/cancel-booking";
+import { cancelBookingSeries, cancelBookingWithResult } from "@/lib/booking/cancel-booking";
 import { enforceRateLimit } from "@/lib/server/rate-limit";
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -29,18 +29,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ uid
 
   if (scope === "series") {
     const count = await cancelBookingSeries(uid, reason);
-    if (count === 0) {
-      return NextResponse.json(
-        { error: "Booking not found or already cancelled" },
-        { status: 404 },
-      );
+    const result = await cancelBookingWithResult(uid, reason);
+    if (!result) {
+      return NextResponse.json({ error: "Booking not found" }, { status: 404 });
     }
-    return NextResponse.json({ ok: true, cancelled: count });
+    return NextResponse.json({ ok: true, cancelled: count, refund: result.refund });
   }
 
-  const ok = await cancelBooking(uid, reason);
-  if (!ok) {
-    return NextResponse.json({ error: "Booking not found or already cancelled" }, { status: 404 });
+  const result = await cancelBookingWithResult(uid, reason);
+  if (!result) {
+    return NextResponse.json({ error: "Booking not found" }, { status: 404 });
   }
-  return NextResponse.json({ ok: true, cancelled: 1 });
+  return NextResponse.json({ ok: true, cancelled: result.changed ? 1 : 0, refund: result.refund });
 }
