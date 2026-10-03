@@ -12,6 +12,7 @@ import {
   or,
   schema,
 } from "@dayotter/db";
+import { restoreBookingCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "./booking-routing";
 import { validatePaymentIntentTerms } from "./payment-success";
 import { requirePaymentReview } from "./payment-work";
@@ -86,6 +87,7 @@ export async function decideBookingCancellation(
         .update(schema.bookings)
         .set({ status: "cancelled", cancelledAt: new Date(), cancelReason: reason ?? null })
         .where(eq(schema.bookings.id, booking.id));
+    const creditRestoration = await restoreBookingCredit(tx, booking);
     let operation: RefundOperation | undefined;
     if (durable && attempt) {
       operation = await tx.query.refundOperations.findFirst({
@@ -136,7 +138,7 @@ export async function decideBookingCancellation(
           })
           .where(eq(schema.paymentAttempts.id, attempt.id));
     }
-    return { booking, changed, durable, operation };
+    return { booking, changed, durable, operation, creditRestoration };
   });
 }
 

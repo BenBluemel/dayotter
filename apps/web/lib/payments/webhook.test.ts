@@ -15,7 +15,10 @@ vi.mock("./payment-events", () => ({
 }));
 vi.mock("./fulfill", () => ({ fulfillCheckout: mock.legacy }));
 vi.mock("./connect", () => ({ syncConnectAccountStatus: mock.account }));
-vi.mock("../packages/fulfill", () => ({ fulfillPackagePurchase: mock.packages }));
+vi.mock("../packages/fulfill", () => ({
+  fulfillPackagePurchase: mock.packages,
+  receivePackageEvent: async () => null,
+}));
 vi.mock("../billing/subscription", () => ({
   syncSubscriptionById: vi.fn(),
   syncOrgSubscription: vi.fn(),

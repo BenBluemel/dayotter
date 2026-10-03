@@ -1,12 +1,12 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slices 1–3 validated (Slice 3: `4ec3d98`); Slice 4 full appointment cancellation refunds implemented on `feature/payment-routing`, NOT YET mechanically validated. Slices 5–7 remain proposed.**
+Status: **Slices 1–4 validated (Slice 3: `4ec3d98`; Slice 4: `c407ac8`, validation fixes: `0a90317`). Slice 5 package integrity is implemented on `feature/payment-routing`; its validation is recorded below. Slices 6–7 remain proposed.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
 This document preserves the code review and Astra High audit. The source map and
 risks below describe that inspection baseline; the Slice 1 section records the
-subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. The Slice 3 section records durable success observations, transactional booking fulfillment, event recovery and bounded finalization tracking. The Slice 4 section records the implemented, unvalidated cancellation/refund lifecycle. Per-effect delivery guarantees remain proposed.
+subsequent routing changes. The Slice 2 section records durable appointment intent/pricing persistence. The Slice 3 section records durable success observations, transactional booking fulfillment, event recovery and bounded finalization tracking. The Slice 4 section records the cancellation/refund lifecycle, subsequently validated at `0a90317`. The Slice 5 section records package ownership, mutation provenance, and purchase recovery. Per-effect delivery guarantees remain proposed.
 
 The investigation inspected source and public Stripe documentation. It did not
 run tests, inspect live Stripe accounts or production data, change Stripe
@@ -764,16 +764,13 @@ verified client session or suitable email/bearer flow before allowing redemption
 
 ### Rescheduling
 
-For unsettled bookings, update time and append a replacement quote in one
-transaction. Supersede any prior unpaid Checkout safely so an old URL cannot
-silently settle a different appointment/price.
+**Business decision updated October 2, 2026:** An allowed reschedule changes scheduling facts on the same booking; it preserves all historical pricing/settlement terms. Do not re-evaluate promotion eligibility, append a replacement quote, refund/recharge, or redeem another credit. This applies to settled, deposit-paid, unpaid price-locked, zero-cash and package bookings. The original quote's appointment time records the original pricing decision; it need not equal the booking's later scheduling time.
 
-For settled bookings, retain original payment facts and snapshots. Requote for an
-explicit adjustment decision, including zero-difference moves. A separate
-adjustment history/workflow is required because the current snapshot guard
-deliberately forbids new ordinary snapshots after settlement. Until that exists,
-block unsupported settled rescheduling. A permitted same-service credit move
-retains its original redemption rather than spending again.
+The upcoming pricing/rescheduling slice must implement a configurable customer grace allowance captured at original pricing/creation. Kimberly's current policy is one free move, honoring the original price even outside the promotion window. A name such as `customerRescheduleLimit` fits the existing `dailyBookingLimit` / `weeklyBookingLimit` conventions; zero, positive integers, and an explicit unlimited representation must be possible. Exact schema choices remain for that slice. The historical-price rule is an invariant, rather than an option to silently reprice when the limit is exceeded.
+
+Keep allowance and consumed moves on the booking lineage, with stable operation identity and an auditable move/actor record. Atomically serialize the move and grace consumption; retries of one move cannot consume two allowances, and a replacement internal occurrence cannot obtain a fresh allowance. Block further customer moves after exhaustion and require explicit authenticated staff intervention. Design staff override provenance separately from ordinary customer grace. Cancellation followed by a genuinely new booking gets current pricing and a new lineage; it must not inherit the cancelled promotion entitlement.
+
+Current `reschedule-booking.ts:rescheduleBooking` updates the same booking and preserves snapshots/payments/redemption. Slice 5 adds package finalization and concurrent-cancellation guards, without implementing grace limits. Existing capability-UID rescheduling still has no allowance accounting or explicit staff/customer distinction. Those are required in the later slice, not claimed complete here.
 
 ### Recurrence
 
@@ -897,7 +894,7 @@ and webhook versions.
 
 ## Implementation slices and required validation
 
-Slices 1–2 passed validation. Slice 3 implementation and adversarial tests are recorded below. Slices 4–7 remain proposed. Each slice should be independently reviewable; a
+Slices 1–5 passed validation. Their implementation and adversarial tests are recorded below. Slices 6–7 remain proposed. Each slice should be independently reviewable; a
 routing flag alone is not the live-payment readiness milestone.
 
 | Slice | Implementation boundary | Tests / evidence required |
@@ -905,18 +902,18 @@ routing flag alone is not the live-payment readiness milestone.
 | 1. Explicit topology and capabilities (validated) | Configuration, route resolver, typed routing identity and Stripe metadata (no attempt persistence), Connect backend/UI gates. | Direct omits transfers/fees despite stale Connect fields; Connect rejects absent/unready recipients; wrong org/config fails closed; old Connect payments retain original refund route after mode switch. |
 | 2. Durable checkout and quotes (appointment implementation; validated) | Saved appointment terms, stable creation identity and expiration, minimal snapshot/booking transaction handoff. Package intent work remains deferred. | Stripe accepts Session before response/DB persistence fails; repeated request; promotion/service/package edits after quote; mismatched amount/currency/account; zero cash bypass; expiration and delayed payment. |
 | 3. Transactional fulfillment and event recovery (appointment implementation; bounded finalization) | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
-| 4. Refund lifecycle (implemented, unvalidated; full appointment cancellation only) | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
-| 5. Package entitlement integrity | Verified redemption, exact grant linkage, restoration constraints, purchase fulfillment/refund policy. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |
-| 6. Remaining pricing entry points | Staff/API policy, unpaid reprice, explicit settled adjustments, occurrence settlement. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
+| 4. Refund lifecycle (validated; full appointment cancellation only) | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
+| 5. Package entitlement integrity (implemented; purchase refunds/revocation deferred) | Internal owner identity, mutation provenance, atomic redemption/restoration, durable verified package purchases, recovery. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |
+| 6. Remaining pricing entry points | Staff/API policy, historical-price-preserving grace reschedules, booking-lineage allowance and move provenance, occurrence settlement. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
 | 7. Cutover and compatibility | Additive migration, legacy processing, web/mobile/docs/deployment updates. | Legacy missing snapshots/duplicate audit; old Connect plus new direct records; outstanding old Sessions; account-context change; connected-balance obligations; rollback preserving new financial work; direct routes expose no withdrawal capability. |
 
 Retain and extend existing tests in `packages/core/src/pricing.test.ts`,
 `apps/web/lib/booking/pricing.database.test.ts`,
 `apps/web/lib/booking/booking-logic.test.ts`, and
-`apps/web/lib/payments/fulfill.test.ts`. The current database suite covers pricing
-constraints and concurrent credit consumption; it does not establish durability
-of checkout/refunds or safety of restoration. Real database concurrency and crash
-boundary tests are needed, not only mocked happy paths. Future Stripe validation
+`apps/web/lib/payments/fulfill.test.ts`. The original database suite covered pricing
+constraints and concurrent credit consumption. Slices 2–5 now add real database
+tests for checkout/refund durability, redemption/restoration, concurrency, and
+crash boundaries. Continue requiring those guarantees beyond mocked happy paths. Future Stripe validation
 should use an isolated test environment, never live money movement.
 
 Before live direct payments, complete durable attempts/fulfillment/refunds and
@@ -1026,9 +1023,9 @@ Tests used a disposable PostgreSQL 17 container with a free loopback-only port, 
 Final review specifically exercised duplicate receipts/events, twelve concurrent fulfillment calls, browser/webhook racing, commit/rollback boundaries, interrupted finalization, acknowledged unpaid receipts followed by observed success, conflicting identifiers/terms/environment/account, delayed settlement, API/DB/provider failures, cross-attempt payment identity conflicts, legacy distinction and current routing configuration changes. Ordinary formatting/test fixture fixes were incorporated. The review also removed connection-holding session locks, guarded stale ambiguity/failure decisions, classified identity uniqueness failures as review and sanitized new Stripe read errors. This is a Slice 3 checkpoint, not authorization to enable live payments or a claim of completed durable refunds/per-effect delivery.
 
 
-## Slice 4 implementation: durable full cancellation refunds (UNVALIDATED)
+## Slice 4 implementation: durable full cancellation refunds (validated at `0a90317`)
 
-This section describes the code built on validated Slice 3 commit `4ec3d98dfb36c51bd795d1d617326fb344a83ad9`. Implementation and manual diff review are complete; **tests, PostgreSQL integration/concurrency tests, typechecks, Biome and builds have NOT been run for Slice 4**. No production runtime/configuration, real Stripe credentials, deployed database or local Compose file was used. Do not treat this checkpoint as authorization to enable payments.
+This section describes the code built on validated Slice 3 commit `4ec3d98dfb36c51bd795d1d617326fb344a83ad9`. Implementation and manual diff review were checkpointed without validation; a subsequent mechanical pass completed focused/full web and PostgreSQL tests, web/DB typechecks, scoped Biome and diff checks, with fixes committed at `0a903172fd7c8e8cea519eecb49658d8d6201011`. No build validation is claimed. No production runtime/configuration, real Stripe credentials, deployed database or local Compose file was used. Do not treat this checkpoint as authorization to enable payments.
 
 ### Boundary and historical refund terms
 
@@ -1115,7 +1112,7 @@ For this implementation's full-cancellation boundary, **once refund debt commits
 
 Added `apps/web/lib/payments/refunds.database.test.ts` with guarded disposable PostgreSQL setup, complete clean migration application, real 0065→0066 upgrade, concurrent/duplicate cancellation and worker recovery, rollback/crash boundaries, saved-key retries, pending/failed/ambiguous states, terminal contradictions, direct/zero-fee/positive-fee Connect history, financial guards/tenant binding, fulfillment/finalization races, cleanup failures and explicit legacy behavior. Each database suite creates/drops a random `dayotter_payments_test_*` database under a loopback-only `dayotter_payments_test` admin URL. No database or test container was launched in this implementation pass.
 
-Added `refund-terms.test.ts`, shared `refund-fixtures.ts`, cancellation route response tests, and durable refund SDK cases in `stripe.test.ts`. They cover exact financial/context/reversal evidence, all supported refund statuses, stable idempotency parameters, historical mode/config changes, bounded creation, sanitized errors and truthful duplicate API responses. **All Slice 4 tests are written but unrun.**
+Added `refund-terms.test.ts`, shared `refund-fixtures.ts`, cancellation route response tests, and durable refund SDK cases in `stripe.test.ts`. They cover exact financial/context/reversal evidence, all supported refund statuses, stable idempotency parameters, historical mode/config changes, bounded creation, sanitized errors and truthful duplicate API responses. These tests were subsequently executed in the Slice 4 validation pass.
 
 The later validation pass must use only disposable PostgreSQL 17 infrastructure, loopback binding, ephemeral storage and test-only credentials. Set both guarded test URLs only in the validation process. Run sequentially:
 
@@ -1132,3 +1129,93 @@ git diff --check HEAD^ HEAD
 ```
 
 Pay special attention to deferred-trigger SQL syntax/order, transaction-end cancellation/completion guarantees, migration compatibility with both Slice 2 and Slice 3 fixtures, lock order under concurrency, stale Stripe reads after another worker succeeds, transfer/fee expansion shapes/permissions, safe creation-window boundaries, and the distinction between original captured deposits and total service price. Fix ordinary mechanical/test-fixture/format failures during validation; financial/concurrency/migration changes require careful review. Remove disposable infrastructure after that validation. No command above was executed for this Slice 4 checkpoint.
+
+
+## Slice 5 implementation: package ownership, credit provenance, and durable purchase grants
+
+This section supersedes the original audit's email-based package paths and the deferred package limitations in Slices 1–4. It does not implement package-purchase cash refunds/revocation, recurring financial policy, a universal outbox, or the new grace-reschedule allowance. Production payments are not enabled by this work.
+
+### Checkpoint lineage
+
+Slice 5 starts from `0a903172fd7c8e8cea519eecb49658d8d6201011` on `feature/payment-routing`, after Slice 3 `4ec3d98dfb36c51bd795d1d617326fb344a83ad9` and Slice 4 `c407ac80d1c4598457eb7c950f4bf188c1eab01f`. Existing commits are retained. The local `compose.light-balance.yaml` is excluded.
+
+### Authoritative ownership and compatibility
+
+`packages/db/src/schema/packages.ts:packageCredits` now distinguishes `integrityVersion = 1` entitlements with immutable `ownerUserId` from version-0 legacy email-only balances. The authoritative owner is Better Auth's internal `users.id`; a server-resolved authenticated session and a currently verified account authorize customer redemption. Email is contact information, and matching it is not proof of ownership. Changing an owner's email does not move purchased value to a different user.
+
+`credits.ts:requirePackageOwner`, `/api/book:POST`, and `/api/packages/[id]/buy:POST` enforce this boundary server-side. Client JSON cannot set internal owner/actor fields. Explicit redemption with a different attendee email fails generically before querying balances; an unauthenticated caller knowing the victim's email cannot spend their credits. Public cash booking remains possible without an account. Account verification is mandatory for new package purchase/redemption; this is a deliberate product compatibility change.
+
+`grantPackageToCustomer` preserves the trusted staff path for the service owner, resolves exactly one verified recipient account, and binds the authenticated actor. A normalized email with ambiguous verified accounts fails closed. Manual grants need a stable `operationId`; web/mobile clients retain it until acknowledged success. Staff package listing includes `verified_account` versus `legacy_requires_review` and scopes both service and organization.
+
+Migration `0067_package_integrity.sql` records **observed** legacy total/used counts into opening-balance columns. It does not infer a purchase, owner, grant, or historical redemption. Existing balances remain readable, unmodified, and frozen against automatic redemption/restoration. Old paid-without-Intent booking cancellation returns `legacy_unknown` when it has no proven redemption. Legacy package Sessions cannot automatically grant from metadata and request manual reconciliation. Ownership claims/backfills and cancellation correction tooling require a separate deliberate review; no silent reassignment is implemented. Deploy schema and application together: old email/counter-writing code is incompatible with the new guards.
+
+### Ledger and database boundary
+
+`schema/package-integrity.ts:packageCreditMutations` is an append-only financial mutation ledger: immutable entitlement/owner/organization/service, positive quantity, type, stable operation key, input fingerprint, booking/purchase/actor source, original redemption reference, and timestamp. Supported financial operations are grant, one-credit redemption, and exact restoration. There is no general adjustment or accounting subsystem.
+
+The migration's guards enforce:
+
+- identity/scope equality; verified recipient and authorized actor for manual grants; verified durable purchase for paid grants;
+- one mutation per operation, one purchased grant, one redemption/restoration per booking, and one restoration per original redemption;
+- restoration of the same entitlement, owner, booking and historical quantity;
+- nonnegative durable balances, with counters equal to ledger sums at transaction commit;
+- package booking/quote/redemption settlement together, cash-versus-credit exclusivity, and cancellation iff its redemption is restored;
+- immutable ledger financial fields, ownership/opening balances, purchase terms, Stripe IDs and observed success facts; deletion is restricted.
+
+Financial mutation triggers lock booking before credit, then apply counters. Runtime external-finalization status is deliberately separated from immutable mutation fields. Purchased grants lock their purchase before inserting the credit. The database, not Redis or Node locks, supplies cross-instance correctness.
+
+### Redemption, retry, and restoration
+
+`create-booking.ts:createBooking` validates the internal owner, finds prior operation results before mutable availability/price checks, and serializes retries with a PostgreSQL transaction advisory lock. `creditBookingIdentity` uses the same stable appointment request identity as cash checkout, with server-side owner authorization and input fingerprint checks; old clients fall back to a deterministic hash of canonical original input/return path. Reusing an operation with changed input is a conflict. An intentional second otherwise-identical booking needs a fresh request ID.
+
+`bookingSettlementClaims` is a small shared immutable PostgreSQL claim keyed by that appointment operation. Database insert triggers for durable cash attempts and credit redemptions claim one settlement/source/fingerprint; the unique key makes concurrent cash-versus-credit selection fail closed even when the cash transaction has an older repeatable-read snapshot. Existing durable cash request/source associations are backfilled from explicit attempt facts; no credit provenance is inferred. Deferred binding guards prevent orphan claims. This closes a race where concurrent auto-selection could otherwise create a cash intent and a separate credit-paid booking for one request. Zero-cash creation retains its existing separate behavior; Slice 6 must address its operation identity if unified retry guarantees are required.
+
+Within the booking transaction, current service eligibility/duration is checked under a share lock; recurring package creation is rejected. `quoteAppointmentPrice` retains its single-statement coherent pricing semantics, uses package settlement without a cash promotion, and `persistBookingPricingSnapshot` saves it before settlement. `redeemBookingCredit` locks the oldest eligible owner/service/org entitlement and writes the redemption, snapshot and paid booking atomically. Concurrent attempts for the last credit cannot both commit. Transaction failure rolls all of them back; response loss returns the original booking without another spend or finalizer invocation.
+
+`refunds.ts:decideBookingCancellation` now calls `restoreBookingCredit` inside the same existing cancellation transaction. It restores exactly the proven original redemption and updates package booking settlement; repeated/already-cancelled requests discover the same restoration. Database deferred guards reject cancellation committed without its restoration. Today's package count/price and attendee ordering are irrelevant. Cancelling a credit-funded appointment restores one credit, not Stripe cash from its funding package purchase. Slice 4 cash refund operations retain their own historical route/fee and transaction boundary.
+
+### Durable package purchases
+
+`schema/package-integrity.ts:packagePurchases` is a small package-specific durable checkout intent. It reuses Slice 1 Stripe routing, Slice 2 stable creation/expiry conventions, and Slice 3 verified payment-fact shape, rather than pretending a package purchase is an appointment booking. It has no encrypted booking input because it does not contain an appointment intake; stored contact/ownership data follows the existing package/user storage model.
+
+`purchases.ts:preparePackagePurchase` saves package price, currency, count, scope, verified owner/contact, immutable routing/environment/account/destination/actual fee, redirect URLs and terms hash before Stripe. A single locked package/service join in `packageConfigurationSnapshot` captures coherent terms under repeatable read, with bounded serialization/operation-conflict retries. This avoids READ COMMITTED lock-wait row re-evaluation combining revisions; no Stripe request is inside a retried transaction. Trusted manual grants use the same configuration boundary. Stable owner/request identity rejects changed package input, and retry returns original terms rather than today's package definition.
+
+`packageCheckout` uses `package-checkout:<purchase UUID>:v1`, with immutable Stripe parameters, client reference and purchase/terms/owner metadata on Session and Intent. New Session creation still passes Slice 1's current-sales fail-closed routing boundary. Historical retrieval/verification always uses the saved route and validated matching credential/account context; disabled/changed sales mode cannot change the original paid grant. Once the bounded creation-replay deadline passes without a Session binding, automatic creation stops in `requires_review` rather than risk another independent payment. A webhook/canonical payment read can resolve that specific creation ambiguity. Expired Sessions do not become fresh operations; a genuinely new purchase requires a new request identity.
+
+`validatePackageSession` / `verifyPackagePayment` validate saved amount/currency, Session/Intent metadata and write-once relationship, environment/account, destination/actual fee, complete **paid** Checkout, succeeded Intent with amount received, and expanded captured charge. Completed-but-unpaid/delayed payment grants nothing. Browser redirects are not payment evidence. Contradictions enter review; transient Stripe/database failures remain retryable. Unknown/legacy/malformed durable relationships cannot grant another account's entitlement.
+
+`observePackagePayment` commits immutable success facts first. `grantObservedPackage` then locks the purchase and atomically creates entitlement + source grant + purchase binding. A crash after observation is recoverable without another Stripe call; a crash during grant rolls back to the durable paid obligation; a crash after grant commit or duplicate delivery returns the same grant. Scoped Session/Intent uniqueness and ledger uniqueness prevent repeated grants. A preexisting legacy credit bearing the same Intent causes review instead of another grant.
+
+`receivePackageEvent` runs only after existing raw-body Stripe SDK signature/environment verification. It handles completed/async-success/async-failure/expired Checkout and Intent-success events, locates durable intent by saved IDs/immutable reference, and verifies canonical payment state. It returns retry on transient processing and review on contradiction; package events cannot fall through to legacy appointment Redis fulfillment. A separate event receipt/outbox is unnecessary for this bounded design because the original purchase itself remains a recovery receipt before Stripe creation.
+
+### Recovery and side effects
+
+`recoverPackagePurchases` queries bounded PostgreSQL prepared/open/paid work, with retry/backoff and fair rescheduling of unpaid observations. It is invoked by the existing `scripts/recover-payments.ts` alongside cash-payment/refund recovery. Webhook and authenticated `/packages/thanks` also reconcile; browser presence is not required. Periodic CLI invocation and monitoring review states remain operational deployment tasks, not changed production configuration.
+
+Credit booking external finalization is tracked on its redemption (`pending`, `running`, `complete`, `requires_review`). `markCreditFinalization` shares the booking lock with cancellation. A failure cannot roll back settlement or authorize another spend. `recoverCreditFinalizations` marks interrupted work older than 15 minutes as visible review without blindly replaying calendar/reminder/email/workflow/webhook effects. Cancellation while finalization runs restores value and prevents a stale finalizer from declaring complete or reopening the booking. **`complete` means the outer finalizer returned, not that every individual effect was delivered.** Existing provider helpers can swallow individual failures or skip delivery when unconfigured. Provider cleanup still has the Slice 3/4 delivery gap; financial truth remains durable, but individual provider effects may require reconciliation.
+
+### Rescheduling and recurrence
+
+`reschedule-booking.ts:rescheduleBooking` preserves the same booking row, actual duration, original pricing snapshot and redemption. It neither restores/redeems nor recalculates price. It rechecks cancellation under the row lock and blocks package moves during ambiguous external finalization. The new customer grace-reschedule requirement above is compatible: future move provenance/allowance must be attached to this lineage, without changing ledger/snapshot terms. Allowance consumption/enforcement and staff overrides are **not** implemented in Slice 5. Cash rescheduling remains unchanged financially.
+
+A package cannot authorize multiple recurring occurrences: creation fails closed at both service/application and database boundaries when recurrence exceeds one. Paid recurring financial policy remains separate future work.
+
+### Crash/adversarial walkthrough
+
+| Failure | Durable outcome |
+| --- | --- |
+| A/B: before/during redemption transaction | No committed spend or booking; retry is safe. |
+| C/D: after booking+redemption commit, response lost/retried | Original operation returns the same booking; no additional ledger mutation or side-effect replay. Interrupted delivery is reviewable. |
+| E: two instances spend final credit | Entitlement row lock/capacity and transaction rollback permit exactly one committed redemption. |
+| F/G/H: duplicate cancellation; crash before/after restoration | Cancellation and exact restoration commit together or neither commits; unique reverse identity converges on one restoration. |
+| I: duplicate package webhook | Canonical success and purchase row lock converge on one grant. |
+| J: paid, crash before grant | Original purchase/session is discoverable by webhook/recovery; immutable observed success survives independently of grant transaction. |
+| K: supplied victim email/forged owner | Session identity and durable owner/scope checks reject without victim balance lookup. |
+| L: historical entitlement missing provenance | Opening balance retained; automated spend/restore/grant denied; explicit legacy review. |
+| M: current definition changes | Original credited count/owner and redemption/restoration quantity remain historical. New operations use current configuration coherently. |
+
+Package purchase refunds, partially consumed credit revocation, disputes/chargebacks, ownership-claim tooling, arbitrary adjustments and per-effect outbox delivery remain deliberate limitations. Do not refund package cash without coordinating credit revocation in a later policy/operation design.
+
+### Slice 5 validation
+
+Validation completed: full web suite **476/476 across 50 files, none skipped**, including **125 PostgreSQL integration tests across five suites** (41 package-credit, 35 refund, 32 fulfillment, 5 attempt, and 12 pricing tests). The package PostgreSQL suite also passed its separate 41-test rerun. Core tests passed 91/91; focused package/payment/booking coverage passed before the final complete suite. Full web typecheck with a 4 GB Node heap, DB/mobile and the remaining workspace typechecks, scoped Biome over 30 changed TypeScript files, and diff checks passed. The final manual diff review covered ownership, operation identity, database locking/guards, migration metadata, purchase verification/recovery, cancellation/finalization races, and historical rescheduling terms. PostgreSQL used a disposable version-17 container on loopback with tmpfs storage and guarded test database names; test URLs existed only in validation processes. No deployed database, credentials, or Compose override was used.

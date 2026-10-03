@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { consumeCredit } from "@/lib/packages/credits";
+import {
+  creditBookingIdentity,
+  findCreditBooking,
+  markCreditFinalization,
+  redeemBookingCredit,
+  requirePackageOwner,
+} from "@/lib/packages/credits";
 import { env } from "@/lib/server/env";
 import { type AppointmentPrice, logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
 import { and, eq, getDb, gte, inArray, lt, schema, sql } from "@dayotter/db";
@@ -21,7 +27,7 @@ import {
 } from "./booking-logic";
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
-import { persistBookingPricingSnapshot } from "./pricing";
+import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
 
 export { BookingError } from "./booking-logic";
 
@@ -158,6 +164,10 @@ export interface CreateBookingInput {
   /** Redeem one prepaid package credit for the attendee instead of charging.
    * Consumed atomically inside the booking transaction (restored on rollback). */
   redeemCredit?: boolean;
+  /** Internal authenticated identity, never copied from HTTP JSON. */
+  creditOwnerUserId?: string;
+  creditRequestId?: string;
+  creditReturnPath?: string;
   /** Internal server-owned frozen terms; never accepted from public HTTP input. */
   pricingQuote?: AppointmentPrice;
   paymentAttemptId?: string;
@@ -165,6 +175,24 @@ export interface CreateBookingInput {
 }
 
 export async function createBooking(
+  input: CreateBookingInput,
+): Promise<{ uid: string; redirectUrl: string | null }> {
+  if (!input.redeemCredit) return createBookingOnce(input);
+  assertExclusiveSettlement(input);
+  await requirePackageOwner(input.creditOwnerUserId, input.attendee.email);
+  const existing = await findCreditBooking(input);
+  if (existing) return { uid: existing.uid, redirectUrl: null };
+  try {
+    return await createBookingOnce(input);
+  } catch (err) {
+    // Another instance may have committed this operation while availability was checked.
+    const committed = await findCreditBooking(input);
+    if (committed) return { uid: committed.uid, redirectUrl: null };
+    throw err;
+  }
+}
+
+async function createBookingOnce(
   input: CreateBookingInput,
 ): Promise<{ uid: string; redirectUrl: string | null }> {
   assertExclusiveSettlement(input);
@@ -176,6 +204,9 @@ export async function createBooking(
   if (!eventType || !eventType.isActive) {
     throw new BookingError("Event type not found", 404);
   }
+
+  if (input.redeemCredit && (eventType.recurringCount ?? 1) > 1)
+    throw new BookingError("Recurring prepaid bookings are not supported yet", 409);
 
   // Resolve the booker's chosen location against the event type's menu. This is the
   // source of truth persisted on the booking (see the insert below) so it survives
@@ -311,8 +342,33 @@ export async function createBooking(
   // (hostId, startsAt) guards against a concurrent double-book: a request that
   // wins the availability check but loses the insert raises a 23505 → 409.
   let booking: typeof schema.bookings.$inferSelect;
+  let replayedCredit = false;
   try {
     booking = await db.transaction(async (tx) => {
+      if (input.redeemCredit) {
+        const identity = creditBookingIdentity(input);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
+        const previous = await findCreditBooking(input, tx);
+        if (previous) {
+          replayedCredit = true;
+          return previous;
+        }
+        const [currentService] = await tx
+          .select()
+          .from(schema.eventTypes)
+          .where(eq(schema.eventTypes.id, eventType.id))
+          .for("share");
+        if (
+          !currentService?.isActive ||
+          currentService.organizationId !== eventType.organizationId ||
+          currentService.ownerId !== eventType.ownerId ||
+          currentService.durationMinutes !== eventType.durationMinutes ||
+          JSON.stringify(currentService.durationOptions) !==
+            JSON.stringify(eventType.durationOptions) ||
+          (currentService.recurringCount ?? 1) > 1
+        )
+          throw new BookingError("Service configuration changed; retry your prepaid booking", 409);
+      }
       if (input.paymentAttemptId) {
         const [attempt] = await tx
           .select()
@@ -535,15 +591,6 @@ export async function createBooking(
         }
       }
 
-      // Prepaid package: spend one credit atomically as the payment method.
-      // Done inside the tx so a lost double-book race rolls the credit back too.
-      if (input.redeemCredit) {
-        const spent = await consumeCredit(eventType.id, input.attendee.email, tx);
-        if (!spent) {
-          throw new BookingError("You have no prepaid sessions left for this event.", 402);
-        }
-      }
-
       const [row] = await tx
         .insert(schema.bookings)
         .values({
@@ -562,8 +609,7 @@ export async function createBooking(
           responses: input.responses,
           uid,
           recurrenceUid,
-          paymentStatus:
-            !input.pricingQuote && (input.payment || input.redeemCredit) ? "paid" : "none",
+          paymentStatus: !input.pricingQuote && input.payment ? "paid" : "none",
           paymentIntentId: input.pricingQuote ? undefined : input.payment?.paymentIntentId,
           amountPaid: input.pricingQuote ? undefined : input.payment?.amountPaid,
           paymentCurrency: input.pricingQuote ? undefined : input.payment?.currency,
@@ -611,6 +657,20 @@ export async function createBooking(
         },
         ...guests.map((email) => ({ bookingId: row.id, email })),
       ]);
+      if (input.redeemCredit) {
+        const creditQuote = await quoteAppointmentPrice(
+          {
+            organizationId: eventType.organizationId,
+            eventTypeId: eventType.id,
+            appointmentStartsAt: start,
+            settlement: "package_credit",
+          },
+          tx,
+        );
+        await persistBookingPricingSnapshot(row.id, creditQuote, tx);
+        await redeemBookingCredit(tx, input, row);
+        row.paymentStatus = "paid";
+      }
       // Record every host of a collective booking explicitly (primary + co-hosts),
       // so "who's hosting this" is first-class rather than inferred from attendees.
       if (eventType.schedulingType === "collective" && hostIds.length > 0) {
@@ -624,6 +684,8 @@ export async function createBooking(
   } catch (err) {
     mapInsertError(err);
   }
+
+  if (replayedCredit) return { uid: booking.uid, redirectUrl: null };
 
   logger.info("booking created", {
     event: "booking_created",
@@ -698,15 +760,28 @@ export async function createBooking(
   // Confirmed immediately: run every confirmed-booking side-effect (meeting link,
   // host calendar, reminders, workflows, travel, confirmation emails, recurring
   // occurrences). Shared verbatim with the host-approval path.
-  await finalizeConfirmedBooking({
-    booking,
-    eventType,
-    host,
-    attendee: input.attendee,
-    guests,
-    notes: input.notes,
-    appUrl,
-  });
+  if (input.redeemCredit && !(await markCreditFinalization(booking.id, "running")))
+    return { uid: booking.uid, redirectUrl: null };
+  try {
+    await finalizeConfirmedBooking({
+      booking,
+      eventType,
+      host,
+      attendee: input.attendee,
+      guests,
+      notes: input.notes,
+      appUrl,
+    });
+    if (input.redeemCredit) await markCreditFinalization(booking.id, "complete");
+  } catch (err) {
+    if (!input.redeemCredit) throw err;
+    await markCreditFinalization(booking.id, "requires_review");
+    logger.warn("Prepaid booking finalization requires review", {
+      event: "package_booking_finalization_review",
+      bookingId: booking.id,
+    });
+    // The confirmed booking + redemption remains durable. Do not spend again on retry.
+  }
 
   return { uid, redirectUrl: eventType.redirectUrl ?? null };
 }

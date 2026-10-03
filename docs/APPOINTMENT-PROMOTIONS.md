@@ -24,9 +24,7 @@ No promotion-management UI is included. Inspection baseline: `698897a`.
   zero price or a missing PaymentIntent.
 - Reprice each recurring occurrence using its own start; persist each snapshot
   independently. Do not copy the first occurrence's promotion to later dates.
-- Rescheduling re-evaluates the new start. Before settlement, create a new quote.
-  After collection, preserve payment facts and require an explicit adjustment
-  path; never silently charge/refund.
+- Updated business policy (October 2, 2026): an allowed reschedule preserves the original pricing/settlement snapshot, including promotional price outside its original window. Do not re-evaluate eligibility or quote again. A configurable customer grace allowance follows booking lineage (current business policy: one free move); after exhaustion block self-service moves for staff intervention. Allowance accounting/override provenance remains future pricing/rescheduling work; see `PAYMENTS-ARCHITECTURE.md`.
 - A checkout represents the exact server quote that created it. Promotion edits
   must not change its amount, currency, or historical attribution.
 - A future UI may expose inclusive calendar-date ranges. Convert those to UTC
@@ -45,7 +43,7 @@ No promotion-management UI is included. Inspection baseline: `698897a`.
 | `apps/web/app/api/v1/bookings/route.ts`, `POST` | Rejects paid services. `host-booking.ts:createHostBooking` and internal team booking insert directly without pricing. |
 | `apps/web/lib/payments/pending.ts`, `stashPendingBooking` | Redis holds booking intent for one hour. It does NOT yet store a bound price quote. |
 | `apps/web/lib/payments/fulfill.ts`, `fulfillCheckout` | Success redirect/webhook share Redis GETDEL and PaymentIntent lookup, then create a booking with Stripe's amount. BookingError refund now passes the Connect destination reversal flag, matching cancellation. Payout and fee calculations are unchanged. |
-| `apps/web/lib/booking/reschedule-booking.ts`, `rescheduleBooking` | Existing live flow updates start/end/reason without repricing. The new pricing service can calculate the replacement quote; live integration remains next work. |
+| `apps/web/lib/booking/reschedule-booking.ts`, `rescheduleBooking` | Existing live flow updates start/end/reason without repricing. Preserve the original quote on a move; grace allowance accounting remains future work. |
 | `apps/web/lib/booking/finalize-booking.ts`, `finalizeOccurrence` | Later recurring occurrences insert directly without independent pricing/payment. Each must call the shared quote service when integration is implemented. |
 | `apps/web/lib/packages/credits.ts`, `consumeCredit` | Now locks the selected grant and repeats its capacity predicate on UPDATE. Grants remain matched by service + lowercase email. |
 | `apps/web/lib/booking/cancel-booking.ts`, `cancelBooking` | Legacy code infers credit redemption from paid-without-PaymentIntent and restores via the first attendee. New zero-price cash handling must not use that inference. |
@@ -68,8 +66,7 @@ with Drizzle journal and schema snapshot. It adds:
    promotion FK: later edits or deletion cannot rewrite historical attribution.
 
 The earlier nullable-JSON-column proposal has been replaced with typed history
-rows. This allows an unpaid reschedule to append a replacement quote while
-retaining the earlier snapshot, and gives an eventual checkout/adjustment an
+rows. New ordinary reschedules preserve the original snapshot under the updated business policy; any separately authorized future adjustment still needs an
 explicit snapshot identity. No row means legacy/unpriced; it never means free.
 
 The migration adds supporting composite unique indexes to event types and
@@ -110,10 +107,7 @@ appends the detached values. It never consumes a credit or changes payment facts
 Never expose its price argument as an HTTP request body. It refuses persistence
 after settlement; an explicit adjustment API/ledger remains future work.
 
-For each new direct booking or recurrence, quote its own start and save its own
-snapshot with the booking. For unpaid rescheduling, update start/end and append
-the replacement snapshot in the same transaction. After collection, quote the
-new start for preview but route the change through an explicit adjustment flow.
+For each genuinely new booking or supported independent occurrence, quote its own start and save its own snapshot. An allowed reschedule moves that same booking and preserves the original snapshot, payments/deposits and package redemption. Promotion eligibility is not evaluated again. Future grace accounting must serialize a stable move operation against the lineage; no new financial attempt or automatic adjustment is created.
 
 ## Checkout integration remains disabled
 
@@ -176,5 +170,5 @@ pnpm --filter @dayotter/web typecheck
 
 Recommended next change: integrate server-owned quotes into new booking and
 checkout intent/fulfillment, including zero cash and credit paths, then add the
-explicit paid-reschedule adjustment workflow and independent recurring pricing.
+customer grace-reschedule allowance/provenance and independent recurring pricing.
 Keep promotion-management UI as a separate change.

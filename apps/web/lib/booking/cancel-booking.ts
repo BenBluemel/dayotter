@@ -3,7 +3,6 @@ import { logger } from "@dayotter/core";
 import { and, eq, getDb, gte, schema } from "@dayotter/db";
 import { bookingCancellation, sendEmail } from "@dayotter/emails";
 import { deleteBookingFromCalendar } from "../calendar/host-calendar";
-import { restoreCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "../payments/booking-routing";
 import {
   type PublicRefundState,
@@ -22,7 +21,11 @@ export async function cancelBookingWithResult(
   const db = getDb();
   const decision = await decideBookingCancellation(uid, reason, db);
   if (!decision) return null;
-  let refund: PublicRefundState = "none";
+  let refund: PublicRefundState = decision.creditRestoration
+    ? "refunded"
+    : !decision.durable && decision.booking.paymentStatus === "paid"
+      ? "legacy_unknown"
+      : "none";
   if (decision.operation) refund = await executeRefundOperation(decision.operation.id, db);
   // A duplicate request still drives refund recovery, but never repeats cleanup.
   if (!decision.changed) return { changed: false, refund };
@@ -63,12 +66,14 @@ export async function cancelBookingWithResult(
         bookingId: booking.id,
       });
     }
-  } else if (!decision.durable && booking.paymentStatus === "paid" && !booking.paymentIntentId) {
-    // Paid with a prepaid package credit (no Stripe charge) - give the credit back.
-    const attendee = booking.attendees[0];
-    if (attendee?.email) {
-      refunded = await restoreCredit(booking.eventTypeId, attendee.email).catch(() => false);
-    }
+  } else if (
+    !decision.durable &&
+    !decision.creditRestoration &&
+    booking.paymentStatus === "paid" &&
+    !booking.paymentIntentId
+  ) {
+    // Legacy email-only settlement cannot identify an original redemption.
+    refund = "legacy_unknown";
   }
 
   if (refunded) {

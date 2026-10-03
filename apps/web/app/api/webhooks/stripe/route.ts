@@ -1,5 +1,5 @@
 import { syncOrgSubscription, syncSubscriptionById } from "@/lib/billing/subscription";
-import { fulfillPackagePurchase } from "@/lib/packages/fulfill";
+import { fulfillPackagePurchase, receivePackageEvent } from "@/lib/packages/fulfill";
 import { syncConnectAccountStatus } from "@/lib/payments/connect";
 import { fulfillCheckout } from "@/lib/payments/fulfill";
 import { processAppointmentEvent, receiveAppointmentEvent } from "@/lib/payments/payment-events";
@@ -38,6 +38,12 @@ export async function POST(request: Request) {
         { status: result === "retry" ? 500 : 200 },
       );
     }
+    const packageResult = await receivePackageEvent(event);
+    if (packageResult)
+      return NextResponse.json(
+        { received: packageResult !== "retry", state: packageResult },
+        { status: packageResult === "retry" ? 500 : 200 },
+      );
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;

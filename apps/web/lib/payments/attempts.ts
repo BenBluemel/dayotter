@@ -138,6 +138,11 @@ export async function prepareAppointmentAttempt(
         cause?: { code?: string; constraint?: string };
       };
       const detail = failure.cause ?? failure;
+      if (detail.constraint === "booking_settlement_claim_conflict")
+        throw new BookingError(
+          "This booking request already has a settlement; retry the original request",
+          409,
+        );
       if (
         retry < 2 &&
         (detail.code === "40001" ||

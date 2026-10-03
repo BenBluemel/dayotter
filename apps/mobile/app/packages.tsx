@@ -4,7 +4,8 @@ import { useAsync } from "@/hooks";
 import type { EventType } from "@/models";
 import { colors, radius } from "@/theme";
 import { Stack } from "expo-router";
-import { useState } from "react";
+import * as SecureStore from "expo-secure-store";
+import { useRef, useState } from "react";
 import {
   Alert,
   Modal,
@@ -35,6 +36,7 @@ interface CreditRow {
   total: number;
   used: number;
   remaining: number;
+  ownership: "verified_account" | "legacy_requires_review";
 }
 
 interface PackagesResponse {
@@ -118,18 +120,37 @@ export default function PackagesScreen() {
     setGrantEmail("");
   }
 
+  const grantBusy = useRef(false);
   async function grant() {
     const email = grantEmail.trim();
-    if (!grantFor || !email) return;
+    if (!grantFor || !email || grantBusy.current) return;
+    grantBusy.current = true;
     setGranting(true);
     try {
-      await api.post("/api/packages/grant", { packageId: grantFor.id, clientEmail: email });
+      const key = `package-grant-${grantFor.id}`;
+      const stored = await SecureStore.getItemAsync(key);
+      const previous = stored ? (JSON.parse(stored) as { email: string; id: string }) : null;
+      const operationId =
+        previous?.email === email.toLowerCase()
+          ? previous.id
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+      await SecureStore.setItemAsync(
+        key,
+        JSON.stringify({ email: email.toLowerCase(), id: operationId }),
+      );
+      await api.post("/api/packages/grant", {
+        packageId: grantFor.id,
+        clientEmail: email,
+        operationId,
+      });
+      await SecureStore.deleteItemAsync(key);
       setGrantFor(null);
       Alert.alert("Credits granted", `${grantFor.sessionCount} credits granted to ${email}.`);
       reload();
     } catch (e) {
       Alert.alert("Couldn't grant", e instanceof ApiError ? e.message : "Please try again.");
     } finally {
+      grantBusy.current = false;
       setGranting(false);
     }
   }
@@ -194,6 +215,9 @@ export default function PackagesScreen() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.balanceEmail}>{c.clientEmail}</Text>
                     <Text style={styles.cardSub}>{titleFor(c.eventTypeId)}</Text>
+                    {c.ownership === "legacy_requires_review" && (
+                      <Text style={styles.cardSub}>Ownership review required</Text>
+                    )}
                   </View>
                   <Text style={[styles.balanceCount, c.remaining === 0 && { color: colors.faint }]}>
                     {c.used} of {c.total} used

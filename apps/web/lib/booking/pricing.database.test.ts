@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createDatabase, eq, schema } from "@dayotter/db";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { consumeCredit } from "../packages/credits";
 import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
 
 // Never fall back to DATABASE_URL. This suite creates its own database, applies
@@ -389,7 +388,7 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
       .where(eq(schema.appointmentPromotions.id, promoId));
   });
 
-  it("keeps every unpaid reschedule quote and blocks automatic repricing after collection", async () => {
+  it("retains explicit pre-settlement quote revisions and blocks repricing after collection", async () => {
     const booking = await makeBooking();
     const initial = await save(booking.id, await quote());
     const newStart = new Date("2026-11-15T10:00:00Z");
@@ -438,10 +437,13 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
         .where(eq(schema.bookings.id, booking.id)),
     ).rejects.toMatchObject({ code: "23514" });
     await expect(save(booking.id, await quote())).rejects.toMatchObject({ code: "23514" });
-    await db
-      .update(schema.bookings)
-      .set({ paymentStatus: "paid" })
-      .where(eq(schema.bookings.id, booking.id));
+    // Slice 5 requires a real redemption, not only a package quote, to settle as paid.
+    await expect(
+      db
+        .update(schema.bookings)
+        .set({ paymentStatus: "paid" })
+        .where(eq(schema.bookings.id, booking.id)),
+    ).rejects.toMatchObject({ code: "23514" });
   });
 
   it("allows zero-price cash with no credit or Stripe requirement and preserves history after deleting a rule", async () => {
@@ -504,83 +506,6 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
     ).rejects.toMatchObject({ code: "23503" });
   });
 
-  it("rolls snapshots and credit redemption back with the booking transaction", async () => {
-    const email = `${randomUUID()}@example.test`;
-    const [grant] = await db
-      .insert(schema.packageCredits)
-      .values({ organizationId: orgId, eventTypeId: eventId, clientEmail: email, totalCredits: 1 })
-      .returning();
-    const booking = await makeBooking();
-    await expect(
-      db.transaction(async (tx) => {
-        expect(await consumeCredit(eventId, email, tx)).toBe(true);
-        await persistBookingPricingSnapshot(
-          booking.id,
-          await quote(startsAt, "package_credit"),
-          tx,
-        );
-        throw new Error("Simulated booking failure");
-      }),
-    ).rejects.toThrow("Simulated booking failure");
-    expect(
-      (
-        await db.select().from(schema.packageCredits).where(eq(schema.packageCredits.id, grant!.id))
-      )[0]?.usedCredits,
-    ).toBe(0);
-    expect(
-      await db
-        .select()
-        .from(schema.bookingPricingSnapshots)
-        .where(eq(schema.bookingPricingSnapshots.bookingId, booking.id)),
-    ).toEqual([]);
-  });
-
-  it("serializes competing redemptions of the last credit", async () => {
-    const email = `${randomUUID()}@example.test`;
-    const [grant] = await db
-      .insert(schema.packageCredits)
-      .values({ organizationId: orgId, eventTypeId: eventId, clientEmail: email, totalCredits: 1 })
-      .returning();
-    // A held transaction guarantees overlap; observe PostgreSQL's lock waiter
-    // before releasing it, rather than hoping Promise.all creates a race.
-    let release!: () => void;
-    let acquired!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const ready = new Promise<void>((resolve) => {
-      acquired = resolve;
-    });
-    const first = db.transaction(async (tx) => {
-      const result = await consumeCredit(eventId, email.toUpperCase(), tx);
-      acquired();
-      await held;
-      return result;
-    });
-    await ready;
-    const second = consumeCredit(eventId, email, db);
-    try {
-      let waiting = false;
-      for (let i = 0; i < 100; i++) {
-        const { rows } = await db.$client.query(
-          "SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        );
-        if (rows.length) {
-          waiting = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(waiting).toBe(true);
-    } finally {
-      release();
-    }
-    expect(await first).toBe(true);
-    expect(await second).toBe(false);
-    expect(
-      (
-        await db.select().from(schema.packageCredits).where(eq(schema.packageCredits.id, grant!.id))
-      )[0]?.usedCredits,
-    ).toBe(1);
-  });
+  // Redemption rollback and last-credit concurrency now exercise durable booking/ledger
+  // relationships in lib/packages/credits.database.test.ts, instead of an email-only counter.
 });

@@ -56,6 +56,12 @@ export function validateResponses(
  */
 export function mapInsertError(err: unknown): never {
   if (err instanceof BookingError) throw err;
+  const failure = err as { constraint?: string; cause?: { constraint?: string } };
+  if ((failure.cause ?? failure).constraint === "booking_settlement_claim_conflict")
+    throw new BookingError(
+      "This booking request already has a settlement; retry the original request",
+      409,
+    );
   // 23505 = unique_violation (same-instant race); 23P01 = exclusion_violation
   // (the bookings_no_overlap GiST constraint catching a cross-duration overlap).
   const code = (err as { code?: string })?.code;

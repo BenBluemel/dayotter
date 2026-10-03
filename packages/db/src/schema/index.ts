@@ -23,3 +23,5 @@ export * from "./support";
 
 export * from "./payment-attempts";
 export * from "./refund-operations";
+
+export * from "./package-integrity";

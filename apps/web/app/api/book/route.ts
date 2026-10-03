@@ -1,5 +1,6 @@
+import { getSession } from "@/lib/auth/session";
 import { BookingError, type CreateBookingInput, createBooking } from "@/lib/booking/create-booking";
-import { creditBalance } from "@/lib/packages/credits";
+import { creditBalance, findCreditBooking, requirePackageOwner } from "@/lib/packages/credits";
 import {
   appointmentCheckout,
   findAppointmentAttempt,
@@ -46,6 +47,7 @@ const schema = z.object({
   /** Where to send the booker if they abandon Stripe Checkout. */
   returnPath: z.string().max(400).optional(),
   /** Stable browser operation identity; its booking input is bound on first use. */
+  redeemCredit: z.boolean().optional(),
   checkoutRequestId: z.string().uuid().optional(),
 });
 
@@ -92,6 +94,32 @@ export async function POST(request: Request) {
   const returnPath =
     requestedPath?.startsWith("/") && !requestedPath.startsWith("//") ? requestedPath : "/";
   try {
+    const session = await getSession();
+    let ownerId: string | undefined;
+    if (session?.user?.id) {
+      try {
+        ownerId = (await requirePackageOwner(session.user.id, input.attendee.email)).id;
+      } catch (err) {
+        if (parsed.data.redeemCredit) throw err;
+      }
+    }
+    if (parsed.data.redeemCredit && !ownerId) await requirePackageOwner(undefined);
+    const creditInput = {
+      ...input,
+      redeemCredit: true,
+      creditOwnerUserId: ownerId,
+      creditRequestId: parsed.data.checkoutRequestId,
+      creditReturnPath: returnPath,
+    };
+    if (ownerId) {
+      const previousCredit = await findCreditBooking(creditInput);
+      if (previousCredit)
+        return NextResponse.json({
+          uid: previousCredit.uid,
+          url: `/booking/${previousCredit.uid}`,
+          redirectUrl: null,
+        });
+    }
     // Resume an existing cash operation before consulting mutable prices or credits.
     const previous = await findAppointmentAttempt(input, returnPath, parsed.data.checkoutRequestId);
     if (previous) return NextResponse.json(await appointmentCheckout(previous));
@@ -99,13 +127,15 @@ export async function POST(request: Request) {
       where: eq(db.eventTypes.id, input.eventTypeId),
       columns: { price: true, isActive: true },
     });
-    if (et?.isActive && (et.price ?? 0) > 0) {
-      const credits = await creditBalance(input.eventTypeId, input.attendee.email);
+    if (ownerId && et?.isActive && ((et.price ?? 0) > 0 || parsed.data.redeemCredit)) {
+      const credits = await creditBalance(input.eventTypeId, ownerId);
       if (credits > 0) {
-        const { uid, redirectUrl } = await createBooking({ ...input, redeemCredit: true });
+        const { uid, redirectUrl } = await createBooking(creditInput);
         return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
       }
     }
+    if (parsed.data.redeemCredit)
+      throw new BookingError("No prepaid session is available for this account", 402);
     const prepared = await prepareAppointmentAttempt(
       input,
       returnPath,

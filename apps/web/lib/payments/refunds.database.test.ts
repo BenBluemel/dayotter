@@ -58,7 +58,7 @@ vi.mock("../booking/availability", () => ({
 vi.mock("../calendar/host-calendar", () => ({ deleteBookingFromCalendar: mock.cleanup }));
 vi.mock("../booking/reminders", () => ({ clearBookingReminders: vi.fn() }));
 vi.mock("../booking/lifecycle", () => ({ fanOutBookingLifecycle: vi.fn() }));
-vi.mock("../packages/credits", () => ({ restoreCredit: mock.credit }));
+vi.mock("../packages/credits", () => ({ restoreBookingCredit: async () => null }));
 vi.mock("@dayotter/emails", () => ({
   sendEmail: vi.fn(),
   bookingRequested: vi.fn(),

@@ -79,10 +79,10 @@ export async function quoteAppointmentPrice(
 }
 
 /**
- * Persist a SERVER-OWNED quote inside the booking/reschedule transaction. Never
+ * Persist a SERVER-OWNED initial quote inside the booking transaction. Never
  * expose `price` as an HTTP input. Checkout integration must recover the exact
  * stored quote used for that checkout, not recalculate from mutable promotions.
- * Each occurrence/reprice appends its own row; payment facts are never changed.
+ * Ordinary rescheduling preserves this historical quote; financial adjustments require a separate explicit design.
  */
 export async function persistBookingPricingSnapshot(
   bookingId: string,
