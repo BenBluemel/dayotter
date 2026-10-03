@@ -1,6 +1,6 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slices 1–4 validated (Slice 3: `4ec3d98`; Slice 4: `c407ac8`, validation fixes: `0a90317`). Slice 5 package integrity is implemented on `feature/payment-routing`; its validation is recorded below. Slices 6–7 remain proposed.**
+Status: **Slices 1–5 implemented and validated on `feature/payment-routing`, through `7ff1a9a8eac39151ae76db0dfc3bc50535542348`. Slice 3: `4ec3d98`; Slice 4: `c407ac8`, validation fixes: `0a90317`; Slice 5: `7ff1a9a`. Slices 6–7 remain proposed.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
@@ -14,10 +14,27 @@ configuration, or implement payment changes. Source references below are relativ
 to the repository root; line numbers describe the inspected working tree and may
 move. Function names identify the relevant boundaries when lines change.
 
-Read this together with [APPOINTMENT-PROMOTIONS.md](APPOINTMENT-PROMOTIONS.md).
-Slice 2 uses that authoritative pricing boundary for new appointment cash checkout
-and saves the exact quote to the resulting booking. Deployment configuration has
-not been changed or production payments enabled.
+## Business-rule authority and document boundaries
+
+Implementation must preserve [BUSINESS-RULES.md](BUSINESS-RULES.md). Changes to
+business policy must update that document and reconcile the technical contracts.
+[PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md) owns authoritative pricing,
+discount sources, accepted quotes, deposits, and rescheduling semantics.
+[APPOINTMENT-PROMOTIONS.md](APPOINTMENT-PROMOTIONS.md) is the promotion-specific
+schema/migration reference. This document owns financial routing, durable
+payment/refund obligations, cash/package settlement, and recovery.
+
+**CURRENT** means implemented within the named paths. **DECIDED / NOT YET
+IMPLEMENTED** means approved policy awaiting implementation. **FUTURE / DEFERRED**
+means additional work; unresolved choices are explicitly identified in the
+business rules. The original source map/risk audit below remains historical;
+read the Slice 1–5 implementation sections for current guarantees and limits.
+Do not treat an original audit finding or an earlier slice exclusion as an
+unfixed current problem when a later slice explicitly supersedes it.
+
+New public cash checkout saves the authoritative quote and persists it to the
+resulting booking; package redemption saves its own settlement snapshot.
+Deployment configuration has not been changed or production payments enabled.
 
 ## Business objective and design decisions
 
@@ -44,7 +61,9 @@ The intended design is:
 
 These are intended architecture decisions. Slice 1 implements only explicit
 routing/configuration and capability gates. Slice 2 adds durable appointment
-checkout terms and the minimum booking handoff; Slice 3 adds appointment recovery described below.
+checkout terms and the minimum booking handoff; Slice 3 adds appointment recovery,
+Slice 4 adds durable full appointment cancellation refunds, and Slice 5 adds
+package ownership, credit provenance, and durable verified package grants.
 Light & Balance correctness and simplicity take priority over upstream compatibility.
 The recommendation does not require a general accounting system or two copies of
 the payment workflow.
@@ -687,96 +706,101 @@ Visiting a cancel URL does not establish payment failure. Expired/failed attempt
 must not grant bookings or credits, but a later verified successful payment must
 receive fulfillment or durable compensation rather than being discarded.
 
-## Interaction with appointment promotions and deposits
+## Pricing handoff and settlement
 
-Retain these implemented foundation pieces:
+**CURRENT:** The new public appointment pipeline uses the pricing contract in
+[PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md). `quoteAppointmentPrice` produces
+a coherent server quote; `prepareAppointmentAttempt` saves positive-cash terms
+before Stripe. Fulfillment verifies canonical Session/Intent/charge facts against
+that quote and original routing. It never selects discounts or recalculates
+prices, deposits, duration, or application fees from current configuration.
 
-- `packages/core/src/pricing.ts:119`, `calculateAppointmentPrice`: pure
-  appointment-time eligibility, best single discount, rounding, deposit cap, and
-  distinct cash/credit settlement.
-- `apps/web/lib/booking/pricing.ts:22`, `quoteAppointmentPrice`: authoritative
-  organization-scoped service/promotion reader. Callers authorize scope and select
-  settlement on the server.
-- `apps/web/lib/booking/pricing.ts:92`, `persistBookingPricingSnapshot`: detached
-  immutable historical quote persistence inside a transaction.
-- `packages/db/src/schema/booking-pricing.ts` and
-  `packages/db/drizzle/0063_appointment_promotions.sql:90`: history constraints and
-  guards against adding snapshots after settlement or mixing cash and credits.
-- `booking-logic.ts:13`, `assertExclusiveSettlement`; the corrected credit locking
-  in `credits.ts:35`; and the uncommitted Connect reversal correction in
-  `payments/fulfill.ts:69`.
+`createBooking` inserts an initially unsettled booking, persists the accepted
+quote with `persistBookingPricingSnapshot`, applies verified settlement, and
+binds the attempt inside one transaction. This ordering respects migration
+0063's snapshot-before-settlement guards. Package redemption saves its credit
+quote and proven ledger mutation in the booking transaction. Legacy paths lacking
+these facts remain explicit compatibility paths, not reconstructed history.
 
-The following integration is proposed, not currently wired:
-
-1. Resolve authorized booking intent and server-selected settlement.
-2. Obtain a server quote and save it with the durable attempt before Checkout.
-3. Bind Stripe metadata to the stored attempt/quote identity. Metadata should be
-   correlation data; it should not replace the saved pricing contract.
-4. On payment fulfillment, lock the attempt and validate the payment.
-5. In one transaction: insert the booking without settlement facts, persist the
-   exact saved quote, apply verified settlement, mark fulfilled, and record pending
-   finalization work.
-
-The ordering in step 5 matters: snapshots currently require a booking parent, and
-the 0063 trigger rejects their insertion after PaymentIntent/positive amount/
-destination/paid/refunded facts exist. Current `createBooking` writes payment
-facts in its initial INSERT and must be adjusted at this boundary. Recalculating
-from mutable prices/promotions during fulfillment would violate the quote.
-
-| Settlement | Intended behavior in both direct and Connect modes |
+| Settlement | Current new-path financial behavior |
 | --- | --- |
-| Full cash | Collect the saved effective service price. |
-| Deposit | Discount full service price first, then cap the fixed deposit at effective price. Keep service value separate from amount captured. |
-| Zero cash / 100% promotion | Create without Stripe, preserving cash settlement and promotion attribution. Never infer a credit from zero amount or absent PaymentIntent. |
-| Package purchase | Save package price/currency/session count/service scope/route before Checkout; grant only after verified payment. Appointment promotions do not implicitly discount package sales. |
-| Credit redemption | Verify entitlement; consume and record the exact grant with booking creation in one transaction; save a credit snapshot; collect no cash and apply no cash promotion. |
+| Full cash | Collect the saved effective service price through the original direct/Connect route. |
+| Deposit | Collect the saved capped deposit. Preserve full service value separately from captured amount; cancellation refunds captured cash. |
+| Zero cash / 100% promotion | No Stripe Session or positive-cash attempt; preserve cash snapshot/attribution. The current zero-cash path has weaker durable retry identity. |
+| Package purchase | Save package price/currency/quantity/scope/owner/route before Checkout; grant once after verified payment. Appointment discounts do not implicitly price package sales. |
+| Credit redemption | Authorize verified internal owner; save credit snapshot and exact redemption with booking; collect no cash and apply no cash promotion. |
 
-A remaining deposit balance is explicitly uncollected. Do not introduce automatic
-later charges as a side effect of this topology change.
+Remaining deposit balance collection, arbitrary financial adjustments, and
+universal staff/API/recurring pricing coverage are deferred. Coupon pricing/use
+is **DECIDED / NOT YET IMPLEMENTED**; its accepted-source and use/restoration
+contract is in the pricing document. Future coupon integration must preserve
+attempt hashes, saved-term verification, durable cancellation/refund obligations,
+and original account routing. A restored coupon allowance is not evidence of a
+completed cash refund.
 
-## Proposed refund and cancellation model
+## Refund and cancellation responsibilities
 
-| Original settlement | Required compensation |
+| Original settlement | Compensation and implementation status |
 | --- | --- |
-| Direct cash payment | Refund the original account's PaymentIntent without Connect flags. |
-| Connect destination payment | Refund the original platform-owned PaymentIntent with transfer reversal; handle the actual application fee according to the retained fee-refund policy. |
-| Redeemed package credit | Restore the exact recorded redemption once. Cancelling one appointment does not refund its funding package purchase. |
-| Package purchase | Separate purchase-refund operation coordinating money returned with remaining/revoked credits; partially consumed packages require an explicit policy. |
+| Direct cash payment | CURRENT for new verified durable bookings: refund the original account's payment without Connect flags. |
+| Connect destination payment | CURRENT for new verified durable bookings: reverse the transfer; refund the saved actual application fee only when positive. |
+| Redeemed package credit | CURRENT for new proven redemptions: restore that redemption once. Appointment cancellation does not refund the funding package purchase. |
+| Package purchase | FUTURE / DEFERRED: coordinate returned cash with credit revocation; partially consumed packages need an explicit policy. |
 
 Atomically record cancellation and its required compensation, then call Stripe
 after commit using the refund-operation ID as an idempotency key. Record Refund
 ID and status, reconcile uncertain results, and retry independently of booking
-cancellation state. Refund the captured amount (or an explicit permitted part),
+cancellation state. Refund the original captured amount,
 never today's price or full service value when only a deposit was paid.
 
-Track pending/succeeded/failed/partial outcomes and external refunds. A failed
+**CURRENT LIMIT:** Durable appointment cancellation supports a full refund of
+captured cash. Partial-refund tooling and an authorized partial-refund policy
+are deferred. Partial/external refund evidence
+requires review rather than automatically calculating a remainder. A failed
 Connect reversal must not trigger a silent retry without reversal. Failed or
 cancelled destination refunds can leave returned funds on the platform and need
 reconciliation. Disputes involving package-funded credits also need an explicit
 review/revocation policy; they are not ordinary booking cancellations.
 
-Replace paid-without-PaymentIntent inference with explicit settlement/redemption
-identity. Record a primary payer/client independently of attendee ordering. Add
-credit bounds and a unique restoration operation. Prove entitlement using a
-verified client session or suitable email/bearer flow before allowing redemption.
+Slices 4–5 implement durable full appointment cash refunds and proven credit
+restoration, respectively. New credit ownership uses verified internal user
+identity, not supplied email or attendee ordering. Legacy payments lacking
+verified charge facts and old credits lacking ownership/redemption provenance
+retain their documented compatibility/review boundaries. Coupon use/restoration
+is a separate future obligation; it must not replace or complete a cash refund.
 
 ## Rescheduling, recurring appointments, and other entry points
 
 ### Rescheduling
 
-**Business decision updated October 2, 2026:** An allowed reschedule changes scheduling facts on the same booking; it preserves all historical pricing/settlement terms. Do not re-evaluate promotion eligibility, append a replacement quote, refund/recharge, or redeem another credit. This applies to settled, deposit-paid, unpaid price-locked, zero-cash and package bookings. The original quote's appointment time records the original pricing decision; it need not equal the booking's later scheduling time.
+**CURRENT + DECIDED CONTRACT:** Moving the same booking changes scheduling facts
+and preserves its historical pricing/settlement snapshot. This applies to
+price-locked unpaid, deposit-paid, fully paid, $0 and package bookings, and future
+coupon attribution/use. Do not re-evaluate discount eligibility, append a
+replacement quote, refund/recharge, create a new cash attempt, or restore/redeem
+value because the appointment moved. Preserve original payment, credit, and
+future coupon-use relationships even outside the original discount window.
 
-The upcoming pricing/rescheduling slice must implement a configurable customer grace allowance captured at original pricing/creation. Kimberly's current policy is one free move, honoring the original price even outside the promotion window. A name such as `customerRescheduleLimit` fits the existing `dailyBookingLimit` / `weeklyBookingLimit` conventions; zero, positive integers, and an explicit unlimited representation must be possible. Exact schema choices remain for that slice. The historical-price rule is an invariant, rather than an option to silently reprice when the limit is exceeded.
+There is **no grace-count/free-reschedule counter requirement**. This supersedes
+the earlier one-free-move proposal and any unpaid-reschedule repricing guidance.
+Availability, authorization, and safety restrictions still apply. Cancellation
+plus a genuine new booking has a new operation and current pricing/eligibility.
 
-Keep allowance and consumed moves on the booking lineage, with stable operation identity and an auditable move/actor record. Atomically serialize the move and grace consumption; retries of one move cannot consume two allowances, and a replacement internal occurrence cannot obtain a fresh allowance. Block further customer moves after exhaustion and require explicit authenticated staff intervention. Design staff override provenance separately from ordinary customer grace. Cancellation followed by a genuinely new booking gets current pricing and a new lineage; it must not inherit the cancelled promotion entitlement.
-
-Current `reschedule-booking.ts:rescheduleBooking` updates the same booking and preserves snapshots/payments/redemption. Slice 5 adds package finalization and concurrent-cancellation guards, without implementing grace limits. Existing capability-UID rescheduling still has no allowance accounting or explicit staff/customer distinction. Those are required in the later slice, not claimed complete here.
+`reschedule-booking.ts:rescheduleBooking` currently updates the same booking and
+keeps actual duration/snapshots/payments/redemption. Slice 5 rechecks cancellation
+under the booking lock and blocks package moves during ambiguous finalization.
+Concurrent move/provider reconciliation and external-effect delivery remain
+technical limitations; they do not authorize financial repricing. See the pricing
+contract for the original-priced-instant distinction and entry-point coverage.
 
 ### Recurrence
 
-Initially reject paid/credit recurring checkout rather than preserving the
-current one-payment-for-many-appointments behavior. Price each occurrence using
-its own start and persist independent snapshots.
+**CURRENT:** New package recurring creation is rejected; new public cash creation
+blocks commercial recurring series with the group-slot exception described in
+[PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md). This is not universal legacy or
+staff/internal coverage. **DECIDED:** Unsupported financial series must fail
+closed; future independently funded occurrences need independent accepted terms,
+while moving an existing occurrence preserves its history.
 
 The later collection design remains a product decision: collect independently
 per occurrence, or introduce a series purchase with explicit per-occurrence
@@ -904,7 +928,7 @@ routing flag alone is not the live-payment readiness milestone.
 | 3. Transactional fulfillment and event recovery (appointment implementation; bounded finalization) | Shared paid fulfillment, database uniqueness, snapshot-before-settlement ordering, durable event receipt and finalization work. | Concurrent redirect/webhook; different events for one payment; crash before/after commit; DB/queue outage; slot conflict; async success/failure; missing/invalid signatures; out-of-order events; resume interrupted calendar/reminder work without duplicate booking/grant. |
 | 4. Refund lifecycle (validated; full appointment cancellation only) | Durable compensation, original route selection, refund status/reconciliation, truthful return UI. | Cancellation crash before request; refund accepted before local persistence; ambiguous timeout; pending/failed/partial/external refunds; Connect fee/no-fee cases; failed reversal; repeated cancellation. |
 | 5. Package entitlement integrity (implemented; purchase refunds/revocation deferred) | Internal owner identity, mutation provenance, atomic redemption/restoration, durable verified package purchases, recovery. | Victim email cannot authorize spending; unpaid/null-PI/duplicate purchase events; concurrent last-credit consumption; concurrent restorations; guest ordering; package changes/deletion; partially consumed purchase refund. |
-| 6. Remaining pricing entry points | Staff/API policy, historical-price-preserving grace reschedules, booking-lineage allowance and move provenance, occurrence settlement. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
+| 6. Remaining pricing entry points | Staff/API pricing coverage, accepted-source extensibility, $0 operation identity, historical-price-preserving moves, occurrence settlement; coupons require separately scoped usage work. | Promotion date boundaries/DST; deposit changes; zero-cash versus credit; settled adjustment decisions; paid/credit series rejected until supported; partial series creation; first/later cancellation and allocation. |
 | 7. Cutover and compatibility | Additive migration, legacy processing, web/mobile/docs/deployment updates. | Legacy missing snapshots/duplicate audit; old Connect plus new direct records; outstanding old Sessions; account-context change; connected-balance obligations; rollback preserving new financial work; direct routes expose no withdrawal capability. |
 
 Retain and extend existing tests in `packages/core/src/pricing.test.ts`,
@@ -1133,9 +1157,11 @@ Pay special attention to deferred-trigger SQL syntax/order, transaction-end canc
 
 ## Slice 5 implementation: package ownership, credit provenance, and durable purchase grants
 
-This section supersedes the original audit's email-based package paths and the deferred package limitations in Slices 1–4. It does not implement package-purchase cash refunds/revocation, recurring financial policy, a universal outbox, or the new grace-reschedule allowance. Production payments are not enabled by this work.
+This section supersedes the original audit's email-based package paths and the deferred package limitations in Slices 1–4. It does not implement package-purchase cash refunds/revocation, recurring financial policy, a universal outbox, or coupon usage. The earlier grace-reschedule proposal is superseded; no counter is required. Production payments are not enabled by this work.
 
 ### Checkpoint lineage
+
+Validated Slice 5 checkpoint: `7ff1a9a8eac39151ae76db0dfc3bc50535542348` (`feat(packages): harden credit redemption integrity`).
 
 Slice 5 starts from `0a903172fd7c8e8cea519eecb49658d8d6201011` on `feature/payment-routing`, after Slice 3 `4ec3d98dfb36c51bd795d1d617326fb344a83ad9` and Slice 4 `c407ac80d1c4598457eb7c950f4bf188c1eab01f`. Existing commits are retained. The local `compose.light-balance.yaml` is excluded.
 
@@ -1196,7 +1222,7 @@ Credit booking external finalization is tracked on its redemption (`pending`, `r
 
 ### Rescheduling and recurrence
 
-`reschedule-booking.ts:rescheduleBooking` preserves the same booking row, actual duration, original pricing snapshot and redemption. It neither restores/redeems nor recalculates price. It rechecks cancellation under the row lock and blocks package moves during ambiguous external finalization. The new customer grace-reschedule requirement above is compatible: future move provenance/allowance must be attached to this lineage, without changing ledger/snapshot terms. Allowance consumption/enforcement and staff overrides are **not** implemented in Slice 5. Cash rescheduling remains unchanged financially.
+`reschedule-booking.ts:rescheduleBooking` preserves the same booking row, actual duration, original pricing snapshot and redemption. It neither restores/redeems nor recalculates price. It rechecks cancellation under the row lock and blocks package moves during ambiguous external finalization. The business contract requires no reschedule allowance/counter. Future move reconciliation must preserve this lineage without changing ledger/snapshot terms. Coupon eligibility/use is future work and must also survive a move without another redemption. Cash rescheduling remains unchanged financially.
 
 A package cannot authorize multiple recurring occurrences: creation fails closed at both service/application and database boundaries when recurrence exceeds one. Paid recurring financial policy remains separate future work.
 
