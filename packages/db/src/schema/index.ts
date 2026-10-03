@@ -5,6 +5,7 @@ export * from "./calendar";
 export * from "./scheduling";
 export * from "./booking";
 export * from "./promotions";
+export * from "./coupons";
 export * from "./booking-pricing";
 export * from "./team";
 export * from "./workflow";

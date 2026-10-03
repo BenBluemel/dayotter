@@ -9,6 +9,7 @@ import {
 } from "@/lib/payments/attempts";
 import { PaymentRoutingError } from "@/lib/payments/routing";
 import { clientIp, enforceRateLimit, verifyCaptcha } from "@/lib/server/rate-limit";
+import { normalizeCouponCode } from "@dayotter/core";
 import { schema as db, eq, getDb } from "@dayotter/db";
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -50,6 +51,7 @@ const schema = z.object({
   /** Stable browser operation identity; its booking input is bound on first use. */
   redeemCredit: z.boolean().optional(),
   checkoutRequestId: z.string().uuid().optional(),
+  couponCode: z.string().trim().min(1).max(64).optional(),
 });
 
 export async function POST(request: Request) {
@@ -77,6 +79,14 @@ export async function POST(request: Request) {
   });
   if (cooldown) return cooldown;
 
+  const couponSession = parsed.data.couponCode ? await getSession() : null;
+  if (parsed.data.couponCode && !couponSession?.user?.id)
+    return NextResponse.json({ error: "Sign in to use a coupon" }, { status: 401 });
+  if (parsed.data.couponCode && parsed.data.redeemCredit)
+    return NextResponse.json(
+      { error: "Choose either a coupon or a prepaid session" },
+      { status: 400 },
+    );
   const input: CreateBookingInput = {
     eventTypeId: parsed.data.eventTypeId,
     start: parsed.data.start,
@@ -89,6 +99,8 @@ export async function POST(request: Request) {
     location: parsed.data.location ?? undefined,
     linkToken: parsed.data.linkToken,
     accessCode: parsed.data.accessCode,
+    couponCode: parsed.data.couponCode ? normalizeCouponCode(parsed.data.couponCode) : undefined,
+    couponCustomerUserId: parsed.data.couponCode ? couponSession!.user.id : undefined,
   };
 
   const requestedPath = parsed.data.returnPath;
@@ -107,7 +119,7 @@ export async function POST(request: Request) {
         url: `/booking/${previousZero.uid}`,
         redirectUrl: null,
       });
-    const session = await getSession();
+    const session = couponSession ?? (await getSession());
     let ownerId: string | undefined;
     if (session?.user?.id) {
       try {
@@ -140,7 +152,12 @@ export async function POST(request: Request) {
       where: eq(db.eventTypes.id, input.eventTypeId),
       columns: { price: true, isActive: true },
     });
-    if (ownerId && et?.isActive && ((et.price ?? 0) > 0 || parsed.data.redeemCredit)) {
+    if (
+      !input.couponCode &&
+      ownerId &&
+      et?.isActive &&
+      ((et.price ?? 0) > 0 || parsed.data.redeemCredit)
+    ) {
       const credits = await creditBalance(input.eventTypeId, ownerId);
       if (credits > 0) {
         const { uid, redirectUrl } = await createBooking(creditInput);

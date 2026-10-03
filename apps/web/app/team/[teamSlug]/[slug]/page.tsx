@@ -1,5 +1,6 @@
 import { SlotPicker } from "@/components/slot-picker";
 import { Card, CardBody } from "@/components/ui/card";
+import { getSession } from "@/lib/auth/session";
 import { LOCATION_LABELS, offeredLocations } from "@/lib/booking/event-type-input";
 import { chargeFor, formatMoney } from "@/lib/booking/money";
 import { paymentsEnabled } from "@/lib/payments/stripe";
@@ -21,6 +22,7 @@ export default async function TeamBookingPage({
 }) {
   const { teamSlug, slug } = await params;
   const db = getDb();
+  const signedIn = Boolean((await getSession())?.user?.id);
 
   const team = await db.query.teams.findFirst({
     where: eq(schema.teams.slug, teamSlug),
@@ -126,6 +128,7 @@ export default async function TeamBookingPage({
           <CardBody className="p-6">
             <h2 className="mb-4 text-sm font-semibold">Select a time</h2>
             <SlotPicker
+              signedIn={signedIn}
               eventTypeId={eventType.id}
               questions={eventType.questions}
               priceLabel={priceLabel}

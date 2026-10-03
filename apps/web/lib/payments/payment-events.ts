@@ -1,6 +1,7 @@
 import { decryptJson, encryptJson, sha256hex } from "@dayotter/core";
 import { type Database, and, eq, getDb, inArray, isNull, schema } from "@dayotter/db";
 import type Stripe from "stripe";
+import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import {
   PAYMENT_ATTEMPT_ID_PATTERN,
   type PaymentAttempt,
@@ -243,6 +244,7 @@ export async function processAppointmentEvent(
               inArray(schema.paymentAttempts.state, ["prepared", "open", "payment_failed"]),
             ),
           );
+        await releaseTerminalCouponReservation(attempt.id, db);
       }
       await db
         .update(schema.paymentEvents)

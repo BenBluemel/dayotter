@@ -6,6 +6,7 @@ import { Tr } from "@/components/tr";
 import { Card, CardBody } from "@/components/ui/card";
 import { ViewTracker } from "@/components/view-tracker";
 import { aiEnabled } from "@/lib/ai/llm";
+import { getSession } from "@/lib/auth/session";
 import { getEntitlements } from "@/lib/billing/entitlements";
 import { sanitizePixelConfig } from "@/lib/booking/analytics-pixels";
 import { brandStyle, getHostBranding } from "@/lib/booking/branding";
@@ -31,6 +32,7 @@ export default async function PublicBookingPage({
 }) {
   const { handle, slug } = await params;
   const db = getDb();
+  const signedIn = Boolean((await getSession())?.user?.id);
 
   const host = await db.query.users.findFirst({ where: eq(schema.users.handle, handle) });
   if (!host) notFound();
@@ -175,6 +177,7 @@ export default async function PublicBookingPage({
                 <LanguagePicker />
               </div>
               <SlotPicker
+                signedIn={signedIn}
                 eventTypeId={eventType.id}
                 questions={eventType.questions}
                 priceLabel={priceLabel}

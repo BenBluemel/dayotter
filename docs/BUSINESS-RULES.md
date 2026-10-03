@@ -1,9 +1,7 @@
 # Pricing, payment, and booking business rules
 
-Status: business decisions recorded against validated Slice 5 commit
-`7ff1a9a8eac39151ae76db0dfc3bc50535542348`, on `feature/payment-routing`.
-Slice 6 enforces the shared pricing contract across new service-booking paths.
-This work does not enable production payments or implement coupon redemption.
+Status: Slice 7 implements appointment coupons on the validated Slice 6 pricing
+foundation on `feature/payment-routing`. Production payments remain unchanged.
 
 This is the product source of truth. Implementation must preserve these rules;
 changes to product policy must update this document. Technical contracts belong
@@ -56,46 +54,52 @@ date entry. These are not included in the implemented promotion foundation.
 
 ## Coupons
 
-**DECIDED / NOT YET IMPLEMENTED:** A coupon is an explicit code supplied by a
-customer or staff member. Planned capabilities include percentage/fixed
-discounts, validity dates, service restrictions, an optional minimum purchase,
-unlimited use, global use limits, and per-customer use limits.
+**CURRENT:** Signed-in customers can enter a trimmed, case-insensitive code on
+public appointment booking. `FRIEND50`, `friend50`, and `" Friend50 "` identify
+one organization-scoped coupon. The database enforces canonical code uniqueness.
+Guest coupon redemption is not available. A submitted attendee email never
+establishes per-customer entitlement; the authenticated user ID does.
 
-Coupons and automatic promotions participate in the same pricing system. The
-single valid discount giving the greatest savings wins; there is no default
-stacking. A coupon that loses to a better promotion must not consume a coupon
-use merely because its code was submitted. No coupon model, code-entry flow,
-usage ledger, or coupon-restoration behavior is implemented yet.
+An owner/admin can create and edit active/inactive percentage or fixed-currency
+coupons, service selection, inclusive local calendar dates, optional regular-price
+minimum, and optional total and per-customer booking limits. The organization's
+business timezone defaults to `America/Boise` and can be changed by an owner or
+admin. Local start-day midnight is included; the midnight after the chosen end
+day is excluded. The resulting UTC instants and timezone are stored with the
+coupon. Eligibility uses the **appointment start**, regardless of booking date.
+A fixed discount must match the service currency and cannot make the price
+negative. The regular/base service price determines minimum eligibility.
 
-Minimum-purchase eligibility uses the regular/base service price, not discounted
-price or deposit. Codes are trimmed and case-insensitive: `FRIEND50`, `friend50`,
-and `" Friend50 "` identify the same code. If a coupon and an automatic promotion
-give exactly the same best price, prefer the automatic promotion and preserve
-the coupon use. Coupons require an authenticated customer; guest redemption is
-not supported.
+Coupons and automatic promotions use the same pricing engine. They do not stack.
+The one valid discount giving the greatest saving wins. An automatic promotion
+wins an exact tie, so the coupon is neither reserved nor used. A promotion that
+beats the coupon likewise preserves its use. Staff can manage definitions; staff
+booking coupon entry awaits a safe authenticated-customer selection and payment
+flow. There is no guest or raw-email redemption shortcut.
 
 ## Coupon usage and cancellation
 
-**DECIDED / NOT YET IMPLEMENTED:** Limited or one-time coupon redemption belongs
-to the booking that used it. Moving that booking does not consume another use.
-Cancellation restores the consumed use exactly once, including the customer's
-per-customer allowance. Retries or repeated cancellation cannot restore twice.
+**CURRENT:** A winning coupon has one durable use belonging to its booking
+lineage. Unlimited coupons still receive an audit use; limits count only active
+reservations and booked redemptions. Total and per-customer limits can coexist.
+PostgreSQL serializes final-use decisions on the coupon definition row; a mutable
+counter is not the authority. Positive-cash Checkout reserves capacity against
+the existing payment attempt. A retry of the same operation reuses its attempt
+and reservation. A verified booking converts the reservation to a redemption in
+the booking transaction. A $0 booking redeems atomically without Stripe.
 
-Future limited-use coupons may have global and/or per-customer limits. Reserve
-scarce capacity safely during Checkout and release it when Checkout is abandoned.
-Successful booking consumes the reservation; cancellation restores it once;
-rescheduling preserves it. Expiration/abandonment must be established safely so
-a delayed successful payment is not discarded or assigned released capacity.
+A terminal expired or failed Checkout releases its reservation. Recovery retries
+release after a crash between terminal state and release. An ambiguous Stripe
+creation/payment state holds its reservation for reconciliation rather than
+risking a delayed paid booking using released capacity. Cancellation restores
+the original booking's allowance once, with a unique restoration record, in the
+existing cancellation/refund transaction. It restores both total and customer
+capacity when both limits apply, even after the coupon expires or is disabled;
+it does not reactivate the coupon. Cash refund completion is a separate fact.
 
-Unlimited coupons do not need scarce-use counting, but the booking still records
-why its discount applied. Restoring a use does not reactivate an expired or
-disabled coupon. Cancellation followed by a genuinely new booking performs a
-fresh eligibility and redemption check; it does not inherit the cancelled
-booking's discounted price.
-
-Coupon-use restoration and returning cash are different operations. Future
-implementation must preserve both obligations without claiming a cash refund
-has completed merely because a coupon use was restored.
+A genuinely new booking makes a fresh eligibility and capacity decision. Moving
+the original booking keeps its quote and use. No recurring commercial booking may
+use one coupon to finance an undefined series; that path fails closed.
 
 ## Rescheduling
 
@@ -105,7 +109,7 @@ the replacement appointment is outside the original promotion window. Payments,
 deposits, and package redemption stay attached to that same booking. Moving it
 does not itself charge, refund, redeem, or restore value.
 
-**DECIDED:** The same rule applies to future coupon-paid discounts and to
+**CURRENT:** The same rule applies to coupon-discounted and to
 unpaid but price-locked, partially paid, fully paid, $0, and package-settled
 bookings. Availability, authorization, and existing scheduling restrictions
 still apply. Price preservation is not a guarantee that every requested time
@@ -186,19 +190,14 @@ cancellation/refund policy.
 
 ## Unresolved decisions
 
-- Coupon validity clock: appointment start, booking acceptance time, or another
-  explicitly defined time; promotion eligibility currently uses appointment start.
-- Coupon eligibility for package purchases is not decided; appointment minimums
-  use base service price. Coupon validity clock remains unresolved separately
-  from the finalized appointment-time promotion rule.
-- Exact scarce-use reservation/release mechanics, abandoned Checkout evidence,
-  delayed-payment races, and operator recovery need design before coupon runtime
-  implementation. Reservation at Checkout and consumption at successful booking
-  are decided; their failure handling must preserve exactly-once use/restoration.
+- Coupon discounts on package purchases remain deferred; appointment coupon
+  minimums use the base service price.
+- Ambiguous payment attempts still require existing operator reconciliation before
+  their coupon reservation can safely be released.
 - Staff/offline commercial booking policy and consistent approval behavior for
   $0 promotional bookings. Current public $0 bookings retain existing approval
   behavior; cash-paid and package bookings bypass approval.
-- Business timezone ownership and inclusive calendar-date input for promotion
-  management; current stored windows are explicit instants.
+- Promotion-management calendar UI remains deferred; current promotion windows
+  are explicit instants. Coupon management uses the organization business timezone.
 - Remaining-balance collection and recurring/package refund policies described
   above. None is implicitly authorized by documenting the current rules.

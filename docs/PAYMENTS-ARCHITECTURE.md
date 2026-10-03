@@ -726,17 +726,17 @@ these facts remain explicit compatibility paths, not reconstructed history.
 | --- | --- |
 | Full cash | Collect the saved effective service price through the original direct/Connect route. |
 | Deposit | Collect the saved capped deposit. Preserve full service value separately from captured amount; cancellation refunds captured cash. |
-| Zero cash / 100% promotion | No Stripe Session or positive-cash attempt; preserve cash snapshot/attribution. The current zero-cash path has weaker durable retry identity. |
+| Zero cash / 100% promotion | No Stripe Session or positive-cash attempt; preserve cash snapshot/attribution. The zero-cash path has a durable operation claim and retry identity. |
 | Package purchase | Save package price/currency/quantity/scope/owner/route before Checkout; grant once after verified payment. Appointment discounts do not implicitly price package sales. |
 | Credit redemption | Authorize verified internal owner; save credit snapshot and exact redemption with booking; collect no cash and apply no cash promotion. |
 
 Remaining deposit balance collection, arbitrary financial adjustments, and
-universal staff/API/recurring pricing coverage are deferred. Coupon pricing/use
-is **DECIDED / NOT YET IMPLEMENTED**; its accepted-source and use/restoration
-contract is in the pricing document. Future coupon integration must preserve
-attempt hashes, saved-term verification, durable cancellation/refund obligations,
-and original account routing. A restored coupon allowance is not evidence of a
-completed cash refund.
+staff/recurring commercial payment expansion are deferred. Slice 7 coupon
+checkout binds one use reservation to the existing immutable attempt and quote;
+verified fulfillment redeems it with the booking. Terminal expiry/failure
+releases it, including by recovery after a crash. Ambiguous Stripe attempts
+retain capacity pending reconciliation. Cancellation restores coupon allowance
+in the existing local decision transaction; that does not prove a cash refund.
 
 ## Refund and cancellation responsibilities
 
@@ -775,11 +775,10 @@ is a separate future obligation; it must not replace or complete a cash refund.
 
 **CURRENT + DECIDED CONTRACT:** Moving the same booking changes scheduling facts
 and preserves its historical pricing/settlement snapshot. This applies to
-price-locked unpaid, deposit-paid, fully paid, $0 and package bookings, and future
-coupon attribution/use. Do not re-evaluate discount eligibility, append a
+price-locked unpaid, deposit-paid, fully paid, $0 and package bookings, and coupon attribution/use. Do not re-evaluate discount eligibility, append a
 replacement quote, refund/recharge, create a new cash attempt, or restore/redeem
 value because the appointment moved. Preserve original payment, credit, and
-future coupon-use relationships even outside the original discount window.
+coupon-use relationships even outside the original discount window.
 
 There is **no grace-count/free-reschedule counter requirement**. This supersedes
 the earlier one-free-move proposal and any unpaid-reschedule repricing guidance.
@@ -1222,7 +1221,7 @@ Credit booking external finalization is tracked on its redemption (`pending`, `r
 
 ### Rescheduling and recurrence
 
-`reschedule-booking.ts:rescheduleBooking` preserves the same booking row, actual duration, original pricing snapshot and redemption. It neither restores/redeems nor recalculates price. It rechecks cancellation under the row lock and blocks package moves during ambiguous external finalization. The business contract requires no reschedule allowance/counter. Future move reconciliation must preserve this lineage without changing ledger/snapshot terms. Coupon eligibility/use is future work and must also survive a move without another redemption. Cash rescheduling remains unchanged financially.
+`reschedule-booking.ts:rescheduleBooking` preserves the same booking row, actual duration, original pricing snapshot and redemption. It neither restores/redeems nor recalculates price. It rechecks cancellation under the row lock and blocks package moves during ambiguous external finalization. The business contract requires no reschedule allowance/counter. Coupon redemptions and accepted prices also stay with this booking lineage, including moves outside the original validity window. Future move reconciliation must preserve these terms. Cash rescheduling remains unchanged financially.
 
 A package cannot authorize multiple recurring occurrences: creation fails closed at both service/application and database boundaries when recurrence exceeds one. Paid recurring financial policy remains separate future work.
 
@@ -1282,8 +1281,8 @@ series are not given fabricated financial allocations.
 
 External calendar/email/reminder delivery for free/staff bookings and recurring
 expansion still lacks a universal durable outbox. A committed booking is retained
-and returned on retry without blindly replaying those effects. Coupon eligibility,
-authenticated redemption, checkout capacity reservations, accepted coupon snapshot
-schema, usage/restoration, and management UI remain future work. Only pure shared
-candidate arithmetic (including promotion preference on ties) and canonical code
-normalization are introduced now; they are not coupon payment provenance.
+and returned on retry without blindly replaying those effects. Slice 7 adds authenticated coupon selection, checkout reservation, booking
+redemption, exactly-once cancellation restoration, immutable quote attribution,
+and owner/admin and customer UI. Staff coupon entry still depends on a safe
+authenticated-customer commercial booking flow. Ambiguous Stripe attempts hold
+reservations for review.

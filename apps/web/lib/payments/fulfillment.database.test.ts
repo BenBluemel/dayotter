@@ -6,6 +6,7 @@ import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureAttempt, fixturePaidSession, fixturePaymentIntent } from "./attempt-fixtures";
 import type { PaymentAttempt } from "./attempt-terms";
+import { insertHistoricalPricingSnapshot } from "./legacy-snapshot-fixture";
 
 const mock = vi.hoisted(() => ({
   db: null as unknown as ReturnType<typeof createDatabase>,
@@ -113,9 +114,11 @@ describe.skipIf(!testUrl)("durable fulfillment PostgreSQL integration", () => {
     }
   }, 60000);
   async function seedTenant() {
-    await db
-      .insert(schema.organizations)
-      .values({ id: organizationId, name: "Test merchant", slug: randomUUID() });
+    await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
+      organizationId,
+      "Test merchant",
+      randomUUID(),
+    ]);
     await db.insert(schema.users).values({ id: ownerId, email: "host@example.test" });
     await db.insert(schema.eventTypes).values({
       id: eventTypeId,
@@ -182,7 +185,6 @@ describe.skipIf(!testUrl)("durable fulfillment PostgreSQL integration", () => {
       `INSERT INTO payment_attempts (${columns.join(",")}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(",")})`,
       keys.map((key) => (key === "quote" ? JSON.stringify(legacy[key]) : legacy[key])),
     );
-    const { persistBookingPricingSnapshot } = await import("../booking/pricing");
     const bookingId = randomUUID();
     const session = fixturePaidSession(legacy);
     await db.transaction(async (tx) => {
@@ -197,7 +199,7 @@ describe.skipIf(!testUrl)("durable fulfillment PostgreSQL integration", () => {
         endsAt: new Date(new Date(input.start).getTime() + 1800000),
         timezone: "UTC",
       });
-      await persistBookingPricingSnapshot(bookingId, quote, tx);
+      await insertHistoricalPricingSnapshot(tx, bookingId, quote);
       await tx
         .update(schema.bookings)
         .set({

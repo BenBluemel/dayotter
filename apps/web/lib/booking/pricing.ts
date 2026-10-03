@@ -1,8 +1,12 @@
-import { type AppointmentPrice, calculateAppointmentPrice } from "@dayotter/core";
+import {
+  type AppointmentPrice,
+  calculateAppointmentPrice,
+  normalizeCouponCode,
+} from "@dayotter/core";
 import { type Database, and, eq, getDb, gt, lte, schema, sql } from "@dayotter/db";
 import { BookingError } from "./booking-logic";
 
-type PricingReader = Pick<Database, "select">;
+type PricingReader = Pick<Database, "select" | "query">;
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 export interface AppointmentQuoteRequest {
@@ -11,6 +15,9 @@ export interface AppointmentQuoteRequest {
   appointmentStartsAt: Date;
   /** Server-selected; this function neither authorizes nor redeems a credit. */
   settlement: "cash" | "package_credit";
+  /** Internal authenticated customer identity, never supplied as an HTTP body field. */
+  couponCustomerUserId?: string;
+  couponCode?: string;
 }
 
 /**
@@ -26,6 +33,18 @@ export async function quoteAppointmentPrice(
   if (!Number.isFinite(input.appointmentStartsAt.getTime())) {
     throw new BookingError("Invalid appointment time", 400);
   }
+  if (input.couponCode && (!input.couponCustomerUserId || input.settlement !== "cash"))
+    throw new BookingError("Sign in to use a coupon", 401);
+  const normalizedCode = input.couponCode ? normalizeCouponCode(input.couponCode) : null;
+  const coupon = normalizedCode
+    ? await db.query.appointmentCoupons.findFirst({
+        where: and(
+          eq(schema.appointmentCoupons.organizationId, input.organizationId),
+          eq(schema.appointmentCoupons.code, normalizedCode),
+        ),
+      })
+    : null;
+  if (normalizedCode && !coupon) throw new BookingError("Coupon code not recognized", 400);
   // One statement sees one PostgreSQL snapshot, even at READ COMMITTED. Separate
   // reads could combine an old service price with newly committed promotion rules.
   const rows = await db
@@ -63,7 +82,41 @@ export async function quoteAppointmentPrice(
   if (!eventType) throw new BookingError("Event type not found", 404);
   const rules = rows.flatMap(({ promotion }) => (promotion ? [promotion] : []));
 
-  return calculateAppointmentPrice({
+  let eligibleCoupon = null;
+  if (coupon) {
+    if (!coupon.isActive) throw new BookingError("This coupon is inactive", 400);
+    if (input.appointmentStartsAt < coupon.startsAt || input.appointmentStartsAt >= coupon.endsAt)
+      throw new BookingError("This appointment is outside the coupon dates", 400);
+    const link = await db.query.appointmentCouponEventTypes.findFirst({
+      where: and(
+        eq(schema.appointmentCouponEventTypes.couponId, coupon.id),
+        eq(schema.appointmentCouponEventTypes.eventTypeId, eventType.id),
+        eq(schema.appointmentCouponEventTypes.organizationId, input.organizationId),
+      ),
+    });
+    if (!link) throw new BookingError("This coupon does not apply to this service", 400);
+    if ((eventType.price ?? 0) < (coupon.minimumBasePrice ?? 0))
+      throw new BookingError("The regular service price is below this coupon's minimum", 400);
+    if (coupon.discountKind === "fixed" && coupon.currency !== (eventType.currency ?? "usd"))
+      throw new BookingError("This coupon uses a different currency", 400);
+    eligibleCoupon = {
+      id: coupon.id,
+      organizationId: coupon.organizationId,
+      code: coupon.code,
+      label: coupon.label,
+      isActive: coupon.isActive,
+      startsAt: coupon.startsAt,
+      endsAt: coupon.endsAt,
+      eventTypeIds: [eventType.id],
+      minimumBasePrice: coupon.minimumBasePrice,
+      discount:
+        coupon.discountKind === "percentage"
+          ? { kind: "percentage" as const, basisPoints: coupon.discountValue }
+          : { kind: "fixed" as const, amount: coupon.discountValue, currency: coupon.currency! },
+    };
+  }
+
+  const quote = calculateAppointmentPrice({
     eventType,
     appointmentStartsAt: input.appointmentStartsAt,
     settlement: input.settlement,
@@ -75,7 +128,11 @@ export async function quoteAppointmentPrice(
           ? { kind: "percentage", basisPoints: p.discountValue }
           : { kind: "fixed", amount: p.discountValue, currency: p.currency! },
     })),
+    coupon: eligibleCoupon,
   });
+  if (coupon && !quote.coupon && !quote.promotion)
+    throw new BookingError("This coupon does not reduce the service price", 400);
+  return quote;
 }
 
 /**
@@ -117,6 +174,7 @@ export async function persistBookingPricingSnapshot(
     throw new BookingError("A settled booking requires an explicit pricing adjustment", 409);
   }
   const p = price.promotion;
+  const c = price.coupon;
   const [snapshot] = await tx
     .insert(schema.bookingPricingSnapshots)
     .values({
@@ -141,6 +199,20 @@ export async function persistBookingPricingSnapshot(
           : p.discount.amount
         : null,
       promotionCurrency: p?.discount.kind === "fixed" ? p.discount.currency : null,
+      discountSource: c ? "coupon" : p ? "promotion" : null,
+      couponId: c?.id ?? null,
+      couponCode: c?.code ?? null,
+      couponLabel: c?.label ?? null,
+      couponStartsAt: c ? new Date(c.startsAt) : null,
+      couponEndsAt: c ? new Date(c.endsAt) : null,
+      couponDiscountKind: c?.discount.kind ?? null,
+      couponDiscountValue: c
+        ? c.discount.kind === "percentage"
+          ? c.discount.basisPoints
+          : c.discount.amount
+        : null,
+      couponCurrency: c?.discount.kind === "fixed" ? c.discount.currency : null,
+      couponMinimumBasePrice: c?.minimumBasePrice ?? null,
     })
     .returning();
   return snapshot!;

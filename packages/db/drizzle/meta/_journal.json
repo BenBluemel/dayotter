@@ -484,6 +484,13 @@
       "when": 1791004773431,
       "tag": "0068_zero_cash_booking",
       "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1791008161971,
+      "tag": "0069_appointment_coupons",
+      "breakpoints": true
     }
   ]
 }

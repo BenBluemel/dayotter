@@ -4,6 +4,7 @@ import { createDatabase, eq, schema } from "@dayotter/db";
 import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePaidSession, fixturePaymentIntent } from "./attempt-fixtures";
+import { insertHistoricalPricingSnapshot } from "./legacy-snapshot-fixture";
 import { fixtureRefundCharge, fixtureRefundEvidence } from "./refund-fixtures";
 import type { RefundEvidence, RefundOperation } from "./refund-terms";
 
@@ -114,9 +115,11 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
     ) as { entries: { tag: string }[] };
     for (const { tag } of journal.entries) {
       if (tag === "0066_refund_operations") {
-        await db
-          .insert(schema.organizations)
-          .values({ id: organizationId, name: "Refund test", slug: randomUUID() });
+        await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
+          organizationId,
+          "Refund test",
+          randomUUID(),
+        ]);
         await db.insert(schema.users).values({ id: ownerId, email: "host@example.test" });
         await db.insert(schema.eventTypes).values({
           id: eventTypeId,
@@ -131,14 +134,14 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
           location: "in_person",
           locationDetail: "Test room",
         });
-        upgrade = await fresh();
+        upgrade = await fresh(true);
         // Genuine Slice 3 cancelled row with no refund operation: migration must
         // preserve it, and bounded recovery may safely reconstruct the obligation.
         await db
           .update(schema.bookings)
           .set({ status: "cancelled" })
           .where(eq(schema.bookings.id, upgrade.booking.id));
-        upgradeInconsistent = await fresh();
+        upgradeInconsistent = await fresh(true);
         await db
           .update(schema.bookings)
           .set({ status: "cancelled", paymentCurrency: "eur" })
@@ -191,7 +194,7 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
       return { ...evidence, refund: { ...evidence.refund, id } };
     });
   });
-  async function fresh() {
+  async function fresh(historical = false) {
     const start = new Date(Date.UTC(2027, 0, 1) + sequence++ * 3600000);
     const input = {
       eventTypeId,
@@ -209,6 +212,48 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
     });
     await observePaymentSuccess(attempt!, session, db);
     const terms = decodeAttempt(attempt!);
+    if (historical) {
+      const bookingId = randomUUID();
+      const uid = randomUUID();
+      await db.transaction(async (tx) => {
+        await tx.insert(schema.bookings).values({
+          id: bookingId,
+          uid,
+          organizationId,
+          eventTypeId,
+          hostId: ownerId,
+          title: "Historical",
+          startsAt: start,
+          endsAt: new Date(start.getTime() + 1800000),
+          timezone: "UTC",
+          allowOverlap: true,
+        });
+        await insertHistoricalPricingSnapshot(tx, bookingId, terms.quote);
+        await tx
+          .update(schema.bookings)
+          .set({
+            paymentStatus: "paid",
+            paymentIntentId: pi.id,
+            amountPaid: attempt!.amount,
+            paymentCurrency: attempt!.currency,
+            destinationAccountId: attempt!.destinationAccountId,
+          })
+          .where(eq(schema.bookings.id, bookingId));
+        await tx
+          .update(schema.paymentAttempts)
+          .set({
+            state: "fulfilled",
+            bookingId,
+            finalizationContext: "historical-test-context",
+            finalizationState: "pending",
+          })
+          .where(eq(schema.paymentAttempts.id, attempt!.id));
+      });
+      const booking = (await db.query.bookings.findFirst({
+        where: eq(schema.bookings.id, bookingId),
+      }))!;
+      return { attempt: attempt!, session, pi, booking };
+    }
     const result = await createBooking({
       ...terms.input,
       paymentAttemptId: attempt!.id,

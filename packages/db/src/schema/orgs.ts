@@ -24,6 +24,8 @@ export const organizations = pgTable("organizations", {
   slug: text("slug").notNull().unique(),
   logo: text("logo"),
   metadata: text("metadata"),
+  /** Calendar-date coupon entry uses this zone; saved coupon windows remain UTC instants. */
+  businessTimezone: text("business_timezone").notNull().default("America/Boise"),
   /** "free" | "pro". Cloud only; self-host treats everyone as unlocked. */
   plan: text("plan").notNull().default("free"),
   /** Mirror of the Stripe subscription status (active/trialing/past_due/canceled/…). */

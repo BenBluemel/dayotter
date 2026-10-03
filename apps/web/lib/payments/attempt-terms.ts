@@ -40,29 +40,41 @@ const discount = z.discriminatedUnion("kind", [
     })
     .strict(),
 ]);
-const quoteSchema = z
+const quoteBase = z.object({
+  organizationId: z.string().uuid(),
+  eventTypeId: z.string().uuid(),
+  appointmentStartsAt: instant,
+  settlement: z.literal("cash"),
+  basePrice: z.number().int().nonnegative(),
+  effectivePrice: z.number().int().nonnegative(),
+  amountToCollect: z.number().int().positive(),
+  currency: z.string().regex(/^[a-z]{3}$/),
+  promotion: z
+    .object({
+      id: z.string().uuid(),
+      label: z.string().min(1),
+      startsAt: instant,
+      endsAt: instant,
+      discount,
+    })
+    .strict()
+    .nullable(),
+});
+const appliedCoupon = z
   .object({
-    version: z.literal(1),
-    organizationId: z.string().uuid(),
-    eventTypeId: z.string().uuid(),
-    appointmentStartsAt: instant,
-    settlement: z.literal("cash"),
-    basePrice: z.number().int().nonnegative(),
-    effectivePrice: z.number().int().nonnegative(),
-    amountToCollect: z.number().int().positive(),
-    currency: z.string().regex(/^[a-z]{3}$/),
-    promotion: z
-      .object({
-        id: z.string().uuid(),
-        label: z.string().min(1),
-        startsAt: instant,
-        endsAt: instant,
-        discount,
-      })
-      .strict()
-      .nullable(),
+    id: z.string().uuid(),
+    code: z.string().regex(/^[A-Z0-9][A-Z0-9_-]{0,63}$/),
+    label: z.string().nullable(),
+    startsAt: instant,
+    endsAt: instant,
+    minimumBasePrice: z.number().int().nonnegative().nullable(),
+    discount,
   })
   .strict();
+const quoteSchema = z.union([
+  quoteBase.extend({ version: z.literal(1) }).strict(),
+  quoteBase.extend({ version: z.literal(2), promotion: z.null(), coupon: appliedCoupon }).strict(),
+]);
 
 export function attemptRoute(attempt: PaymentAttempt): PaymentRoute {
   const context = {
@@ -116,10 +128,10 @@ export function decodeAttempt(attempt: PaymentAttempt) {
     throw new PaymentContradictionError("Saved checkout intent and pricing terms disagree");
   }
   // Integrity check of immutable numbers only; never run quote/promotion selection at fulfillment.
-  const p = quote.promotion;
+  const p = quote.promotion ?? (quote.version === 2 ? quote.coupon : null);
   const saving = p
     ? p.discount.kind === "percentage"
-      ? Math.round((quote.basePrice * p.discount.basisPoints) / 10000)
+      ? Math.floor((quote.basePrice * p.discount.basisPoints + 5000) / 10000)
       : Math.min(quote.basePrice, p.discount.amount)
     : 0;
   if (
@@ -129,7 +141,10 @@ export function decodeAttempt(attempt: PaymentAttempt) {
       (saving <= 0 ||
         new Date(quote.appointmentStartsAt) < new Date(p.startsAt) ||
         new Date(quote.appointmentStartsAt) >= new Date(p.endsAt) ||
-        (p.discount.kind === "fixed" && p.discount.currency !== quote.currency)))
+        (p.discount.kind === "fixed" && p.discount.currency !== quote.currency))) ||
+    (quote.version === 2 &&
+      quote.coupon?.minimumBasePrice != null &&
+      quote.basePrice < quote.coupon.minimumBasePrice)
   ) {
     throw new PaymentContradictionError("Invalid saved pricing arithmetic");
   }

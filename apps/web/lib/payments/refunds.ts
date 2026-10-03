@@ -12,6 +12,7 @@ import {
   or,
   schema,
 } from "@dayotter/db";
+import { restoreBookingCoupon } from "../booking/coupon-uses";
 import { restoreBookingCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "./booking-routing";
 import { validatePaymentIntentTerms } from "./payment-success";
@@ -88,6 +89,7 @@ export async function decideBookingCancellation(
         .set({ status: "cancelled", cancelledAt: new Date(), cancelReason: reason ?? null })
         .where(eq(schema.bookings.id, booking.id));
     const creditRestoration = await restoreBookingCredit(tx, booking);
+    await restoreBookingCoupon(tx, booking);
     let operation: RefundOperation | undefined;
     if (durable && attempt) {
       operation = await tx.query.refundOperations.findFirst({

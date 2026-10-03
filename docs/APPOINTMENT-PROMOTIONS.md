@@ -1,12 +1,11 @@
 # Automatic appointment promotions: implementation reference
 
 Status: the promotion foundation originated on `feature/promotions` in migration
-0063 and is integrated into the new public appointment cash/package pricing
-paths through validated Slice 5 commit `7ff1a9a8eac39151ae76db0dfc3bc50535542348`,
-with direct/API/staff pricing enforcement added in Slice 6 on
-`feature/payment-routing`. No promotion-management UI or runtime coupon
-functionality is implemented. Existing bookings are not backfilled. Production
-configuration has not been changed or payments enabled by these slices.
+0063 and was extended to shared pricing in Slice 6. Slice 7 adds appointment
+coupons through that same pricing and accepted-quote contract. Promotion
+management remains API/schema-only; coupon management and public customer entry
+are implemented. Existing bookings are not backfilled. Production configuration
+has not been changed or payments enabled by these slices.
 
 ## Contract and document boundaries
 
@@ -19,9 +18,10 @@ owns cash/package settlement, payment/refund durability, and recovery.
 This document owns promotion-specific schema/migration and code navigation.
 Earlier statements that public checkout is undiscounted, credits are authorized
 by email, or unpaid reschedules should receive replacement quotes are obsolete.
-There is no grace-count/free-reschedule counter requirement. Coupon support is
-decided future work in the shared pricing contract; the promotion-only code does
-not currently accept coupon codes.
+There is no grace-count/free-reschedule counter requirement. Coupon policy and
+current implementation are documented in
+[BUSINESS-RULES.md](BUSINESS-RULES.md) and
+[PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md).
 
 ## Current code map
 
@@ -30,16 +30,18 @@ anchors. Behavior below describes the current code, not the original audit.
 
 | Boundary | Current behavior |
 | --- | --- |
-| `packages/core/src/pricing.ts:calculateAppointmentPrice` | Pure automatic-promotion eligibility, greatest single saving, deterministic ties, rounding, deposit cap, separate cash/credit settlement. |
-| `apps/web/lib/booking/pricing.ts:quoteAppointmentPrice` | One coherent SQL view of active organization-scoped service and selected promotions; server-owned quote. |
+| `packages/core/src/pricing.ts:calculateAppointmentPrice` | Pure promotion/coupon eligibility, greatest single saving, promotion preference on ties, rounding, deposit cap, separate cash/credit settlement. |
+| `apps/web/lib/booking/pricing.ts:quoteAppointmentPrice` | One coherent SQL view of active organization-scoped service and promotion rules; coupon eligibility joins the same authoritative discount selection. |
 | `apps/web/lib/booking/pricing.ts:persistBookingPricingSnapshot` | Locks/validates scope and initial start; saves detached values before settlement. |
 | `apps/web/app/api/book/route.ts:POST` | Resumes existing durable cash/credit operations; can prefer authorized credits; otherwise prepares cash quote, Checkout, or $0 booking. |
-| `apps/web/lib/payments/attempts.ts:prepareAppointmentAttempt` | Saves positive-cash quote, resolved duration and original merchant routing before Stripe, under repeatable read. |
+| `apps/web/lib/payments/attempts.ts:prepareAppointmentAttempt` | Saves positive-cash quote, resolved duration and original merchant routing before Stripe; coupon capacity uses a definition row lock at READ COMMITTED, other attempts use repeatable read. |
 | `apps/web/lib/payments/payment-success.ts`, `payment-work.ts`, `payment-events.ts` | Verify canonical payment facts and fulfill from saved terms, not recalculated promotions. |
 | `apps/web/lib/booking/create-booking.ts:createBooking` | Persists the saved cash snapshot before settlement; package branch quotes and persists credit snapshot with redemption atomically. |
 | `apps/web/lib/packages/credits.ts` | Verified internal owner, durable grant/redemption/restoration provenance; never email-only entitlement spending. |
 | `apps/web/lib/booking/reschedule-booking.ts:rescheduleBooking` | Moves the same booking without changing its financial snapshot or spending another credit. |
-| `apps/web/lib/payments/refunds.ts:decideBookingCancellation` | Cancellation coordinates durable cash refund obligation or exact credit restoration; coupon restoration does not exist yet. |
+| `apps/web/lib/payments/refunds.ts:decideBookingCancellation` | Cancellation coordinates durable cash refund obligation, exact credit restoration, and exactly-once coupon allowance restoration. |
+| `apps/web/lib/booking/coupon-uses.ts` | PostgreSQL-serialized coupon capacity, checkout reservation, booking redemption, terminal release, and exactly-once cancellation restoration. |
+| `apps/web/app/api/coupons` and `apps/web/components/coupons-manager.tsx` | Owner/admin coupon definition and organization timezone management; public booking preview requires customer authentication to apply a code. |
 | `apps/web/app/api/v1/bookings/route.ts:POST` | Delegates to shared booking pricing; a service with positive base price can book only when its appointment quote collects zero cash. |
 | `apps/web/lib/booking/host-booking.ts:createHostBooking` | Staff service creation uses atomic zero-cash quote/snapshot; positive collection requires public checkout. Personal/internal meetings stay noncommercial. |
 | `apps/web/lib/booking/finalize-booking.ts:finalizeOccurrence` | Free occurrences save zero-cash quotes atomically; commercial expansion fails closed. Funded per-occurrence allocation remains deferred. |
@@ -61,12 +63,14 @@ journal and snapshot. Schema references:
 3. `booking_pricing_snapshots` stores append-only booking-linked accepted quote
    history: base/effective price, currency, quoted collection, original priced
    start, settlement, version, and copied promotion identity/label/window/rule.
-   It has no promotion FK; promotion edits/deletion cannot rewrite attribution.
+   Slice 7 extends this record with coupon identity/code/label/window/rule when
+   the coupon wins. It has no promotion or coupon FK; definition edits cannot
+   rewrite attribution.
 
 Supporting composite indexes/FKs bind every snapshot to the booking's actual
 organization and service. Checks enforce integer bounds, exact discount arithmetic,
 valid attribution, and cash/credit separation. No snapshot means legacy/unpriced,
-not a free service. Current types/columns represent promotions, not future coupons.
+not a free service.
 
 Handwritten triggers reject snapshot UPDATE and direct DELETE. Parent booking
 deletion can cascade history, subject to later durable financial restrictions.
@@ -101,11 +105,12 @@ and their guards are documented in the payment architecture.
 Slice 6 closes staff/API quote coverage and zero-cash operation identity gaps.
 CURRENT gaps: universal external-effect recovery, commercial offline workflows,
 independent recurring financial allocation and external-effect reconciliation.
-CURRENT coupon preparation: pure shared best-discount selection and code normalization.
-DECIDED but unimplemented: runtime coupon eligibility and durable
-booking-linked use/restoration. FUTURE: promotion-management UI and inclusive
-calendar-date entry after business timezone semantics are chosen. See the pricing
-contract and business rules for unresolved decisions and later scope.
+CURRENT coupon support: runtime eligibility, authenticated public entry,
+durable booking-linked use/reservation/restoration, and owner/admin management
+are implemented in Slice 7. Coupon calendar dates use the organization business
+timezone. FUTURE: promotion-management UI, staff coupon entry pending a safe
+authenticated-customer commercial flow, and recurring financial allocation.
+See the pricing contract and business rules for remaining boundaries.
 
 ## Slice 6 pricing enforcement
 
@@ -122,7 +127,6 @@ and cash/credit exclusivity. New free recurring occurrences save individual
 quotes; commercial recurring expansion fails closed. Ordinary rescheduling still
 preserves the exact original quote and payment/redemption relationships.
 
-Shared core discount candidates can represent eligible promotions or future
-coupons; promotion wins an equal-saving cross-source tie. Canonical codes trim
-and uppercase. There is no coupon table, guest redemption, scarce-use reservation,
-usage/restoration implementation, or coupon UI in Slice 6.
+Shared core discount candidates represent eligible promotions and coupons;
+promotion wins an equal-saving cross-source tie. Canonical coupon codes trim and
+uppercase. Slice 7 adds the coupon schema and use lifecycle described above.

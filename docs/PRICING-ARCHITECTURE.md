@@ -1,10 +1,7 @@
 # Pricing architecture and accepted-quote contract
 
-Status: Slice 6 extends the validated Slice 1–5 financial foundation and its
-business-rule documentation checkpoint. New public/direct/API/staff service
-creation uses authoritative pricing. Coupons have shared arithmetic/normalization
-primitives only; runtime eligibility, reservations, redemption, and UI remain
-unimplemented. Production payments are not enabled.
+Status: Slice 7 adds authenticated appointment coupons to the Slice 6
+accepted-quote foundation. Production payments remain unchanged.
 
 ## Business-rule authority and document boundaries
 
@@ -48,10 +45,10 @@ coverage; the coverage gaps below must not be read as implemented functionality.
    booking. Package booking creates its credit snapshot and redemption in the
    same booking transaction. Neither is proof of a cash payment.
 
-Current public `/api/book` can automatically prefer an available authorized
-package credit before calculating a new cash quote; explicit redemption also
-requires a verified owner. This existing settlement-selection behavior is not
-an implemented coupon-versus-credit comparison or a redesigned public UI.
+Public `/api/book` can use an authorized package credit as an alternative
+settlement. Explicit coupon and credit selection are mutually exclusive; a
+submitted coupon proceeds through cash pricing, including a $0 effective price.
+No package credit is consumed because a coupon lowers the price.
 
 ## Price and settlement vocabulary
 
@@ -96,72 +93,67 @@ settlement ordering is mandatory. Explicit pre-settlement revision primitives
 exist, but ordinary rescheduling must not use them to reprice. A separate
 financial-adjustment workflow is deferred.
 
-Future discount-source and coupon attribution must preserve this contract;
-current snapshot/attempt types are promotion-specific and cannot represent a
-coupon by pretending it is a promotion. Extend them deliberately when coupon
-work is authorized. Do not backfill missing legacy quotes from today's prices.
+Migration `0069_appointment_coupons.sql` adds version-2 coupon attribution to
+the same booking snapshot and payment-attempt quote. It copies the coupon ID,
+code, label, window, discount kind/value/currency, and minimum beside base,
+effective, quoted collection, currency, and priced appointment instant. Later
+definition edits cannot reinterpret this history. Do not backfill legacy quotes.
 
 ## Discount sources and selection
 
-**CURRENT:** `AppointmentPromotion`, `PromotionDiscount`, `AppliedPromotion`,
-and `AppointmentPrice` represent automatic promotions only. Eligibility requires
-an active rule, matching organization, explicitly selected service, and an
-appointment start in its window. An empty service selection applies nowhere.
-Greatest single saving wins; ties use ascending stable promotion ID. No stacking.
+**CURRENT:** `quoteAppointmentPrice` reads server-owned service price and eligible
+organization promotions; an authenticated coupon code is normalized and looked
+up in that same organization. It checks active state, selected service, original
+appointment start in `[startsAt, endsAt)`, base-price minimum, and fixed-currency
+match. The pure `calculateAppointmentPrice` function submits promotion and coupon
+candidates to `selectBestDiscount`. Greatest single saving wins; promotion wins
+an exact cross-source tie; same-source ties use stable ID order. Nothing stacks.
+A losing coupon has no use or attribution. Zero-saving coupons cannot be applied.
 
-**CURRENT arithmetic boundary:** `DiscountRule`, `DiscountCandidate`, and
-`selectBestDiscount` in `packages/core/src/pricing.ts` support already eligible
-promotion/coupon candidates. Automatic pricing uses this helper now; larger
-saving wins, promotion wins cross-source ties, and stable IDs break same-source
-ties. `normalizeCouponCode` implements `trim().toUpperCase()` identity only.
-These pure helpers neither authenticate customers nor reserve/redeem coupons.
+The client receives only an advisory preview of base/effective/due-now amounts;
+checkout and $0 booking revalidate on the server. Positive-cash checkout saves
+its exact quote before Stripe. Fulfillment copies that quote, not a fresh lookup.
+The booking snapshot and attempt JSON carry `version=2` for a winning coupon;
+version-1 promotion and undiscounted quotes remain compatible. The database
+checks coupon arithmetic, scope, and source exclusivity. Code normalization is
+`trim().toUpperCase()` with a unique `(organization_id, code)` index plus a
+canonical-code CHECK. Coupon authorization uses the authenticated user ID, never
+attendee email.
 
-**DECIDED / NOT YET IMPLEMENTED:** Runtime coupon eligibility must join the
-existing promotion evaluation through that same pricing contract. Keep
-eligibility separate from pure discount arithmetic and settlement. Each valid
-candidate contributes its source identity/type, copied explanation/rule, and
-computed saving. Choose the greatest single valid saving and persist the chosen
-source; do not add promotion and coupon savings together. Accepted coupon
-attribution and schema evolution remain future implementation design. Equal savings across
-sources prefer the automatic promotion, preserving the coupon use.
-Future candidates must be validated server-side in the same organization and
-service scope; a submitted code is not authority for a price or ownership claim.
+## Coupon reservation, redemption, and restoration
 
-Coupon eligibility will support percent/fixed amounts, dates, service scope,
-optional minimum purchase, and optional global/per-customer limits. There is
-currently no coupon table, input, evaluator, accepted attribution, or use ledger.
-Minimum-purchase eligibility tests base service price. Canonical codes use
-`code.trim().toUpperCase()` so case and surrounding whitespace do not create
-separate identities; enforce scoped canonical uniqueness when a coupon schema
-is implemented. Coupon redemption requires an authenticated customer, never a
-guest or supplied email alone. The unresolved eligibility questions are listed
-in the business rules. Package credit remains a settlement choice, not a
-candidate cash discount.
+**CURRENT:** `appointment_coupons` stores definitions and UTC date bounds plus
+the business timezone used to convert inclusive local dates. The organization
+setting defaults to `America/Boise`. `appointment_coupon_event_types` scopes
+services. `appointment_coupon_uses` records stable request identity, user,
+coupon, organization, service, payment attempt or booking, and one state:
+`reserved`, `redeemed`, `released`, or `restored`. Unlimited coupons retain uses
+but skip allowance counting. PostgreSQL locks the definition row and counts
+active reserved/redeemed uses for global and per-customer limits before insert.
+There is no authoritative mutable uses counter. Unique operation, attempt, and
+booking keys, foreign keys, CHECKs, and triggers constrain direct mutations.
+Deferred database checks require every accepted coupon checkout quote to own a
+reservation, every coupon-priced booking to own its matching use, and cancelled
+coupon bookings to own exactly one completed restoration. They reject a partial
+financial commit even if an application path omits a write.
 
-## Future coupon-use provenance
+A positive-cash attempt reserves capacity in the same transaction as its saved
+quote. Response loss retries the same attempt. On verified fulfillment, booking,
+immutable snapshot, and reserved-to-redeemed transition commit together. $0
+cash bookings create the snapshot and redeemed use in their booking transaction,
+without Stripe. Expired or async-failed terminal attempts release once; payment
+recovery sweeps terminal reservations if the process stopped between commits.
+An ambiguous checkout remains held for existing payment reconciliation because
+a late paid obligation must not be assigned released capacity.
 
-**DECIDED / NOT YET IMPLEMENTED:** The chosen limited coupon needs a durable
-booking-linked use with stable operation identity and authoritative customer
-scope where per-customer limits apply. A code that loses discount selection does
-not consume a use. Global and customer limit checks/mutations must be atomic in
-PostgreSQL across application instances; read-then-decrement in application code
-or Redis is insufficient.
-
-Cancellation must identify the original consumed use and restore both global
-and per-customer allowances exactly once, transactionally with the local
-cancellation decision where possible. Unique reversal identity and immutable
-source/owner/booking/quantity facts must prevent double restore and lost restore.
-Do not derive restoration from current coupon configuration. Unlimited coupons
-retain accepted attribution/provenance without unnecessary scarce-use arithmetic.
-Restoration never changes the coupon's active flag or validity dates.
-
-Rescheduling preserves the same use. A genuine new booking performs fresh
-selection and redemption. Reserve scarce global/customer capacity during
-Checkout, release it after authoritative abandonment/expiration, and consume it
-with successful booking. Database-backed reservation identity and safe delayed-
-payment/release coordination need an explicit design before runtime implementation;
-saved pricing alone cannot guarantee scarce availability.
-Coupon restoration must not erase or replace a pending cash RefundOperation.
+The existing cancellation decision transaction inserts one
+`appointment_coupon_restorations` row referencing the original use and moves it
+to `restored`; duplicate/retried cancellation converges. This frees both scopes
+without changing the definition's active flag or dates. The cash refund
+obligation remains separate. Rescheduling touches neither snapshot nor use,
+regardless of a moved date or edited/expired definition. A new booking starts a
+new eligibility decision. Unsupported recurring commercial coupon series fail
+closed until recurring finance is defined.
 
 ## $0 and package settlement
 
@@ -206,7 +198,7 @@ and approved commercial offline workflows remain separate work.
 moves the same booking while retaining its actual duration and financial facts.
 It does not quote again, change accepted attribution, create a PaymentAttempt,
 refund/recharge, or restore/redeem a package credit. Preserve that behavior for
-unpaid price-locked, deposit-paid, fully paid, $0, and future coupon bookings.
+unpaid price-locked, deposit-paid, fully paid, $0, and coupon bookings.
 The snapshot's priced appointment instant remains the original decision instant;
 it need not equal the booking's later scheduling start.
 
@@ -231,12 +223,13 @@ start; customer booking time is irrelevant. Snapshots retain the original bounds
 and priced instant. Fixed discounts carry matching currency; links enforce
 same-organization service/promotion scope.
 
-**FUTURE / DEFERRED:** A date-entry UI may offer inclusive business calendar dates,
-converted to the corresponding UTC instants using an explicitly chosen business
-timezone. Compute local next-day boundaries with calendar-aware timezone rules,
-including DST; do not add 24 hours blindly. Business-timezone ownership and date
-entry are unresolved. Coupon eligibility must not silently inherit appointment-
-time semantics before its validity-clock decision is made.
+Coupon management accepts inclusive local calendar dates. The organization
+business timezone defaults to `America/Boise` and can be changed by an owner/admin.
+The server converts the first date's local midnight and the midnight after the
+last date into UTC instants using calendar-aware timezone rules, including DST.
+The saved UTC bounds and timezone remain fixed if the organization setting later
+changes. Coupon eligibility uses appointment start, with the same `[startsAt,
+endsAt)` semantics as promotions.
 
 ## Concurrency, retry, and recurring boundaries
 
@@ -248,8 +241,9 @@ booking. Package redemption and restoration use PostgreSQL locks/constraints.
 See the payment architecture for exact lifecycle/recovery behavior.
 
 **DECIDED:** Future pricing entry points and coupon mutations must preserve these
-guarantees. Concurrent administration edits must not produce mixed-revision
-quotes; configuration changes cannot replace an already accepted quote.
+guarantees. Coupon mutations serialize with reservations and cannot replace an
+already accepted quote. Concurrent administration edits must not produce
+mixed-revision quotes.
 Contradictory saved/payment facts fail closed for recovery/review. Never weaken
 an invariant to handle a stale or retried request.
 
@@ -280,10 +274,10 @@ contract or authorized by the presence of a recurring scheduling feature.
 | `/api/v1/bookings` | Authorizes caller-owned service; delegates authoritative quote/snapshot to `createBooking`, allows zero effective cash, rejects positive collection; supports `checkoutRequestId`. |
 | `host-booking.ts:createHostBooking` / internal meetings | Commercial service quote/snapshot is atomic; positive collection requires public checkout. Personal/internal meetings remain noncommercial. Explicit service scope is enforced. |
 | Reschedule | Same financial lineage; no repricing/counter; external-effect/move reconciliation is incomplete. |
-| Coupons | Pure shared candidate selection/canonical code helper exists; runtime eligibility/usage remains deferred; business rules decided subject to listed unresolved questions. |
+| Coupons | Authenticated public booking preview and entry, owner/admin management, shared pricing, durable use/reservation/restoration and saved attribution are implemented; staff entry and package-purchase discounts are deferred. |
 | Recurring creation | Financial guards cover public/direct/staff commercial creation; free occurrences save quotes; funded recurring architecture remains deferred. |
 
 Slice 6 deliberately retains version-1 promotion snapshots/attempts and the
-Slice 1–5 cash/credit/refund guarantees. Future coupon runtime must extend
-accepted attribution and scarce-capacity provenance explicitly; a generic pure
-candidate is not a persisted coupon entitlement.
+Slice 1–6 cash/credit/refund guarantees remain intact. Coupon uses are separate
+from package credits and cash settlement. Ambiguous payment reconciliation holds
+scarce reservations until the existing payment workflow proves a terminal state.

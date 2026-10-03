@@ -145,9 +145,11 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
     ) as { entries: { tag: string }[] };
     for (const { tag } of journal.entries) {
       if (tag === "0067_package_integrity") {
-        await db
-          .insert(schema.organizations)
-          .values({ id: org, name: "Package test", slug: randomUUID() });
+        await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
+          org,
+          "Package test",
+          randomUUID(),
+        ]);
         await db
           .insert(schema.users)
           .values({ id: host, email: `${host}@example.test`, emailVerified: true });

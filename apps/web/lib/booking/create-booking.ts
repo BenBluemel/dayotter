@@ -25,6 +25,7 @@ import {
   mapInsertError,
   validateResponses,
 } from "./booking-logic";
+import { redeemReservedCouponUse, reserveCouponUse } from "./coupon-uses";
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
 import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
@@ -176,11 +177,18 @@ export interface CreateBookingInput {
   /** Internal operation identity shared by cash, credits, and zero-cash booking. */
   bookingRequestId?: string;
   bookingReturnPath?: string;
+  /** Canonical customer-entered code; public routes derive the identity below from session. */
+  couponCode?: string;
+  couponCustomerUserId?: string;
 }
 
 export async function createBooking(
   input: CreateBookingInput,
 ): Promise<{ uid: string; redirectUrl: string | null }> {
+  if (input.couponCode && (!input.couponCustomerUserId || input.redeemCredit))
+    throw new BookingError("Sign in to use a coupon with cash pricing", 401);
+  if (input.couponCode && input.payment && !input.paymentAttemptId)
+    throw new BookingError("Coupon payment requires its saved checkout", 409);
   if (!input.redeemCredit) {
     if (input.payment) return createBookingOnce(input); // Explicit historical/durable payment paths.
     const existing = await findZeroCashBooking(input);
@@ -392,6 +400,8 @@ async function createBookingOnce(
             eventTypeId: current.id,
             appointmentStartsAt: start,
             settlement: "cash",
+            couponCode: input.couponCode,
+            couponCustomerUserId: input.couponCustomerUserId,
           },
           tx,
         );
@@ -676,6 +686,14 @@ async function createBookingOnce(
       if (!row) throw new BookingError("Failed to create booking", 500);
       if (acceptedQuote) {
         await persistBookingPricingSnapshot(row.id, acceptedQuote, tx);
+        if (input.paymentAttemptId && acceptedQuote.coupon)
+          await redeemReservedCouponUse(
+            tx,
+            input.paymentAttemptId,
+            row.id,
+            acceptedQuote,
+            input.couponCustomerUserId!,
+          );
         if (input.payment) {
           const [settled] = await tx
             .update(schema.bookings)
@@ -717,6 +735,15 @@ async function createBookingOnce(
         await tx.execute(
           sql`select claim_booking_settlement(${identity.key},'zero_cash',${row.id}::uuid,${identity.fingerprint})`,
         );
+        if (acceptedQuote?.coupon)
+          await reserveCouponUse(
+            tx,
+            acceptedQuote,
+            input.couponCustomerUserId!,
+            identity.key,
+            identity.fingerprint,
+            { bookingId: row.id },
+          );
       }
       if (input.redeemCredit) {
         const creditQuote = await quoteAppointmentPrice(

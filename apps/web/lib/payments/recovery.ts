@@ -1,4 +1,5 @@
-import { type Database, and, eq, getDb, inArray, lte, schema } from "@dayotter/db";
+import { type Database, and, eq, getDb, inArray, lte, schema, sql } from "@dayotter/db";
+import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import { decodeAttempt } from "./attempt-terms";
 import { appointmentCheckout } from "./attempts";
 import { processAppointmentEvent, reconcileSession } from "./payment-events";
@@ -87,6 +88,18 @@ export async function recoverAppointmentPayments(limit = 25, db: Database = getD
           .where(eq(schema.paymentAttempts.id, attempt.id));
     }
   }
+  // A process may stop after marking a checkout terminal but before releasing
+  // its reservation. Reconcile from durable attempt state on later recovery.
+  const pendingReleases = await db.query.appointmentCouponUses.findMany({
+    where: and(
+      eq(schema.appointmentCouponUses.status, "reserved"),
+      sql`exists (select 1 from payment_attempts a where a.id = ${schema.appointmentCouponUses.paymentAttemptId} and a.state in ('expired','payment_failed') and a.success_facts is null and a.booking_id is null)`,
+    ),
+    columns: { paymentAttemptId: true },
+    limit,
+  });
+  for (const use of pendingReleases)
+    if (use.paymentAttemptId) await releaseTerminalCouponReservation(use.paymentAttemptId, db);
   const finalizations = await db.query.paymentAttempts.findMany({
     where: and(
       eq(schema.paymentAttempts.state, "fulfilled"),

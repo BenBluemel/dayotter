@@ -71,8 +71,31 @@ export interface AppliedPromotion {
   readonly discount: PromotionDiscount;
 }
 
+export interface AppointmentCoupon {
+  readonly id: string;
+  readonly organizationId: string;
+  readonly code: string;
+  readonly label: string | null;
+  readonly isActive: boolean;
+  readonly startsAt: Date;
+  readonly endsAt: Date;
+  readonly eventTypeIds: readonly string[];
+  readonly minimumBasePrice: number | null;
+  readonly discount: DiscountRule;
+}
+
+export interface AppliedCoupon {
+  readonly id: string;
+  readonly code: string;
+  readonly label: string | null;
+  readonly startsAt: string;
+  readonly endsAt: string;
+  readonly minimumBasePrice: number | null;
+  readonly discount: DiscountRule;
+}
+
 interface PriceSnapshot {
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly organizationId: string;
   readonly eventTypeId: string;
   /** The appointment instant priced, retained even if a booking is later moved. */
@@ -88,8 +111,12 @@ interface PriceSnapshot {
 
 export type AppointmentPrice = PriceSnapshot &
   (
-    | { readonly settlement: "cash"; readonly promotion: AppliedPromotion | null }
-    | { readonly settlement: "package_credit"; readonly promotion: null }
+    | {
+        readonly settlement: "cash";
+        readonly promotion: AppliedPromotion | null;
+        readonly coupon?: AppliedCoupon | null;
+      }
+    | { readonly settlement: "package_credit"; readonly promotion: null; readonly coupon?: null }
   );
 
 export interface AppointmentPricingInput {
@@ -105,6 +132,8 @@ export interface AppointmentPricingInput {
   /** Chosen by the server. Credit balance validation/consumption belongs in the booking transaction. */
   readonly settlement: "cash" | "package_credit";
   readonly promotions: readonly AppointmentPromotion[];
+  /** Server-verified candidate. Eligibility is repeated here to keep pure pricing safe. */
+  readonly coupon?: AppointmentCoupon | null;
 }
 
 // Fits existing PostgreSQL integer money columns; also keeps basis-point arithmetic exact.
@@ -188,7 +217,10 @@ export function calculateAppointmentPrice(input: AppointmentPricingInput): Appoi
   }
   if (input.settlement !== "cash") throw new RangeError("Unknown appointment settlement");
 
-  const candidates: (AppointmentPromotion & DiscountCandidate)[] = [];
+  const candidates: (
+    | (AppointmentPromotion & { readonly source: "promotion" })
+    | (AppointmentCoupon & { readonly source: "coupon" })
+  )[] = [];
   const ids = new Set<string>();
   for (const promotion of input.promotions) {
     if (
@@ -210,23 +242,64 @@ export function calculateAppointmentPrice(input: AppointmentPricingInput): Appoi
     candidates.push({ ...promotion, source: "promotion" });
   }
 
+  const coupon = input.coupon;
+  if (coupon) {
+    validateAmount(coupon.minimumBasePrice ?? 0);
+    if (
+      coupon.isActive &&
+      coupon.organizationId === eventType.organizationId &&
+      coupon.eventTypeIds.includes(eventType.id) &&
+      basePrice >= (coupon.minimumBasePrice ?? 0) &&
+      appointment >= instant(coupon.startsAt) &&
+      appointment < instant(coupon.endsAt) &&
+      discountAmount(basePrice, currency, coupon.discount) > 0
+    ) {
+      candidates.push({ ...coupon, source: "coupon" });
+    }
+  }
+
   const { candidate: selected, saving } = selectBestDiscount(basePrice, currency, candidates);
+  const selectedPromotion = selected?.source === "promotion" ? selected : null;
+  const selectedCoupon = selected?.source === "coupon" ? selected : null;
   return {
     ...snapshot,
+    version: selectedCoupon ? 2 : 1,
     settlement: "cash",
     effectivePrice: basePrice - saving,
     amountToCollect: deposit > 0 ? Math.min(deposit, basePrice - saving) : basePrice - saving,
-    promotion: selected
+    promotion: selectedPromotion
       ? {
-          id: selected.id,
-          label: selected.label,
-          startsAt: selected.startsAt.toISOString(),
-          endsAt: selected.endsAt.toISOString(),
+          id: selectedPromotion.id,
+          label: selectedPromotion.label,
+          startsAt: selectedPromotion.startsAt.toISOString(),
+          endsAt: selectedPromotion.endsAt.toISOString(),
           discount:
-            selected.discount.kind === "fixed"
-              ? { ...selected.discount, currency: currencyCode(selected.discount.currency) }
-              : { ...selected.discount },
+            selectedPromotion.discount.kind === "fixed"
+              ? {
+                  ...selectedPromotion.discount,
+                  currency: currencyCode(selectedPromotion.discount.currency),
+                }
+              : { ...selectedPromotion.discount },
         }
       : null,
+    ...(selectedCoupon
+      ? {
+          coupon: {
+            id: selectedCoupon.id,
+            code: selectedCoupon.code,
+            label: selectedCoupon.label,
+            startsAt: selectedCoupon.startsAt.toISOString(),
+            endsAt: selectedCoupon.endsAt.toISOString(),
+            minimumBasePrice: selectedCoupon.minimumBasePrice,
+            discount:
+              selectedCoupon.discount.kind === "fixed"
+                ? {
+                    ...selectedCoupon.discount,
+                    currency: currencyCode(selectedCoupon.discount.currency),
+                  }
+                : { ...selectedCoupon.discount },
+          },
+        }
+      : {}),
   };
 }

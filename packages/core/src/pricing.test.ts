@@ -354,3 +354,88 @@ describe("eligible discount sources", () => {
     expect(selectBestDiscount(1000, "usd", [p, { ...p, source: "coupon" }]).candidate).toBe(p);
   });
 });
+
+describe("coupon selection in authoritative pricing", () => {
+  const coupon = (
+    overrides: Partial<NonNullable<AppointmentPricingInput["coupon"]>> = {},
+  ): NonNullable<AppointmentPricingInput["coupon"]> => ({
+    id: "coupon-a",
+    organizationId: light.organizationId,
+    code: "FRIEND50",
+    label: "Friends",
+    isActive: true,
+    startsAt: new Date("2026-10-01T00:00:00Z"),
+    endsAt: new Date("2026-11-01T00:00:00Z"),
+    eventTypeIds: [light.id],
+    minimumBasePrice: 5000,
+    discount: { kind: "percentage", basisPoints: 5000 },
+    ...overrides,
+  });
+  it("normalizes trim and case before lookup", () => {
+    expect(["FRIEND50", "friend50", " Friend50 "].map(normalizeCouponCode)).toEqual([
+      "FRIEND50",
+      "FRIEND50",
+      "FRIEND50",
+    ]);
+  });
+  it("uses one percent or fixed discount and caps deposit after discount", () => {
+    expect(price({ eventType: { ...light, depositAmount: 4500 }, coupon: coupon() })).toMatchObject(
+      {
+        version: 2,
+        basePrice: 5000,
+        effectivePrice: 2500,
+        amountToCollect: 2500,
+        coupon: { code: "FRIEND50" },
+        promotion: null,
+      },
+    );
+    expect(
+      price({ coupon: coupon({ discount: { kind: "fixed", amount: 6000, currency: "usd" } }) }),
+    ).toMatchObject({ effectivePrice: 0, amountToCollect: 0, settlement: "cash" });
+  });
+  it("prefers promotion on equal savings and does not attribute coupon", () => {
+    expect(
+      price({ coupon: coupon({ discount: { kind: "percentage", basisPoints: 2000 } }) }),
+    ).toMatchObject({
+      version: 1,
+      effectivePrice: 4000,
+      promotion: { id: "promo-a" },
+    });
+  });
+  it("selects a coupon only when it beats the promotion", () => {
+    expect(price({ coupon: coupon() })).toMatchObject({
+      version: 2,
+      effectivePrice: 2500,
+      coupon: { id: "coupon-a" },
+      promotion: null,
+    });
+    expect(
+      price({ coupon: coupon({ discount: { kind: "fixed", amount: 500, currency: "usd" } }) }),
+    ).toMatchObject({ version: 1, effectivePrice: 4000, promotion: { id: "promo-a" } });
+  });
+  it("uses base price for the minimum and appointment start for boundaries", () => {
+    expect(price({ coupon: coupon({ minimumBasePrice: 5001 }) }).coupon).toBeUndefined();
+    expect(
+      price({
+        appointmentStartsAt: new Date("2026-10-01T00:00:00Z"),
+        promotions: [],
+        coupon: coupon(),
+      }).effectivePrice,
+    ).toBe(2500);
+    expect(
+      price({
+        appointmentStartsAt: new Date("2026-11-01T00:00:00Z"),
+        promotions: [],
+        coupon: coupon(),
+      }).coupon,
+    ).toBeUndefined();
+  });
+  it("never applies a coupon to credit settlement or wrong currency/service", () => {
+    expect(price({ settlement: "package_credit", coupon: coupon() }).coupon).toBeUndefined();
+    expect(price({ coupon: coupon({ eventTypeIds: ["other"] }) }).coupon).toBeUndefined();
+    expect(
+      price({ coupon: coupon({ discount: { kind: "fixed", amount: 2000, currency: "eur" } }) })
+        .coupon,
+    ).toBeUndefined();
+  });
+});

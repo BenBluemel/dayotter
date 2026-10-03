@@ -122,7 +122,8 @@ export const paymentAttempts = pgTable(
     check(
       "payment_attempt_quote_binding_check",
       sql`jsonb_typeof(${t.quote}) = 'object' AND (
-    ${t.quote}->>'version' = '1' AND ${t.quote}->>'settlement' = ${t.settlement}
+    ${t.quote}->>'version' IN ('1','2') AND ${t.quote}->>'settlement' = ${t.settlement}
+    AND (${t.quote}->>'version' <> '2' OR (jsonb_typeof(${t.quote}->'coupon') = 'object' AND ${t.quote}->>'promotion' IS NULL))
     AND ${t.quote}->>'organizationId' = ${t.organizationId}::text AND ${t.quote}->>'eventTypeId' = ${t.eventTypeId}::text
     AND ${t.quote}->>'currency' = ${t.currency} AND (${t.quote}->>'amountToCollect')::integer = ${t.amount}
     AND (${t.quote}->>'effectivePrice')::integer >= ${t.amount} AND (${t.quote}->>'basePrice')::integer >= (${t.quote}->>'effectivePrice')::integer

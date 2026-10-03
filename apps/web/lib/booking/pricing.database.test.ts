@@ -77,10 +77,11 @@ describe.skipIf(!testUrl)("appointment pricing PostgreSQL integration", () => {
         if (statement.trim()) await db.$client.query(statement);
       }
     }
-    await db.insert(schema.organizations).values([
-      { id: orgId, name: "Light & Balance", slug: randomUUID() },
-      { id: otherOrgId, name: "Other", slug: randomUUID() },
-    ]);
+    // Seed the historical schema before migration 0069 added business_timezone.
+    await db.$client.query(
+      "INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3),($4,$5,$6)",
+      [orgId, "Light & Balance", randomUUID(), otherOrgId, "Other", randomUUID()],
+    );
     await db.insert(schema.users).values({ id: hostId, email: "host@example.test" });
     await db.insert(schema.eventTypes).values([
       {

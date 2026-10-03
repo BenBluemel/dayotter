@@ -3,6 +3,8 @@ import { encryptJson, sha256hex } from "@dayotter/core";
 import { type Database, and, eq, getDb, schema, sql } from "@dayotter/db";
 import type Stripe from "stripe";
 import { BookingError } from "../booking/booking-logic";
+import { reserveCouponUse } from "../booking/coupon-uses";
+import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import type { CreateBookingInput } from "../booking/create-booking";
 import { quoteAppointmentPrice } from "../booking/pricing";
 import { env } from "../server/env";
@@ -59,9 +61,19 @@ export async function prepareAppointmentAttempt(
               quote: decodeAttempt(existing).quote,
               durationMinutes: decodeAttempt(existing).resolvedDurationMinutes,
             };
-          const event = await tx.query.eventTypes.findFirst({
-            where: eq(schema.eventTypes.id, input.eventTypeId),
-          });
+          // Coupon capacity uses a locked definition row and READ COMMITTED count.
+          // Hold the service row too so its price/owner cannot change mid-prepare.
+          const event = input.couponCode
+            ? (
+                await tx
+                  .select()
+                  .from(schema.eventTypes)
+                  .where(eq(schema.eventTypes.id, input.eventTypeId))
+                  .for("share")
+              )[0]
+            : await tx.query.eventTypes.findFirst({
+                where: eq(schema.eventTypes.id, input.eventTypeId),
+              });
           if (!event?.isActive) throw new BookingError("Event type not found", 404);
           const quote = await quoteAppointmentPrice(
             {
@@ -69,6 +81,8 @@ export async function prepareAppointmentAttempt(
               eventTypeId: event.id,
               appointmentStartsAt: new Date(input.start),
               settlement: "cash",
+              couponCode: input.couponCode,
+              couponCustomerUserId: input.couponCustomerUserId,
             },
             tx,
           );
@@ -126,10 +140,19 @@ export async function prepareAppointmentAttempt(
             })
             .returning();
           if (!attempt) throw new PaymentRoutingError("Could not save checkout intent");
+          if (quote.coupon)
+            await reserveCouponUse(
+              tx,
+              quote,
+              input.couponCustomerUserId!,
+              identity.key,
+              identity.fingerprint,
+              { attemptId: attempt.id, expiresAt: attempt.expiresAt },
+            );
           decodeAttempt(attempt);
           return { attempt, quote, durationMinutes };
         },
-        { isolationLevel: "repeatable read" },
+        { isolationLevel: input.couponCode ? "read committed" : "repeatable read" },
       );
     } catch (err) {
       const failure = err as {
@@ -161,7 +184,7 @@ export async function bindAttemptSession(
   db = getDb(),
 ) {
   validateAttemptSession(attempt, session);
-  return db.transaction(async (tx) => {
+  const updated = await db.transaction(async (tx) => {
     const [current] = await tx
       .select()
       .from(schema.paymentAttempts)
@@ -186,6 +209,8 @@ export async function bindAttemptSession(
       .returning();
     return updated!;
   });
+  if (updated.state === "expired") await releaseTerminalCouponReservation(updated.id, db);
+  return updated;
 }
 
 export async function appointmentCheckout(attempt: PaymentAttempt) {
