@@ -148,14 +148,14 @@ export const bookingSettlementClaims = pgTable(
   "booking_settlement_claims",
   {
     operationKey: text("operation_key").primaryKey(),
-    settlement: text("settlement").$type<"cash" | "package_credit">().notNull(),
+    settlement: text("settlement").$type<"cash" | "package_credit" | "zero_cash">().notNull(),
     sourceId: uuid("source_id").notNull(),
     requestFingerprint: text("request_fingerprint").notNull(),
   },
   (t) => [
     check(
       "booking_settlement_claim_shape",
-      sql`${t.settlement} IN ('cash','package_credit') AND ${t.requestFingerprint} ~ '^[0-9a-f]{64}$'`,
+      sql`${t.settlement} IN ('cash','package_credit','zero_cash') AND ${t.requestFingerprint} ~ '^[0-9a-f]{64}$'`,
     ),
     uniqueIndex("booking_settlement_claim_source_idx").on(t.settlement, t.sourceId),
   ],

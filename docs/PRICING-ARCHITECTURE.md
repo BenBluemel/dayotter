@@ -1,10 +1,10 @@
 # Pricing architecture and accepted-quote contract
 
-Status: inspected at validated Slice 5 commit
-`7ff1a9a8eac39151ae76db0dfc3bc50535542348`. Public appointment cash pricing,
-automatic promotion calculation, $0 cash snapshots, and package settlement are
-implemented. Coupons and complete pricing coverage of other entry points are
-not implemented. Slice 6 has not begun.
+Status: Slice 6 extends the validated Slice 1–5 financial foundation and its
+business-rule documentation checkpoint. New public/direct/API/staff service
+creation uses authoritative pricing. Coupons have shared arithmetic/normalization
+primitives only; runtime eligibility, reservations, redemption, and UI remain
+unimplemented. Production payments are not enabled.
 
 ## Business-rule authority and document boundaries
 
@@ -41,8 +41,11 @@ coverage; the coverage gaps below must not be read as implemented functionality.
 5. Verified fulfillment uses that saved quote; it never runs promotion selection
    again. Booking creation locks/binds the attempt and persists the pricing
    snapshot before applying verified settlement, in one transaction.
-6. Public zero-cash quotes skip Stripe and persist a snapshot with booking
-   creation. Package booking creates its credit snapshot and redemption in the
+6. Zero-cash bookings skip Stripe. Public preparation can preview a free quote,
+   but booking creation requotes within its transaction before accepting and
+   persisting the snapshot. Public/direct/API creation also claims the stable
+   operation as `zero_cash` in that transaction; retries return its original
+   booking. Package booking creates its credit snapshot and redemption in the
    same booking transaction. Neither is proof of a cash payment.
 
 Current public `/api/book` can automatically prefer an available authorized
@@ -83,7 +86,9 @@ and copied promotion identity/label/window/discount rule. Attribution is not a
 join to a mutable promotion; deleting or editing that promotion cannot rewrite
 the saved explanation. UPDATE and direct DELETE are guarded. The original schema
 allows parent booking deletion to cascade snapshots; durable financial bindings
-add their own deletion restrictions. Do not claim all legacy history is undeletable.
+add their own deletion restrictions. New claimed zero-cash bookings also reject
+additional snapshots that would replace their accepted quote. Legacy uncollected
+revision history remains intact. Do not claim all legacy history is undeletable.
 
 `persistBookingPricingSnapshot` locks and validates booking scope/start and
 refuses to attach a fresh quote to an already settled booking. Snapshot and
@@ -104,21 +109,34 @@ an active rule, matching organization, explicitly selected service, and an
 appointment start in its window. An empty service selection applies nowhere.
 Greatest single saving wins; ties use ascending stable promotion ID. No stacking.
 
-**DECIDED / NOT YET IMPLEMENTED:** Treat automatic promotions and explicit coupon
-codes as sources of candidate discounts in the same pricing contract. Keep
+**CURRENT arithmetic boundary:** `DiscountRule`, `DiscountCandidate`, and
+`selectBestDiscount` in `packages/core/src/pricing.ts` support already eligible
+promotion/coupon candidates. Automatic pricing uses this helper now; larger
+saving wins, promotion wins cross-source ties, and stable IDs break same-source
+ties. `normalizeCouponCode` implements `trim().toUpperCase()` identity only.
+These pure helpers neither authenticate customers nor reserve/redeem coupons.
+
+**DECIDED / NOT YET IMPLEMENTED:** Runtime coupon eligibility must join the
+existing promotion evaluation through that same pricing contract. Keep
 eligibility separate from pure discount arithmetic and settlement. Each valid
 candidate contributes its source identity/type, copied explanation/rule, and
 computed saving. Choose the greatest single valid saving and persist the chosen
-source; do not add promotion and coupon savings together. The precise shared
-types, schema evolution, and cross-source tie rule remain implementation design.
+source; do not add promotion and coupon savings together. Accepted coupon
+attribution and schema evolution remain future implementation design. Equal savings across
+sources prefer the automatic promotion, preserving the coupon use.
 Future candidates must be validated server-side in the same organization and
 service scope; a submitted code is not authority for a price or ownership claim.
 
 Coupon eligibility will support percent/fixed amounts, dates, service scope,
 optional minimum purchase, and optional global/per-customer limits. There is
 currently no coupon table, input, evaluator, accepted attribution, or use ledger.
-The unresolved eligibility questions are listed in the business rules. Package
-credit remains a settlement choice, not a candidate cash discount.
+Minimum-purchase eligibility tests base service price. Canonical codes use
+`code.trim().toUpperCase()` so case and surrounding whitespace do not create
+separate identities; enforce scoped canonical uniqueness when a coupon schema
+is implemented. Coupon redemption requires an authenticated customer, never a
+guest or supplied email alone. The unresolved eligibility questions are listed
+in the business rules. Package credit remains a settlement choice, not a
+candidate cash discount.
 
 ## Future coupon-use provenance
 
@@ -138,9 +156,11 @@ retain accepted attribution/provenance without unnecessary scarce-use arithmetic
 Restoration never changes the coupon's active flag or validity dates.
 
 Rescheduling preserves the same use. A genuine new booking performs fresh
-selection and redemption. Checkout reservations, abandoned/expired attempts,
-delayed settlement, and the precise consumption boundary need an explicit design
-before implementation; saved pricing alone cannot guarantee scarce availability.
+selection and redemption. Reserve scarce global/customer capacity during
+Checkout, release it after authoritative abandonment/expiration, and consume it
+with successful booking. Database-backed reservation identity and safe delayed-
+payment/release coordination need an explicit design before runtime implementation;
+saved pricing alone cannot guarantee scarce availability.
 Coupon restoration must not erase or replace a pending cash RefundOperation.
 
 ## $0 and package settlement
@@ -156,10 +176,29 @@ redemption/booking atomicity, exact cancellation restoration, and purchase
 fulfillment belong to the payment architecture. A missing PaymentIntent or zero
 collection amount must never be used to infer that a credit was consumed.
 
-**CURRENT LIMITATION:** The zero-cash path has no durable attempt or shared
-cash/credit operation claim. It does not yet have the same response-loss retry
-guarantees as positive cash and package redemption. Staff/API/direct internal
-booking paths are not universally snapshot-producing.
+**CURRENT:** `booking/zero-cash.ts` uses the same appointment operation key and
+input fingerprint as cash/credit. `createBooking` locks that identity, creates
+booking + immutable snapshot + `zero_cash` settlement claim atomically, and
+returns a committed original before consulting mutable prices/availability.
+Migration `0068_zero_cash_booking.sql` extends the shared claim, checks zero cash
+against its immutable snapshot, and protects claimed booking identity/settlement.
+No Stripe attempt is needed for a transaction that creates a free booking.
+A cash, credit, or zero-cash operation cannot independently settle the same key.
+Old callers retain exact-input deduplication; a genuinely new booking after
+cancellation must supply a fresh `checkoutRequestId`.
+
+Staff service creation also quotes and commits snapshot/attendees with booking.
+It has no positive-cash collection workflow, so it rejects positive collection
+and commercial recurring series. An explicit missing/foreign service cannot
+silently fall back to a Personal meeting. Hidden Personal/internal team meetings
+remain noncommercial and are guarded against acquiring a paid Personal service
+configuration; they do not invent commercial pricing history.
+
+**CURRENT LIMITATION:** Zero-cash creation, free recurring expansion, and staff
+calendar/email/reminder delivery are not a universal durable outbox. An operation
+retry returns DB booking truth without replaying external effects. Staff ad-hoc
+creation also has no new request-id API in this slice. Provider-effect recovery
+and approved commercial offline workflows remain separate work.
 
 ## Rescheduling and new financial lineage
 
@@ -219,9 +258,11 @@ Package recurring creation is rejected in application and database guards.
 when `basePrice > 0`, `recurringCount > 1`, and the service is not a host-owned
 group slot (`maxAttendees > 1`); this includes a 100%-discounted commercial series.
 The group-slot exception is not a funded recurring series, and legacy/internal
-paths are not universally covered. Later occurrence creation in
-`finalize-booking.ts:finalizeOccurrence` does not produce independent pricing
-history or financial allocations today.
+records are not retroactively repaired. Staff service series reject positive
+base price too. `finalize-booking.ts:finalizeOccurrence` atomically saves a zero
+quote with each new free-service occurrence and rejects positive base prices,
+including a paid service edited after initial series creation. This is a free
+scheduling path, not financial allocation for recurring paid services.
 
 Unsupported paid/credit series must remain blocked until explicit occurrence
 settlement exists. Future genuine occurrences need their own pricing decision;
@@ -233,14 +274,16 @@ contract or authorized by the presence of a recurring scheduling feature.
 
 | Entry point | CURRENT coverage / remaining boundary |
 | --- | --- |
-| `/api/book` + `prepareAppointmentAttempt` | Saved positive-cash quotes, promotion/deposit calculation, verified durable fulfillment; $0 snapshot with weaker operation identity. |
+| `/api/book` + `prepareAppointmentAttempt` | Saved positive-cash quotes, promotion/deposit calculation, verified durable fulfillment; $0 snapshot with shared stable operation claim. |
 | `createBooking` package path | Verified owner, coherent credit quote, immutable snapshot and atomic redemption; no cash promotion stacking. |
 | Package purchase | Independent saved package price/count; appointment promotions are not applied to its sale. |
-| `/api/v1/bookings` | Rejects positive base-price services; free creation does not use the shared quote pipeline. |
-| `host-booking.ts:createHostBooking` / internal meetings | Direct insertion without universal commercial quote enforcement; staff/offline and noncommercial policy need explicit separation. |
+| `/api/v1/bookings` | Authorizes caller-owned service; delegates authoritative quote/snapshot to `createBooking`, allows zero effective cash, rejects positive collection; supports `checkoutRequestId`. |
+| `host-booking.ts:createHostBooking` / internal meetings | Commercial service quote/snapshot is atomic; positive collection requires public checkout. Personal/internal meetings remain noncommercial. Explicit service scope is enforced. |
 | Reschedule | Same financial lineage; no repricing/counter; external-effect/move reconciliation is incomplete. |
-| Coupons | Entire pricing/usage implementation deferred; business rules decided subject to listed unresolved questions. |
-| Recurring creation | Financial guards exist on new public paths; independent occurrence financial architecture remains deferred. |
+| Coupons | Pure shared candidate selection/canonical code helper exists; runtime eligibility/usage remains deferred; business rules decided subject to listed unresolved questions. |
+| Recurring creation | Financial guards cover public/direct/staff commercial creation; free occurrences save quotes; funded recurring architecture remains deferred. |
 
-Slice 6 must be separately scoped against these documents before implementation.
-This checkpoint introduces no runtime, schema, deployment, or payment changes.
+Slice 6 deliberately retains version-1 promotion snapshots/attempts and the
+Slice 1–5 cash/credit/refund guarantees. Future coupon runtime must extend
+accepted attribution and scarce-capacity provenance explicitly; a generic pure
+candidate is not a persisted coupon entitlement.

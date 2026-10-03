@@ -16,6 +16,10 @@ export {
 export { roundRobinPick } from "./round-robin";
 export {
   calculateAppointmentPrice,
+  selectBestDiscount,
+  normalizeCouponCode,
+  type DiscountRule,
+  type DiscountCandidate,
   type AppointmentPrice,
   type AppointmentPricingInput,
   type AppointmentPromotion,

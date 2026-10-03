@@ -28,6 +28,7 @@ import {
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
 import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
+import { findZeroCashBooking, zeroCashBookingIdentity } from "./zero-cash";
 
 export { BookingError } from "./booking-logic";
 
@@ -172,12 +173,26 @@ export interface CreateBookingInput {
   pricingQuote?: AppointmentPrice;
   paymentAttemptId?: string;
   quotedDurationMinutes?: number;
+  /** Internal operation identity shared by cash, credits, and zero-cash booking. */
+  bookingRequestId?: string;
+  bookingReturnPath?: string;
 }
 
 export async function createBooking(
   input: CreateBookingInput,
 ): Promise<{ uid: string; redirectUrl: string | null }> {
-  if (!input.redeemCredit) return createBookingOnce(input);
+  if (!input.redeemCredit) {
+    if (input.payment) return createBookingOnce(input); // Explicit historical/durable payment paths.
+    const existing = await findZeroCashBooking(input);
+    if (existing) return { uid: existing.uid, redirectUrl: null };
+    try {
+      return await createBookingOnce(input);
+    } catch (err) {
+      const committed = await findZeroCashBooking(input);
+      if (committed) return { uid: committed.uid, redirectUrl: null };
+      throw err;
+    }
+  }
   assertExclusiveSettlement(input);
   await requirePackageOwner(input.creditOwnerUserId, input.attendee.email);
   const existing = await findCreditBooking(input);
@@ -342,15 +357,55 @@ async function createBookingOnce(
   // (hostId, startsAt) guards against a concurrent double-book: a request that
   // wins the availability check but loses the insert raises a 23505 → 409.
   let booking: typeof schema.bookings.$inferSelect;
-  let replayedCredit = false;
+  let replayedBooking = false;
+  let acceptedQuote = input.payment ? input.pricingQuote : undefined;
   try {
     booking = await db.transaction(async (tx) => {
+      if (!input.payment && !input.redeemCredit) {
+        const identity = zeroCashBookingIdentity(input);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
+        const previous = await findZeroCashBooking(input, tx);
+        if (previous) {
+          replayedBooking = true;
+          return previous;
+        }
+        const [current] = await tx
+          .select()
+          .from(schema.eventTypes)
+          .where(eq(schema.eventTypes.id, eventType.id))
+          .for("share");
+        if (
+          !current?.isActive ||
+          current.organizationId !== eventType.organizationId ||
+          current.ownerId !== eventType.ownerId ||
+          current.durationMinutes !== eventType.durationMinutes ||
+          JSON.stringify(current.durationOptions) !== JSON.stringify(eventType.durationOptions) ||
+          current.recurringCount !== eventType.recurringCount ||
+          current.maxAttendees !== eventType.maxAttendees
+        )
+          throw new BookingError("Service configuration changed; retry booking", 409);
+        // A prepared free preview is not an accepted quote. Promotion or service
+        // terms may change before this transaction commits the booking.
+        acceptedQuote = await quoteAppointmentPrice(
+          {
+            organizationId: current.organizationId,
+            eventTypeId: current.id,
+            appointmentStartsAt: start,
+            settlement: "cash",
+          },
+          tx,
+        );
+        if (acceptedQuote.amountToCollect > 0)
+          throw new BookingError("A payment is required; book through the public checkout", 402);
+        if (acceptedQuote.basePrice > 0 && isRecurring)
+          throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+      }
       if (input.redeemCredit) {
         const identity = creditBookingIdentity(input);
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
         const previous = await findCreditBooking(input, tx);
         if (previous) {
-          replayedCredit = true;
+          replayedBooking = true;
           return previous;
         }
         const [currentService] = await tx
@@ -619,8 +674,8 @@ async function createBookingOnce(
         })
         .returning();
       if (!row) throw new BookingError("Failed to create booking", 500);
-      if (input.pricingQuote) {
-        await persistBookingPricingSnapshot(row.id, input.pricingQuote, tx);
+      if (acceptedQuote) {
+        await persistBookingPricingSnapshot(row.id, acceptedQuote, tx);
         if (input.payment) {
           const [settled] = await tx
             .update(schema.bookings)
@@ -657,6 +712,12 @@ async function createBookingOnce(
         },
         ...guests.map((email) => ({ bookingId: row.id, email })),
       ]);
+      if (!input.payment && !input.redeemCredit) {
+        const identity = zeroCashBookingIdentity(input);
+        await tx.execute(
+          sql`select claim_booking_settlement(${identity.key},'zero_cash',${row.id}::uuid,${identity.fingerprint})`,
+        );
+      }
       if (input.redeemCredit) {
         const creditQuote = await quoteAppointmentPrice(
           {
@@ -685,7 +746,7 @@ async function createBookingOnce(
     mapInsertError(err);
   }
 
-  if (replayedCredit) return { uid: booking.uid, redirectUrl: null };
+  if (replayedBooking) return { uid: booking.uid, redirectUrl: null };
 
   logger.info("booking created", {
     event: "booking_created",

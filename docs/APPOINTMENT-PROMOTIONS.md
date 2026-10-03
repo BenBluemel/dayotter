@@ -2,10 +2,11 @@
 
 Status: the promotion foundation originated on `feature/promotions` in migration
 0063 and is integrated into the new public appointment cash/package pricing
-paths through validated Slice 5 commit `7ff1a9a8eac39151ae76db0dfc3bc50535542348`
-on `feature/payment-routing`. No promotion-management UI or coupon functionality
-is implemented. Existing bookings are not backfilled. Production configuration
-has not been changed or payments enabled by these slices.
+paths through validated Slice 5 commit `7ff1a9a8eac39151ae76db0dfc3bc50535542348`,
+with direct/API/staff pricing enforcement added in Slice 6 on
+`feature/payment-routing`. No promotion-management UI or runtime coupon
+functionality is implemented. Existing bookings are not backfilled. Production
+configuration has not been changed or payments enabled by these slices.
 
 ## Contract and document boundaries
 
@@ -39,9 +40,9 @@ anchors. Behavior below describes the current code, not the original audit.
 | `apps/web/lib/packages/credits.ts` | Verified internal owner, durable grant/redemption/restoration provenance; never email-only entitlement spending. |
 | `apps/web/lib/booking/reschedule-booking.ts:rescheduleBooking` | Moves the same booking without changing its financial snapshot or spending another credit. |
 | `apps/web/lib/payments/refunds.ts:decideBookingCancellation` | Cancellation coordinates durable cash refund obligation or exact credit restoration; coupon restoration does not exist yet. |
-| `apps/web/app/api/v1/bookings/route.ts:POST` | Rejects services with positive base price; free API creation is not yet universally quoted. |
-| `apps/web/lib/booking/host-booking.ts:createHostBooking` | Direct staff/internal creation without universal pricing enforcement; commercial offline policy unresolved. |
-| `apps/web/lib/booking/finalize-booking.ts:finalizeOccurrence` | Scheduling recurrence without independent pricing/allocation; unsupported financial series must remain blocked. |
+| `apps/web/app/api/v1/bookings/route.ts:POST` | Delegates to shared booking pricing; a service with positive base price can book only when its appointment quote collects zero cash. |
+| `apps/web/lib/booking/host-booking.ts:createHostBooking` | Staff service creation uses atomic zero-cash quote/snapshot; positive collection requires public checkout. Personal/internal meetings stay noncommercial. |
+| `apps/web/lib/booking/finalize-booking.ts:finalizeOccurrence` | Free occurrences save zero-cash quotes atomically; commercial expansion fails closed. Funded per-occurrence allocation remains deferred. |
 | `apps/web/lib/payments/pending.ts`, `fulfill.ts` | Redis compatibility path for legacy appointment Sessions; new durable appointment attempts do not depend on it. |
 
 ## Implemented promotion schema
@@ -97,9 +98,31 @@ It creates/applies migrations/drops only its own unique child database; it does
 not fall back to `DATABASE_URL`. Other durable payment/package integration suites
 and their guards are documented in the payment architecture.
 
-CURRENT gaps: staff/API pricing coverage, zero-cash durable operation identity,
+Slice 6 closes staff/API quote coverage and zero-cash operation identity gaps.
+CURRENT gaps: universal external-effect recovery, commercial offline workflows,
 independent recurring financial allocation and external-effect reconciliation.
-DECIDED but unimplemented: coupons sharing best-discount selection and durable
+CURRENT coupon preparation: pure shared best-discount selection and code normalization.
+DECIDED but unimplemented: runtime coupon eligibility and durable
 booking-linked use/restoration. FUTURE: promotion-management UI and inclusive
 calendar-date entry after business timezone semantics are chosen. See the pricing
 contract and business rules for unresolved decisions and later scope.
+
+## Slice 6 pricing enforcement
+
+`createBooking` quotes new unpaid service bookings and rejects positive cash
+without payment. `/api/v1/bookings` delegates that decision rather than rejecting
+base price before promotions. `host-booking.ts:createHostBooking` scopes explicit
+services to the host organization and persists free/promotional snapshots in the
+booking transaction; it rejects unsupported paid/offline creation. Hidden
+Personal/internal meetings are explicitly noncommercial.
+
+`booking/zero-cash.ts` and migration `0068_zero_cash_booking.sql` add stable
+zero-cash settlement identity, immutable source binding, response-loss replay,
+and cash/credit exclusivity. New free recurring occurrences save individual
+quotes; commercial recurring expansion fails closed. Ordinary rescheduling still
+preserves the exact original quote and payment/redemption relationships.
+
+Shared core discount candidates can represent eligible promotions or future
+coupons; promotion wins an equal-saving cross-source tie. Canonical codes trim
+and uppercase. There is no coupon table, guest redemption, scarce-use reservation,
+usage/restoration implementation, or coupon UI in Slice 6.

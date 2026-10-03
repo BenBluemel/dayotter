@@ -5,6 +5,7 @@ const mock = vi.hoisted(() => ({
   owner: vi.fn(),
   balance: vi.fn(),
   previous: vi.fn(),
+  zero: vi.fn(),
   booking: vi.fn(),
   prepareCash: vi.fn(),
   prepare: vi.fn(),
@@ -12,6 +13,7 @@ const mock = vi.hoisted(() => ({
   grant: vi.fn(),
   event: vi.fn(),
 }));
+vi.mock("../booking/zero-cash", () => ({ findZeroCashBooking: mock.zero }));
 vi.mock("../auth/session", () => ({ getSession: mock.session }));
 vi.mock("../server/rate-limit", () => ({
   enforceRateLimit: async () => null,
@@ -67,6 +69,7 @@ beforeEach(() => {
     return { id: owner };
   });
   mock.previous.mockResolvedValue(null);
+  mock.zero.mockResolvedValue(null);
   mock.balance.mockResolvedValue(1);
   mock.event.mockResolvedValue({ price: 5000, isActive: true });
   mock.booking.mockResolvedValue({ uid: "original", redirectUrl: null });
@@ -164,4 +167,27 @@ it("staff grants use the authenticated actor and require a stable grant identity
   expect(
     (await grant(request({ packageId: pkg, clientEmail: "owner@example.test" }), undefined)).status,
   ).toBe(400);
+});
+
+it("zero-cash response-loss retry uses its committed result without today's configuration", async () => {
+  mock.zero.mockResolvedValue({ uid: "original-free" });
+  const data = { ...input(), redeemCredit: false };
+  expect(await (await book(request(data))).json()).toMatchObject({ uid: "original-free" });
+  expect(mock.prepareCash).not.toHaveBeenCalled();
+  expect(mock.session).not.toHaveBeenCalled();
+  expect(mock.booking).not.toHaveBeenCalled();
+});
+it("public zero-cash booking passes stable operation and duration for transactional quoting", async () => {
+  const quote = { settlement: "cash", basePrice: 5000, effectivePrice: 0, amountToCollect: 0 };
+  mock.prepareCash.mockResolvedValue({ quote, durationMinutes: 30 });
+  mock.session.mockResolvedValue(null);
+  expect((await book(request({ ...input(), redeemCredit: false }))).status).toBe(200);
+  expect(mock.booking).toHaveBeenCalledWith(
+    expect.objectContaining({
+      bookingRequestId: operation,
+      bookingReturnPath: "/",
+      quotedDurationMinutes: 30,
+    }),
+  );
+  expect(mock.booking.mock.calls[0]?.[0]).not.toHaveProperty("pricingQuote");
 });

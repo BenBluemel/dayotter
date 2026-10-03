@@ -1,5 +1,6 @@
 import { getSession } from "@/lib/auth/session";
 import { BookingError, type CreateBookingInput, createBooking } from "@/lib/booking/create-booking";
+import { findZeroCashBooking } from "@/lib/booking/zero-cash";
 import { creditBalance, findCreditBooking, requirePackageOwner } from "@/lib/packages/credits";
 import {
   appointmentCheckout,
@@ -94,6 +95,18 @@ export async function POST(request: Request) {
   const returnPath =
     requestedPath?.startsWith("/") && !requestedPath.startsWith("//") ? requestedPath : "/";
   try {
+    const zeroInput = {
+      ...input,
+      bookingRequestId: parsed.data.checkoutRequestId,
+      bookingReturnPath: returnPath,
+    };
+    const previousZero = await findZeroCashBooking(zeroInput);
+    if (previousZero)
+      return NextResponse.json({
+        uid: previousZero.uid,
+        url: `/booking/${previousZero.uid}`,
+        redirectUrl: null,
+      });
     const session = await getSession();
     let ownerId: string | undefined;
     if (session?.user?.id) {
@@ -151,8 +164,7 @@ export async function POST(request: Request) {
     }
     // Zero-cash quotes do not create a Stripe Session. Preserve existing approval policy.
     const { uid, redirectUrl } = await createBooking({
-      ...input,
-      pricingQuote: prepared.quote,
+      ...zeroInput,
       quotedDurationMinutes: prepared.durationMinutes,
     });
     return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });

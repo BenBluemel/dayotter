@@ -11,11 +11,15 @@ const mock = vi.hoisted(() => ({
   create: vi.fn(),
   routeMode: "direct" as "direct" | "connect",
   fee: 0,
+  primary: vi.fn(),
 }));
 vi.mock("@dayotter/db", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@dayotter/db")>()),
   getDb: () => mock.db,
 }));
+vi.mock("../billing/entitlements", () => ({ primaryOrg: mock.primary }));
+vi.mock("../booking/team-schedule", () => ({ teamSchedule: async () => [] }));
+vi.mock("../integrations/zoom", () => ({ createZoomMeeting: async () => null }));
 vi.mock("../server/env", () => ({ env: { APP_URL: "https://example.test" } }));
 vi.mock("../payments/connect", () => ({
   checkoutRouteForOrganization: async (organizationId: string) => ({
@@ -53,26 +57,32 @@ vi.mock("../booking/availability", () => ({
 }));
 vi.mock("../booking/finalize-booking", () => ({ finalizeConfirmedBooking: mock.finalize }));
 vi.mock("../calendar/host-calendar", () => ({
+  writeBookingToCalendar: vi.fn().mockResolvedValue(null),
   deleteBookingFromCalendar: vi.fn(),
   updateBookingCalendarEvent: vi.fn(),
 }));
 vi.mock("../booking/reminders", () => ({
+  hostBookingPrefs: async () => ({ wantsOverflow: false, wantsScribe: false, reminderOffsets: [] }),
   clearBookingReminders: vi.fn(),
   scheduleBookingReminders: vi.fn(),
   reminderOffsetsForHost: async () => [],
-  scheduleWorkflowMessages: vi.fn(),
+  scheduleWorkflowMessages: vi.fn().mockResolvedValue(undefined),
   hostWantsOverflowNotice: async () => false,
   hostWantsScribe: async () => false,
   scheduleOverflowCheck: vi.fn(),
   scheduleScribe: vi.fn(),
 }));
-vi.mock("../booking/lifecycle", () => ({ fanOutBookingLifecycle: vi.fn() }));
-vi.mock("../booking/travel", () => ({ reserveTravelBlocks: vi.fn() }));
+vi.mock("../booking/lifecycle", () => ({
+  fanOutBookingLifecycle: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("../booking/travel", () => ({ reserveTravelBlocks: vi.fn().mockResolvedValue(undefined) }));
 vi.mock("../automation/apply-rules", () => ({
+  applyBookingRules: vi.fn().mockResolvedValue(undefined),
   reserveRuleBlocks: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@dayotter/emails", () => ({
   sendEmail: vi.fn(),
+  bookingConfirmation: vi.fn(),
   bookingCancellation: vi.fn(),
   bookingRescheduled: vi.fn(),
   bookingRequested: vi.fn(),
@@ -80,6 +90,8 @@ vi.mock("@dayotter/emails", () => ({
 }));
 import { cancelBookingWithResult } from "../booking/cancel-booking";
 import { type CreateBookingInput, createBooking } from "../booking/create-booking";
+import { createHostBooking, getOrCreatePersonalEventType } from "../booking/host-booking";
+import { createInternalTeamBooking } from "../booking/internal-team-booking";
 import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "../booking/pricing";
 import { rescheduleBooking } from "../booking/reschedule-booking";
 import { prepareAppointmentAttempt } from "../payments/attempts";
@@ -114,6 +126,7 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
   const host = randomUUID();
   const event = randomUUID();
   const legacy = randomUUID();
+  const legacyZero = randomUUID();
   let sequence = 0;
   beforeAll(async () => {
     const u = new URL(url!);
@@ -156,6 +169,20 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
           [legacy, org, event, `${host}@example.test`],
         );
       }
+      if (tag === "0068_zero_cash_booking") {
+        await db.insert(schema.bookings).values({
+          id: legacyZero,
+          organizationId: org,
+          eventTypeId: event,
+          hostId: host,
+          title: "Legacy unpriced",
+          uid: randomUUID(),
+          startsAt: new Date("2050-01-01T12:00:00Z"),
+          endsAt: new Date("2050-01-01T12:30:00Z"),
+          timezone: "UTC",
+          allowOverlap: true,
+        });
+      }
       const client = await db.$client.connect();
       try {
         await client.query("BEGIN");
@@ -192,10 +219,11 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
     vi.clearAllMocks();
     mock.routeMode = "direct";
     mock.fee = 0;
+    mock.primary.mockResolvedValue({ id: org });
     mock.finalize.mockResolvedValue(undefined);
     await db
       .update(schema.eventTypes)
-      .set({ recurringCount: 1, price: 5000, currency: "usd" })
+      .set({ recurringCount: 1, price: 5000, currency: "usd", depositAmount: null })
       .where(eq(schema.eventTypes.id, event));
   });
   async function owned(count = 1) {
@@ -1100,5 +1128,427 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
     );
     expect(new Set(ids).size).toBe(1);
     expect((await balance(ids[0]!)).totalCredits).toBe(1);
+  });
+  // Slice 6: use the real booking writer and migrated database, including the
+  // shared settlement claim. No mocked transaction proves these properties.
+  async function zeroInput(promotional = false) {
+    const a = await owned();
+    const { redeemCredit, creditOwnerUserId, creditRequestId, ...intent } = a.input;
+    const input = { ...intent, bookingRequestId: creditRequestId };
+    if (promotional) {
+      const [promo] = await db
+        .insert(schema.appointmentPromotions)
+        .values({
+          organizationId: org,
+          label: "One appointment",
+          discountKind: "percentage",
+          discountValue: 10000,
+          startsAt: new Date(new Date(input.start).getTime() - 1),
+          endsAt: new Date(new Date(input.start).getTime() + 1),
+        })
+        .returning();
+      await db
+        .insert(schema.appointmentPromotionEventTypes)
+        .values({ organizationId: org, promotionId: promo!.id, eventTypeId: event });
+    } else
+      await db.update(schema.eventTypes).set({ price: 0 }).where(eq(schema.eventTypes.id, event));
+    return { ...a, input };
+  }
+  async function bookingQuote(uid: string) {
+    const b = await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, uid) });
+    const q = await db.query.bookingPricingSnapshots.findFirst({
+      where: eq(schema.bookingPricingSnapshots.bookingId, b!.id),
+    });
+    return { b: b!, q: q! };
+  }
+  it("a direct/API caller cannot create a positive-cash service without collecting payment", async () => {
+    const a = await owned();
+    const { redeemCredit, creditOwnerUserId, creditRequestId, ...intent } = a.input;
+    await expect(createBooking(intent)).rejects.toMatchObject({ status: 402 });
+    expect(
+      await db.query.bookings.findFirst({
+        where: eq(schema.bookings.startsAt, new Date(intent.start)),
+      }),
+    ).toBeUndefined();
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("direct/API creation saves an authoritative free quote and durable zero settlement", async () => {
+    const a = await zeroInput();
+    const { uid } = await createBooking(a.input);
+    const { b, q } = await bookingQuote(uid);
+    expect(q).toMatchObject({
+      basePrice: 0,
+      effectivePrice: 0,
+      amountToCollect: 0,
+      settlement: "cash",
+    });
+    expect(b).toMatchObject({ paymentStatus: "none", paymentIntentId: null });
+    expect(
+      await db.query.bookingSettlementClaims.findFirst({
+        where: eq(schema.bookingSettlementClaims.sourceId, b.id),
+      }),
+    ).toMatchObject({ settlement: "zero_cash" });
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("a 100% appointment-time promotion produces zero cash despite a deposit and never spends a credit", async () => {
+    const a = await zeroInput(true);
+    await db
+      .update(schema.eventTypes)
+      .set({ depositAmount: 4500 })
+      .where(eq(schema.eventTypes.id, event));
+    const { uid } = await createBooking(a.input);
+    expect((await bookingQuote(uid)).q).toMatchObject({
+      basePrice: 5000,
+      effectivePrice: 0,
+      amountToCollect: 0,
+      promotionLabel: "One appointment",
+    });
+    expect((await balance(a.creditId)).usedCredits).toBe(0);
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("rechecks a free preview before acceptance when service or promotion terms change", async () => {
+    const free = await zeroInput();
+    const oldQuote = await quoteAppointmentPrice(
+      {
+        organizationId: org,
+        eventTypeId: event,
+        appointmentStartsAt: new Date(free.input.start),
+        settlement: "cash",
+      },
+      db,
+    );
+    await db.update(schema.eventTypes).set({ price: 5000 }).where(eq(schema.eventTypes.id, event));
+    await expect(createBooking({ ...free.input, pricingQuote: oldQuote })).rejects.toMatchObject({
+      status: 402,
+    });
+    expect(
+      await db.query.bookings.findFirst({
+        where: eq(schema.bookings.startsAt, new Date(free.input.start)),
+      }),
+    ).toBeUndefined();
+
+    const promoted = await zeroInput(true);
+    const preview = await quoteAppointmentPrice(
+      {
+        organizationId: org,
+        eventTypeId: event,
+        appointmentStartsAt: new Date(promoted.input.start),
+        settlement: "cash",
+      },
+      db,
+    );
+    expect(preview.promotion?.id).toBeTruthy();
+    await db
+      .update(schema.appointmentPromotions)
+      .set({ isActive: false })
+      .where(eq(schema.appointmentPromotions.id, preview.promotion!.id));
+    await expect(createBooking({ ...promoted.input, pricingQuote: preview })).rejects.toMatchObject(
+      { status: 402 },
+    );
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("concurrent zero-cash retries and a response-loss retry return one committed booking", async () => {
+    const a = await zeroInput(true);
+    const results = await Promise.all([createBooking(a.input), createBooking(a.input)]);
+    expect(results[0]!.uid).toBe(results[1]!.uid);
+    expect(mock.finalize).toHaveBeenCalledTimes(1);
+    await db.update(schema.eventTypes).set({ price: 9900 }).where(eq(schema.eventTypes.id, event));
+    expect((await createBooking(a.input)).uid).toBe(results[0]!.uid);
+    expect(mock.finalize).toHaveBeenCalledTimes(1);
+    await expect(createBooking({ ...a.input, notes: "Changed" })).rejects.toMatchObject({
+      status: 409,
+    });
+  });
+  it("rescheduling outside the discount window preserves the zero quote and original retry lineage", async () => {
+    const a = await zeroInput(true);
+    const { uid } = await createBooking(a.input);
+    const { b, q } = await bookingQuote(uid);
+    const later = new Date(Date.UTC(2040, 0, 1 + sequence++, 12)).toISOString();
+    await rescheduleBooking(uid, later);
+    await rescheduleBooking(uid, later);
+    expect((await bookingQuote(uid)).q).toEqual(q);
+    expect((await bookingQuote(uid)).b.id).toBe(b.id);
+    expect((await createBooking(a.input)).uid).toBe(uid);
+    expect((await balance(a.creditId)).usedCredits).toBe(0);
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("cancellation is not a new booking: only a fresh identity gets current price eligibility", async () => {
+    const a = await zeroInput();
+    const { uid } = await createBooking(a.input);
+    await cancelBookingWithResult(uid);
+    await db.update(schema.eventTypes).set({ price: 5000 }).where(eq(schema.eventTypes.id, event));
+    expect((await createBooking(a.input)).uid).toBe(uid);
+    expect((await bookingQuote(uid)).b.status).toBe("cancelled");
+    await expect(
+      createBooking({ ...a.input, bookingRequestId: randomUUID() }),
+    ).rejects.toMatchObject({ status: 402 });
+  });
+  it("zero cash cannot turn into a cash attempt or credit redemption under the same operation", async () => {
+    const a = await zeroInput();
+    const { uid } = await createBooking(a.input);
+    const { bookingRequestId, ...intent } = a.input;
+    await db.update(schema.eventTypes).set({ price: 5000 }).where(eq(schema.eventTypes.id, event));
+    await expect(
+      prepareAppointmentAttempt(intent, "/", bookingRequestId, db),
+    ).rejects.toMatchObject({ status: 409 });
+    await expect(
+      createBooking({
+        ...intent,
+        redeemCredit: true,
+        creditOwnerUserId: a.id,
+        creditRequestId: bookingRequestId,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect((await balance(a.creditId)).usedCredits).toBe(0);
+    expect((await bookingQuote(uid)).q.effectivePrice).toBe(0);
+  });
+  it("a cash operation cannot be replaced with a free booking after a price change", async () => {
+    const a = await owned();
+    const { redeemCredit, creditOwnerUserId, creditRequestId, ...intent } = a.input;
+    const prepared = await prepareAppointmentAttempt(intent, "/", creditRequestId, db);
+    await db.update(schema.eventTypes).set({ price: 0 }).where(eq(schema.eventTypes.id, event));
+    await expect(
+      createBooking({ ...intent, bookingRequestId: creditRequestId }),
+    ).rejects.toMatchObject({ status: 409 });
+    expect(prepared.attempt).not.toBeNull();
+    expect(
+      await db.query.bookings.findFirst({
+        where: eq(schema.bookings.startsAt, new Date(intent.start)),
+      }),
+    ).toBeUndefined();
+  });
+  it("zero-cash database guards reject orphan claims, later cash settlement and booking deletion", async () => {
+    await expect(
+      db.insert(schema.bookingSettlementClaims).values({
+        operationKey: `appointment:${randomUUID()}`,
+        settlement: "zero_cash",
+        sourceId: randomUUID(),
+        requestFingerprint: "a".repeat(64),
+      }),
+    ).rejects.toThrow();
+    const a = await zeroInput();
+    const { b } = await bookingQuote((await createBooking(a.input)).uid);
+    const replacement = await quoteAppointmentPrice(
+      {
+        organizationId: org,
+        eventTypeId: event,
+        appointmentStartsAt: b.startsAt,
+        settlement: "cash",
+      },
+      db,
+    );
+    await expect(
+      db.transaction((tx) => persistBookingPricingSnapshot(b.id, replacement, tx)),
+    ).rejects.toThrow();
+    await expect(
+      db
+        .update(schema.bookings)
+        .set({ paymentStatus: "paid", amountPaid: 100 })
+        .where(eq(schema.bookings.id, b.id)),
+    ).rejects.toThrow();
+    await expect(db.delete(schema.bookings).where(eq(schema.bookings.id, b.id))).rejects.toThrow();
+    await expect(
+      db
+        .update(schema.bookingSettlementClaims)
+        .set({ sourceId: randomUUID() })
+        .where(eq(schema.bookingSettlementClaims.sourceId, b.id)),
+    ).rejects.toThrow();
+  });
+  it("staff service booking rejects positive cash, but saves a zero promotional quote", async () => {
+    const a = await owned();
+    const input = {
+      userId: host,
+      eventTypeSlug: "sessions",
+      title: "Staff",
+      start: new Date(a.input.start),
+      end: new Date(new Date(a.input.start).getTime() + 1800000),
+      timezone: "UTC",
+    };
+    await expect(createHostBooking(input)).rejects.toMatchObject({ status: 402 });
+    const z = await zeroInput(true);
+    const result = await createHostBooking({
+      ...input,
+      start: new Date(z.input.start),
+      end: new Date(new Date(z.input.start).getTime() + 1800000),
+    });
+    expect((await bookingQuote(result!.uid)).q).toMatchObject({
+      effectivePrice: 0,
+      promotionLabel: "One appointment",
+    });
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("an explicit missing or foreign-organization staff service cannot fall back to Personal", async () => {
+    const a = await owned();
+    const orgId = randomUUID();
+    await db.insert(schema.organizations).values({ id: orgId, name: "Other", slug: randomUUID() });
+    await db.insert(schema.eventTypes).values({
+      organizationId: orgId,
+      ownerId: host,
+      slug: "foreign",
+      title: "Foreign",
+      price: 0,
+    });
+    const input = {
+      userId: host,
+      title: "Staff",
+      start: new Date(a.input.start),
+      end: new Date(new Date(a.input.start).getTime() + 1800000),
+      timezone: "UTC",
+    };
+    for (const eventTypeSlug of ["missing", "foreign"])
+      await expect(createHostBooking({ ...input, eventTypeSlug })).rejects.toMatchObject({
+        status: 404,
+      });
+  });
+  it("commercial staff recurrence fails closed even with a 100% discount", async () => {
+    const a = await zeroInput(true);
+    await expect(
+      createHostBooking({
+        userId: host,
+        eventTypeSlug: "sessions",
+        title: "Series",
+        start: new Date(a.input.start),
+        end: new Date(new Date(a.input.start).getTime() + 1800000),
+        timezone: "UTC",
+        recurrenceUid: randomUUID(),
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+    await db
+      .update(schema.eventTypes)
+      .set({ recurringCount: 3 })
+      .where(eq(schema.eventTypes.id, event));
+    await expect(createBooking(a.input)).rejects.toMatchObject({ status: 409 });
+  });
+  it("hidden Personal bookings are explicitly noncommercial and cannot acquire a paid configuration", async () => {
+    const id = await getOrCreatePersonalEventType(host, org);
+    await db.update(schema.eventTypes).set({ price: 100 }).where(eq(schema.eventTypes.id, id));
+    await expect(getOrCreatePersonalEventType(host, org)).rejects.toMatchObject({ status: 409 });
+    await db.update(schema.eventTypes).set({ price: 0 }).where(eq(schema.eventTypes.id, id));
+  });
+  it("free recurring expansion saves zero quotes; mutable prices cannot turn it into an unpaid paid series", async () => {
+    const a = await zeroInput();
+    await db
+      .update(schema.eventTypes)
+      .set({ recurringCount: 3 })
+      .where(eq(schema.eventTypes.id, event));
+    const { b } = await bookingQuote((await createBooking(a.input)).uid);
+    const et = (await db.query.eventTypes.findFirst({ where: eq(schema.eventTypes.id, event) }))!;
+    const h = (await db.query.users.findFirst({ where: eq(schema.users.id, host) }))!;
+    const { finalizeConfirmedBooking } = await vi.importActual<
+      typeof import("../booking/finalize-booking")
+    >("../booking/finalize-booking");
+    await finalizeConfirmedBooking({
+      booking: b,
+      eventType: et,
+      host: h,
+      attendee: a.input.attendee,
+      guests: [],
+      appUrl: "https://example.test",
+    });
+    const occurrences = await db.query.bookings.findMany({
+      where: eq(schema.bookings.recurrenceUid, b.recurrenceUid!),
+    });
+    expect(occurrences).toHaveLength(3);
+    for (const child of occurrences)
+      expect((await bookingQuote(child.uid)).q).toMatchObject({
+        effectivePrice: 0,
+        amountToCollect: 0,
+      });
+    const second = await zeroInput();
+    await db
+      .update(schema.eventTypes)
+      .set({ recurringCount: 3 })
+      .where(eq(schema.eventTypes.id, event));
+    const { b: parent } = await bookingQuote((await createBooking(second.input)).uid);
+    await db.update(schema.eventTypes).set({ price: 5000 }).where(eq(schema.eventTypes.id, event));
+    await finalizeConfirmedBooking({
+      booking: parent,
+      eventType: et,
+      host: h,
+      attendee: second.input.attendee,
+      guests: [],
+      appUrl: "https://example.test",
+    });
+    expect(
+      await db.query.bookings.findMany({
+        where: eq(schema.bookings.recurrenceUid, parent.recurrenceUid!),
+      }),
+    ).toHaveLength(1);
+  });
+  it("a concurrent credit-versus-zero request commits exactly one settlement with no lost credit", async () => {
+    for (let i = 0; i < 3; i++) {
+      const a = await zeroInput(true);
+      const { bookingRequestId, ...intent } = a.input;
+      const results = await Promise.allSettled([
+        createBooking(a.input),
+        createBooking({
+          ...intent,
+          redeemCredit: true,
+          creditOwnerUserId: a.id,
+          creditRequestId: bookingRequestId,
+        }),
+      ]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const claim = await db.query.bookingSettlementClaims.findFirst({
+        where: eq(schema.bookingSettlementClaims.operationKey, `appointment:${bookingRequestId}`),
+      });
+      expect((await balance(a.creditId)).usedCredits).toBe(
+        claim!.settlement === "package_credit" ? 1 : 0,
+      );
+      const rows = await db.query.bookings.findMany({
+        where: eq(schema.bookings.startsAt, new Date(intent.start)),
+      });
+      expect(rows).toHaveLength(1);
+      expect((await bookingQuote(rows[0]!.uid)).q.settlement).toBe(
+        claim!.settlement === "package_credit" ? "package_credit" : "cash",
+      );
+    }
+  });
+  it("internal team meetings remain noncommercial and reject a Personal service repurposed for sales", async () => {
+    const [team] = await db
+      .insert(schema.teams)
+      .values({ organizationId: org, name: "Team", slug: randomUUID() })
+      .returning();
+    await db.insert(schema.teamMembers).values({ teamId: team!.id, userId: host });
+    const a = await owned();
+    const input = {
+      teamId: team!.id,
+      organizerId: host,
+      title: "Internal",
+      start: new Date(a.input.start),
+      durationMinutes: 30,
+      memberIds: [],
+      timezone: "UTC",
+    };
+    const result = await createInternalTeamBooking(input);
+    expect(result).not.toBeNull();
+    const { b } = await bookingQuote(result!.uid);
+    expect(b.paymentStatus).toBe("none");
+    const personal = await getOrCreatePersonalEventType(host, org);
+    await db
+      .update(schema.eventTypes)
+      .set({ isActive: true, isPrivate: false })
+      .where(eq(schema.eventTypes.id, personal));
+    await expect(createInternalTeamBooking(input)).rejects.toMatchObject({ status: 409 });
+    await db
+      .update(schema.eventTypes)
+      .set({ isActive: false, isPrivate: true })
+      .where(eq(schema.eventTypes.id, personal));
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it("0068 upgrade preserves preexisting unpriced bookings without fabricating zero-cash identity", async () => {
+    expect(
+      await db.query.bookings.findFirst({ where: eq(schema.bookings.id, legacyZero) }),
+    ).toMatchObject({ paymentStatus: "none", title: "Legacy unpriced" });
+    expect(
+      await db.query.bookingSettlementClaims.findFirst({
+        where: eq(schema.bookingSettlementClaims.sourceId, legacyZero),
+      }),
+    ).toBeUndefined();
+    expect(
+      await db.query.bookingPricingSnapshots.findFirst({
+        where: eq(schema.bookingPricingSnapshots.bookingId, legacyZero),
+      }),
+    ).toBeUndefined();
   });
 });

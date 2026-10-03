@@ -1,8 +1,54 @@
 /** Automatic appointment pricing. Pure domain logic; no payment or credit I/O. */
 
-export type PromotionDiscount =
+export type DiscountRule =
   | { readonly kind: "percentage"; readonly basisPoints: number }
   | { readonly kind: "fixed"; readonly amount: number; readonly currency: string };
+
+/** Existing persisted promotion terms retain their version-1 shape. */
+export type PromotionDiscount = DiscountRule;
+
+export interface DiscountCandidate {
+  readonly id: string;
+  readonly source: "promotion" | "coupon";
+  readonly discount: DiscountRule;
+}
+
+/** Canonical identity only: does not validate, authenticate, or redeem a coupon. */
+export function normalizeCouponCode(code: string): string {
+  return code.trim().toUpperCase();
+}
+
+/** Candidates must already be authorized/eligible. Only the winner may consume capacity. */
+export function selectBestDiscount<T extends DiscountCandidate>(
+  basePrice: number,
+  currency: string,
+  candidates: readonly T[],
+): { candidate: T | null; saving: number } {
+  validateAmount(basePrice);
+  const code = currencyCode(currency);
+  let candidate: T | null = null;
+  let saving = 0;
+  const ids = new Set<string>();
+  for (const item of candidates) {
+    const key = `${item.source}:${item.id}`;
+    if (!item.id || !["promotion", "coupon"].includes(item.source) || ids.has(key))
+      throw new RangeError("Invalid or duplicate discount source");
+    ids.add(key);
+    const amount = discountAmount(basePrice, code, item.discount);
+    if (
+      amount > saving ||
+      (amount > 0 &&
+        amount === saving &&
+        candidate &&
+        ((item.source === "promotion" && candidate.source === "coupon") ||
+          (item.source === candidate.source && item.id < candidate.id)))
+    ) {
+      candidate = item;
+      saving = amount;
+    }
+  }
+  return { candidate, saving };
+}
 
 export interface AppointmentPromotion {
   readonly id: string;
@@ -142,8 +188,7 @@ export function calculateAppointmentPrice(input: AppointmentPricingInput): Appoi
   }
   if (input.settlement !== "cash") throw new RangeError("Unknown appointment settlement");
 
-  let selected: AppointmentPromotion | null = null;
-  let saving = 0;
+  const candidates: (AppointmentPromotion & DiscountCandidate)[] = [];
   const ids = new Set<string>();
   for (const promotion of input.promotions) {
     if (
@@ -162,12 +207,10 @@ export function calculateAppointmentPrice(input: AppointmentPricingInput): Appoi
     if (to <= from) throw new RangeError("Promotion end must follow its start");
     const amount = discountAmount(basePrice, currency, promotion.discount);
     if (appointment < from || appointment >= to || amount === 0) continue;
-    if (amount > saving || (amount === saving && selected && promotion.id < selected.id)) {
-      selected = promotion;
-      saving = amount;
-    }
+    candidates.push({ ...promotion, source: "promotion" });
   }
 
+  const { candidate: selected, saving } = selectBestDiscount(basePrice, currency, candidates);
   return {
     ...snapshot,
     settlement: "cash",

@@ -66,6 +66,7 @@ const body = z.object({
   guests: z.array(z.string().email()).max(20).optional(),
   notes: z.string().max(2000).optional(),
   durationMinutes: z.number().int().min(5).max(1440).optional(),
+  checkoutRequestId: z.string().uuid().optional(),
 });
 
 /** POST /api/v1/bookings - create a booking programmatically on your own event type. */
@@ -87,12 +88,6 @@ export const POST = withApiKey(async (caller, request) => {
     columns: { id: true, price: true },
   });
   if (!eventType) return NextResponse.json({ error: "Event type not found" }, { status: 404 });
-  if (eventType.price && eventType.price > 0) {
-    return NextResponse.json(
-      { error: "Paid event types must be booked through the public page." },
-      { status: 400 },
-    );
-  }
 
   const input: CreateBookingInput = {
     eventTypeId: parsed.data.eventTypeId,
@@ -101,6 +96,7 @@ export const POST = withApiKey(async (caller, request) => {
     guests: parsed.data.guests,
     notes: parsed.data.notes,
     durationMinutes: parsed.data.durationMinutes,
+    bookingRequestId: parsed.data.checkoutRequestId,
   };
 
   try {

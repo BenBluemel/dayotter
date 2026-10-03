@@ -3,6 +3,8 @@ import {
   type AppointmentPricingInput,
   type AppointmentPromotion,
   calculateAppointmentPrice,
+  normalizeCouponCode,
+  selectBestDiscount,
 } from "./pricing";
 
 const light = { id: "light", organizationId: "light-and-balance", price: 5000, currency: "usd" };
@@ -283,5 +285,72 @@ describe("automatic appointment pricing", () => {
     expect(() =>
       price({ settlement: "cash_and_credit" as AppointmentPricingInput["settlement"] }),
     ).toThrow(RangeError);
+  });
+});
+
+describe("eligible discount sources", () => {
+  it.each(["FRIEND50", "friend50", " Friend50 "])(
+    "canonicalizes code %s without redeeming it",
+    (code) => {
+      expect(normalizeCouponCode(code)).toBe("FRIEND50");
+    },
+  );
+  it("selects one best discount across sources without stacking", () => {
+    const candidates = [
+      {
+        id: "p",
+        source: "promotion" as const,
+        discount: { kind: "percentage" as const, basisPoints: 2000 },
+      },
+      {
+        id: "c",
+        source: "coupon" as const,
+        discount: { kind: "fixed" as const, amount: 1500, currency: "usd" },
+      },
+    ];
+    expect(selectBestDiscount(5000, "usd", candidates)).toEqual({
+      candidate: candidates[1],
+      saving: 1500,
+    });
+    expect(selectBestDiscount(5000, "usd", [...candidates].reverse())).toEqual(
+      selectBestDiscount(5000, "usd", candidates),
+    );
+  });
+  it("prefers a promotion on an exact rounded-price tie, preserving coupon capacity", () => {
+    const candidates = [
+      {
+        id: "aaa",
+        source: "coupon" as const,
+        discount: { kind: "fixed" as const, amount: 51, currency: "usd" },
+      },
+      {
+        id: "zzz",
+        source: "promotion" as const,
+        discount: { kind: "percentage" as const, basisPoints: 5000 },
+      },
+    ];
+    for (const ordered of [candidates, [...candidates].reverse()])
+      expect(selectBestDiscount(101, "usd", ordered)).toEqual({
+        candidate: candidates[1],
+        saving: 51,
+      });
+  });
+  it("does not select zero-saving, foreign-currency or free-service discounts", () => {
+    const candidate = {
+      id: "c",
+      source: "coupon" as const,
+      discount: { kind: "fixed" as const, amount: 500, currency: "eur" },
+    };
+    expect(selectBestDiscount(5000, "usd", [candidate])).toEqual({ candidate: null, saving: 0 });
+    expect(selectBestDiscount(0, "eur", [candidate])).toEqual({ candidate: null, saving: 0 });
+  });
+  it("scopes identity by discount source but rejects duplicate candidates", () => {
+    const p = {
+      id: "same",
+      source: "promotion" as const,
+      discount: { kind: "percentage" as const, basisPoints: 1000 },
+    };
+    expect(() => selectBestDiscount(1000, "usd", [p, p])).toThrow(RangeError);
+    expect(selectBestDiscount(1000, "usd", [p, { ...p, source: "coupon" }]).candidate).toBe(p);
   });
 });

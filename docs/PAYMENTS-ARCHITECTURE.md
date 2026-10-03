@@ -28,7 +28,7 @@ payment/refund obligations, cash/package settlement, and recovery.
 IMPLEMENTED** means approved policy awaiting implementation. **FUTURE / DEFERRED**
 means additional work; unresolved choices are explicitly identified in the
 business rules. The original source map/risk audit below remains historical;
-read the Slice 1–5 implementation sections for current guarantees and limits.
+read the Slice 1–6 implementation sections for current guarantees and limits.
 Do not treat an original audit finding or an earlier slice exclusion as an
 unfixed current problem when a later slice explicitly supersedes it.
 
@@ -1245,3 +1245,45 @@ Package purchase refunds, partially consumed credit revocation, disputes/chargeb
 ### Slice 5 validation
 
 Validation completed: full web suite **476/476 across 50 files, none skipped**, including **125 PostgreSQL integration tests across five suites** (41 package-credit, 35 refund, 32 fulfillment, 5 attempt, and 12 pricing tests). The package PostgreSQL suite also passed its separate 41-test rerun. Core tests passed 91/91; focused package/payment/booking coverage passed before the final complete suite. Full web typecheck with a 4 GB Node heap, DB/mobile and the remaining workspace typechecks, scoped Biome over 30 changed TypeScript files, and diff checks passed. The final manual diff review covered ownership, operation identity, database locking/guards, migration metadata, purchase verification/recovery, cancellation/finalization races, and historical rescheduling terms. PostgreSQL used a disposable version-17 container on loopback with tmpfs storage and guarded test database names; test URLs existed only in validation processes. No deployed database, credentials, or Compose override was used.
+
+## Slice 6 implementation: authoritative booking quotes
+
+See [PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md) for the pricing contract and
+[BUSINESS-RULES.md](BUSINESS-RULES.md) for finalized promotion/coupon decisions.
+Slice 6 preserves existing durable cash fulfillment, refunds, historical routing,
+package ownership/redemption, and purchase settlement. No Stripe operation or
+production deployment configuration changes.
+
+New unpaid commercial `createBooking` callers must prove zero cash through a
+fresh shared quote in the booking transaction and persist it atomically with
+booking/attendees. A public free preview cannot authorize a later booking after
+service or promotion terms change. Staff explicit
+service creation does the same; unsupported positive-cash staff/API creation
+fails closed rather than inventing an offline payment workflow. Versioned API
+creation accepts an optional stable `checkoutRequestId` and delegates pricing.
+
+Migration `0068_zero_cash_booking.sql` extends `booking_settlement_claims` with
+`zero_cash`, bound to its booking ID and immutable zero-cash snapshot. No legacy
+free operation is backfilled. A single appointment operation cannot acquire cash,
+credit and zero-cash settlements independently. The existing advisory transaction
+lock and unique claim serialize retries; booking/snapshot/claim commit together.
+A crash before commit leaves none; response loss after commit returns the same
+booking before reading new prices or availability. Cancelled/moved bookings remain
+that operation's result; a genuinely new booking needs a fresh operation ID.
+Deferred guards reject orphan zero claims and later attaching cash settlement or
+deleting the claimed booking. Exactly one accepted snapshot binds the claim;
+appending another snapshot cannot reinterpret it as an uncollected revision.
+Future explicit adjustments need their own design.
+
+Rescheduling changes scheduling facts, never historical quote/settlement or
+redemption. There is no grace counter. New free recurring occurrences save their
+own zero quotes; paid/commercial expansion fails closed. Existing historical
+series are not given fabricated financial allocations.
+
+External calendar/email/reminder delivery for free/staff bookings and recurring
+expansion still lacks a universal durable outbox. A committed booking is retained
+and returned on retry without blindly replaying those effects. Coupon eligibility,
+authenticated redemption, checkout capacity reservations, accepted coupon snapshot
+schema, usage/restoration, and management UI remain future work. Only pure shared
+candidate arithmetic (including promotion preference on ties) and canonical code
+normalization are introduced now; they are not coupon payment provenance.

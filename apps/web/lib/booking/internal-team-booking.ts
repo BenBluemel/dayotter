@@ -3,6 +3,7 @@ import { primaryOrg } from "@/lib/billing/entitlements";
 import { writeBookingToCalendar } from "@/lib/calendar/host-calendar";
 import { logger } from "@dayotter/core";
 import { and, eq, getDb, schema } from "@dayotter/db";
+import { BookingError } from "./booking-logic";
 import { getOrCreatePersonalEventType } from "./host-booking";
 import { reminderOffsetsForHost, scheduleBookingReminders } from "./reminders";
 import { teamSchedule } from "./team-schedule";
@@ -117,6 +118,22 @@ export async function createInternalTeamBooking(
   const uid = randomUUID();
 
   const booking = await db.transaction(async (tx) => {
+    // Recheck under a row lock: an administration edit after Personal lookup
+    // must not turn a noncommercial internal meeting into a pricing bypass.
+    const [service] = await tx
+      .select()
+      .from(schema.eventTypes)
+      .where(eq(schema.eventTypes.id, eventTypeId))
+      .for("share");
+    if (
+      !service ||
+      service.organizationId !== org.id ||
+      service.ownerId !== input.organizerId ||
+      (service.price ?? 0) !== 0 ||
+      !service.isPrivate ||
+      service.isActive
+    )
+      throw new BookingError("Personal booking configuration requires review", 409);
     const [row] = await tx
       .insert(schema.bookings)
       .values({

@@ -2,7 +2,8 @@
 
 Status: business decisions recorded against validated Slice 5 commit
 `7ff1a9a8eac39151ae76db0dfc3bc50535542348`, on `feature/payment-routing`.
-This documentation checkpoint does not implement Slice 6 or enable payments.
+Slice 6 enforces the shared pricing contract across new service-booking paths.
+This work does not enable production payments or implement coupon redemption.
 
 This is the product source of truth. Implementation must preserve these rules;
 changes to product policy must update this document. Technical contracts belong
@@ -26,7 +27,10 @@ determines an effective price from eligible automatic promotions. Accepted
 pricing is historical: later service-price, promotion, deposit, or payment
 configuration changes do not rewrite a saved quote or an existing booking's
 financial history. These guarantees cover the new public cash/package paths;
-some staff, API, and recurring paths still lack the shared pricing history.
+new direct/API and staff service bookings now save the shared pricing history.
+Staff/API paths without a collection workflow reject positive cash. Hidden
+Personal and internal team meetings remain explicitly noncommercial; legacy
+bookings are not assigned invented historical quotes.
 
 **DECIDED:** All commercial booking entry points must respect the same pricing
 contract. A missing historical quote must not be interpreted as a free booking.
@@ -41,6 +45,9 @@ and have validity windows. No percentage, including 50%, is hardcoded.
 When several promotions qualify, use the single promotion giving the customer
 the greatest savings. Discounts do not stack. Current eligibility uses the
 original appointment start, rather than when the customer submits the booking.
+For example, an October 1–31 window covers appointments occurring in October,
+regardless of when they are booked. Stored windows exclude the end instant; an
+inclusive October 31 date is represented by the next local-day boundary.
 A fixed discount must use the service's currency and cannot make its price
 negative. The promotion's end boundary is excluded.
 
@@ -60,12 +67,25 @@ stacking. A coupon that loses to a better promotion must not consume a coupon
 use merely because its code was submitted. No coupon model, code-entry flow,
 usage ledger, or coupon-restoration behavior is implemented yet.
 
+Minimum-purchase eligibility uses the regular/base service price, not discounted
+price or deposit. Codes are trimmed and case-insensitive: `FRIEND50`, `friend50`,
+and `" Friend50 "` identify the same code. If a coupon and an automatic promotion
+give exactly the same best price, prefer the automatic promotion and preserve
+the coupon use. Coupons require an authenticated customer; guest redemption is
+not supported.
+
 ## Coupon usage and cancellation
 
 **DECIDED / NOT YET IMPLEMENTED:** Limited or one-time coupon redemption belongs
 to the booking that used it. Moving that booking does not consume another use.
 Cancellation restores the consumed use exactly once, including the customer's
 per-customer allowance. Retries or repeated cancellation cannot restore twice.
+
+Future limited-use coupons may have global and/or per-customer limits. Reserve
+scarce capacity safely during Checkout and release it when Checkout is abandoned.
+Successful booking consumes the reservation; cancellation restores it once;
+rescheduling preserves it. Expiration/abandonment must be established safely so
+a delayed successful payment is not discarded or assigned released capacity.
 
 Unlimited coupons do not need scarce-use counting, but the booking still records
 why its discount applied. Restoring a use does not reactivate an expired or
@@ -150,8 +170,11 @@ new booking that loses the original financial relationships.
 
 **CURRENT:** Package-paid recurring creation is blocked. The new public cash
 path blocks commercial recurring series where one payment would otherwise fund
-multiple occurrences; existing group-slot exceptions and legacy/internal
-creation paths mean this is not a universal recurring financial contract.
+multiple occurrences; host-owned group-slot exceptions remain (they do not
+expand into a series).
+Staff commercial series are blocked too, including 100%-discounted services.
+Free-service occurrence expansion saves separate zero-cash quotes and refuses
+commercial prices; historical series are not retroactively allocated payments.
 
 **DECIDED:** One payment or credit must not authorize multiple independently
 chargeable occurrences. Unsupported financial series must fail closed until
@@ -165,13 +188,13 @@ cancellation/refund policy.
 
 - Coupon validity clock: appointment start, booking acceptance time, or another
   explicitly defined time; promotion eligibility currently uses appointment start.
-- Minimum-purchase calculation: which price and purchase scope it tests, including
-  deposits and any future eligibility for package purchases.
-- Coupon code normalization, equal-saving promotion/coupon tie resolution, and
-  how per-customer limits identify guest customers without trusting supplied email.
-- When scarce coupon uses are reserved/consumed during Checkout, how abandoned
-  or expired checkout releases them, and how delayed successful payments resolve
-  that lifecycle. These choices must preserve the decided exactly-once rules.
+- Coupon eligibility for package purchases is not decided; appointment minimums
+  use base service price. Coupon validity clock remains unresolved separately
+  from the finalized appointment-time promotion rule.
+- Exact scarce-use reservation/release mechanics, abandoned Checkout evidence,
+  delayed-payment races, and operator recovery need design before coupon runtime
+  implementation. Reservation at Checkout and consumption at successful booking
+  are decided; their failure handling must preserve exactly-once use/restoration.
 - Staff/offline commercial booking policy and consistent approval behavior for
   $0 promotional bookings. Current public $0 bookings retain existing approval
   behavior; cash-paid and package bookings bypass approval.
