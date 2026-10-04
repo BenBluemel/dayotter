@@ -491,6 +491,20 @@
       "when": 1791008161971,
       "tag": "0069_appointment_coupons",
       "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1791058123500,
+      "tag": "0070_resource_allocation",
+      "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1791082040578,
+      "tag": "0071_resource_claim_diagnostics",
+      "breakpoints": true
     }
   ]
 }

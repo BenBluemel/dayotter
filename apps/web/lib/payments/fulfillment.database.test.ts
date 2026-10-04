@@ -6,6 +6,7 @@ import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureAttempt, fixturePaidSession, fixturePaymentIntent } from "./attempt-fixtures";
 import type { PaymentAttempt } from "./attempt-terms";
+import { withPreResourceSchedulingSchema } from "./legacy-scheduling-fixture";
 import { insertHistoricalPricingSnapshot } from "./legacy-snapshot-fixture";
 
 const mock = vi.hoisted(() => ({
@@ -95,8 +96,10 @@ describe.skipIf(!testUrl)("durable fulfillment PostgreSQL integration", () => {
     ) as { entries: { tag: string }[] };
     for (const { tag } of journal.entries) {
       if (tag === "0065_payment_fulfillment") {
-        await seedTenant();
-        await seedSlice2Booking();
+        await withPreResourceSchedulingSchema(async () => {
+          await seedTenant();
+          await seedSlice2Booking();
+        });
       }
       const migration = await readFile(new URL(`${tag}.sql`, directory), "utf8");
       const client = await db.$client.connect();

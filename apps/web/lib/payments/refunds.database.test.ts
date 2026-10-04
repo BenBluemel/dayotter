@@ -4,6 +4,7 @@ import { createDatabase, eq, schema } from "@dayotter/db";
 import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixturePaidSession, fixturePaymentIntent } from "./attempt-fixtures";
+import { withPreResourceSchedulingSchema } from "./legacy-scheduling-fixture";
 import { insertHistoricalPricingSnapshot } from "./legacy-snapshot-fixture";
 import { fixtureRefundCharge, fixtureRefundEvidence } from "./refund-fixtures";
 import type { RefundEvidence, RefundOperation } from "./refund-terms";
@@ -115,37 +116,39 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
     ) as { entries: { tag: string }[] };
     for (const { tag } of journal.entries) {
       if (tag === "0066_refund_operations") {
-        await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
-          organizationId,
-          "Refund test",
-          randomUUID(),
-        ]);
-        await db.insert(schema.users).values({ id: ownerId, email: "host@example.test" });
-        await db.insert(schema.eventTypes).values({
-          id: eventTypeId,
-          organizationId,
-          ownerId,
-          slug: "test",
-          title: "Test",
-          price: 5000,
-          depositAmount: 2000,
-          currency: "usd",
-          durationMinutes: 30,
-          location: "in_person",
-          locationDetail: "Test room",
+        await withPreResourceSchedulingSchema(async () => {
+          await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
+            organizationId,
+            "Refund test",
+            randomUUID(),
+          ]);
+          await db.insert(schema.users).values({ id: ownerId, email: "host@example.test" });
+          await db.insert(schema.eventTypes).values({
+            id: eventTypeId,
+            organizationId,
+            ownerId,
+            slug: "test",
+            title: "Test",
+            price: 5000,
+            depositAmount: 2000,
+            currency: "usd",
+            durationMinutes: 30,
+            location: "in_person",
+            locationDetail: "Test room",
+          });
+          upgrade = await fresh(true);
+          // Genuine Slice 3 cancelled row with no refund operation: migration must
+          // preserve it, and bounded recovery may safely reconstruct the obligation.
+          await db
+            .update(schema.bookings)
+            .set({ status: "cancelled" })
+            .where(eq(schema.bookings.id, upgrade.booking.id));
+          upgradeInconsistent = await fresh(true);
+          await db
+            .update(schema.bookings)
+            .set({ status: "cancelled", paymentCurrency: "eur" })
+            .where(eq(schema.bookings.id, upgradeInconsistent.booking.id));
         });
-        upgrade = await fresh(true);
-        // Genuine Slice 3 cancelled row with no refund operation: migration must
-        // preserve it, and bounded recovery may safely reconstruct the obligation.
-        await db
-          .update(schema.bookings)
-          .set({ status: "cancelled" })
-          .where(eq(schema.bookings.id, upgrade.booking.id));
-        upgradeInconsistent = await fresh(true);
-        await db
-          .update(schema.bookings)
-          .set({ status: "cancelled", paymentCurrency: "eur" })
-          .where(eq(schema.bookings.id, upgradeInconsistent.booking.id));
       }
       const migration = await readFile(new URL(`${tag}.sql`, directory), "utf8");
       const client = await db.$client.connect();

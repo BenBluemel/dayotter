@@ -1,5 +1,6 @@
 import { relations, sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   index,
   integer,
@@ -19,6 +20,7 @@ import {
 } from "./_shared";
 import { calendars } from "./calendar";
 import { organizations, users } from "./orgs";
+import type { AcceptedSchedulingPlan } from "./resources";
 import { eventTypes } from "./scheduling";
 
 /** A scheduled meeting instance. */
@@ -72,6 +74,10 @@ export const bookings = pgTable(
     cancelReason: text("cancel_reason"),
     /** Why the booking was last moved (shown to the host on the booking page). */
     rescheduleReason: text("reschedule_reason"),
+
+    /** Null retains unknown scheduling history on legacy/unmanaged rows. */
+    schedulingPlan: jsonb("scheduling_plan").$type<AcceptedSchedulingPlan>(),
+    allocationRevision: bigint("allocation_revision", { mode: "number" }),
 
     // Payments (Stripe). paymentStatus="none" for free event types.
     paymentStatus: paymentStatus("payment_status").notNull().default("none"),

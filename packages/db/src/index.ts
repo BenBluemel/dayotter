@@ -17,3 +17,10 @@ export {
   desc,
   asc,
 } from "drizzle-orm";
+export {
+  allocateBookingResources,
+  releaseBookingResources,
+  classifyResourceError,
+  withResourceTransaction,
+  type ResourceErrorIdentity,
+} from "./resources";
