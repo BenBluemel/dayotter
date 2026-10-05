@@ -971,7 +971,7 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
       let waiters = 0;
       for (let n = 0; n < 100 && waiters < 2; n++) {
         const { rows } = await db.$client.query(
-          "SELECT count(*)::int as n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%package_credits%'",
+          "SELECT count(*)::int as n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query LIKE '%package_credits%' OR query LIKE '%pg_advisory_xact_lock%')",
         );
         waiters = rows[0].n;
         if (waiters < 2) await new Promise((r) => setTimeout(r, 10));

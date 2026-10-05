@@ -1,6 +1,6 @@
 # Resource scheduling: proposed architecture
 
-**Status: R1 allocation foundation implemented; resource rollout remains inactive.**
+**Status: R1 foundation and R2 creation/paid acceptance implemented locally; real resource rollout remains inactive.**
 Original repository archaeology against validated/public Slice 7,
 commit `6b2796e05f1ff2bdea13c6bddee04c49e07e6879`, tree
 `e87a2e067395c717f2301faf07efd36448f98c2f`, inspected 2026-10-03.
@@ -1240,15 +1240,15 @@ single-occurrence booking with terms proved against locked current configuration
 NULL remains unmanaged/unknown; an asserted empty list is rejected unless the
 complete plan matches resolved configuration. Existing plans cannot be rewritten,
 and ordinary DML cannot adopt a legacy row. Schedule deletion and parent scope
-changes cannot erase managed history. No attempt-custody binding or reviewed
-adoption workflow is exposed yet; their protected extension is R2–R4 work.
+changes cannot erase managed history. At the R1 checkpoint, attempt-custody binding and reviewed adoption were not
+exposed. R2 adds protected attempt custody; reviewed adoption remains R4 work.
 
-**This is not resource activation.** Admission epoch must remain zero and host-free
+**R1 was not resource activation.** At that checkpoint admission epoch remained zero and host-free
 configuration remains unavailable. Requirements may be stored, but existing writers
 continue creating unmanaged bookings with NULL plans; no availability, payment,
-reschedule, cancellation, recurrence, UI or real service is converted. Mandatory
-future-admission/attempt guards and activation census are installed only with the
-coordinated writer cutover described above. No legacy plans/claims are backfilled.
+reschedule, cancellation, recurrence, UI or real service is converted. R2 installs mandatory
+future-admission/attempt guards and the serialized census; live activation still
+requires the coordinated rollout below. No legacy plans/claims are backfilled.
 
 Resource-layer allocation/release functions take no new service, booking or financial
 locks. Callers must first acquire higher-order locks and perform host-index admission;
@@ -1276,3 +1276,142 @@ UPDATE release/history guards retain their existing ordering so old-revision
 release during atomic replacement remains legal. Deferred booking/claim triggers
 still prove final-set completeness at COMMIT, including missing or extra claims.
 No booking-path integration, activation or Slice 2 behavior is included.
+
+
+## R2 implementation checkpoint: creation and paid acceptance
+
+Migration `0072_resource_booking_acceptance.sql` is additive; 0070/0071 are
+unchanged. There is still no live configuration, management UI, host-free execution,
+resource prediction, or commercial recurring support. The admission state is inert
+on existing services. Tests enable synthetic services only. R3 must complete
+lifecycle/prediction work and R4 must perform the coordinated, drained cutover
+before any real service is enabled.
+
+### Admission, immutable terms and custody
+
+`resource-acceptance.ts` locks the service `FOR SHARE`; configuration and
+requirement mutation retain `FOR UPDATE`. A new managed plan is obtained from
+`resource_accept_plan`, never a client resource list. It captures the existing
+versioned plan representation including resolved schedule, fixed required host,
+timezones, duration and buffers. Definition eligibility may reject an already
+disabled resource early; only post-fence PostgreSQL allocation admits capacity.
+
+Booking/attempt guards participate in the service gate even for raw writes.
+An attempt's nullable `scheduling_plan` and `scheduling_duration_minutes` are
+immutable under the existing attempt terms guard and are proven against serialized
+configuration at INSERT. No claims/holds are created at checkout. Managed
+fulfillment copies those exact terms and records `bookings.scheduling_attempt_id`;
+SQL proves verified paid custody, service/organization, original time/duration,
+fixed host and matching plan. Deferred checks on both booking and attempt require
+the final reciprocal booking binding. Current requirements are not historical
+payment authority. Schedule deletion and service organization reassignment also
+respect frozen attempt history.
+
+The gate's one VOLATILE commitment census covers bookings and unbound accepted
+attempts while holding the exclusive service lock; it takes no attempt/booking
+locks. Known empty managed plans can be proven elapsed using accepted after buffers.
+NULL-plan legacy rows have no accepted buffer evidence and are conservatively
+included until reviewed/drained. No historical plan or claims are invented. A
+legacy/empty-plan row moved into managed occupancy is rejected; ordinary DML has
+no adoption capability. Host-free, recurring, group/team and reserved Personal
+configuration remain excluded. Only the guarded service admission transition can
+change the epoch; this is a database primitive, not permission for live activation.
+
+### Writer inventory and transaction order
+
+The four application booking INSERTs remain:
+
+- `createBooking`: public/authenticated/guest/embed/v1 API, free/zero-cash,
+  package and durable paid fulfillment. Direct acceptance captures a plan; paid
+  acceptance uses locked attempt custody. Booking, quote/settlement, coupon or
+  credit work, attendees/links and claims commit together.
+- `createHostBooking`: staff, AI and SMS through `createOtterEvent`. Managed
+  requests use a stable authenticated-host operation key/fingerprint, advisory
+  serialization and immutable booking identity. Explicit `requestId` is supported;
+  older callers converge on an exact-input identity including actual UTC times.
+  Replays return the original booking before mutable configuration/provider work.
+- `createInternalTeamBooking`: the reserved noncommercial Personal service remains
+  unmanaged; managed services fail closed. No team resource allocation is added.
+- `finalizeConfirmedBooking`'s `finalizeOccurrence`: takes the service gate and
+  rejects managed recurrence before INSERT. `createOtterEvent` rejects resource
+  series before its loop and prevents focus/reminder holds from masquerading as
+  resource-bearing service acceptance; the host writer independently rejects a
+  recurrence association. Configuration/database guards supply the final backstop.
+
+Creation locks are: stable operation identity; paid attempt (and existing operator
+resolution action); service gate; sorted required-person mutexes; sorted union of
+applicable service period cap keys and person daily focus keys; booking INSERT/host
+index admission; link/quote/attendee/coupon/credit financial work; complete sorted
+resource fences; claims; deferred nonlocking completeness. Already held attempt
+and action locks are reused when binding the final result. The allocator takes no
+higher-order locks. Whole-transaction retries are bounded to three for wrapped
+40001/40P01 and exclude provider calls. Capacity conflict is not retried as a
+transaction failure. Public primary-person creation rechecks the existing candidate buffer/minimum-gap
+predicate under the person mutex, including unmanaged competitors; staff retains explicit ordinary
+availability override but cannot override resource capacity. Pending and confirmed
+consume cap slots; independently intersecting month/year/week/day keys are locked
+rather than assuming a week belongs to one month. Creation also retains the legacy
+host/week mutex used by ordinary rescheduling, preserving their shared cap barrier.
+Recurring ordinary occurrence inserts take the person mutex as well. Host-free cap
+semantics remain R3.
+
+Managed rescheduling, cancellation and decline are deliberately blocked until R3;
+the existing deferred invariant also prevents raw incomplete lifecycle writes. Approval
+may retain the same pending allocation when confirming. No release/move lifecycle
+is wired into existing application booking paths by R2.
+
+### Paid conflict and controlled operator resolution
+
+Verified Stripe success is committed independently. `fulfillObservedPayment`
+creates booking/claims/financial binding atomically using frozen scheduling and
+pricing terms. A valid resource conflict rolls everything in that creation transaction
+back and records `booking_obligation_requires_review`. Ordinary webhook/return/
+recovery does not automatically reopen review. The coupon stays reserved while paid
+value is owed. A resource invariant becomes `resource_invariant_requires_review`;
+it cannot be resolved through the scheduling retry/refund action API. This preserves
+0071's distinction through wrapped driver errors and application mapping, including
+browser reconciliation, signed event receipts and the recovery CLI.
+
+`GET /api/payments/review?organizationId=…` is an authenticated owner/admin queue
+of paid, unbooked obligations, including technical and refund-progress review.
+Completed refunds are excluded. `POST /api/payments/review` accepts only a stable
+UUID `id`, `attemptId`, `method` (`retry` or `refund`), and customer contact/consent
+`evidence`. It does not accept a replacement time, resources, money or routing.
+Both layers authorize current organization membership. `payment_review_actions`
+retains encrypted evidence, actor, input fingerprint and terminal status; one active
+action per attempt is enforced durably. Terminal history cannot be deleted/truncated.
+
+Kimberly/another authorized owner or admin must inspect the queue daily and contact
+the customer; Ben is the technical escalation backup. Escalate unresolved paid cases
+within one business day. Recording contact alone does not settle the obligation.
+With customer consent, retry the ORIGINAL accepted time through the normal allocator.
+A successful retry binds one booking and marks the action booked in that transaction;
+a failed scheduling retry marks the action failed and keeps paid/coupon obligations.
+Retries of the action ID return its original result; another deliberate attempt needs
+a new action ID. Recovery may resume an explicitly reopened original-time attempt.
+
+Alternatively create one full `unbooked_obligation` RefundOperation with NULL booking
+under the attempt lock and authorized action, copying verified historical charge/
+route facts. The existing executor, historical Stripe context, stable provider key,
+charge/refund verification and recovery apply. Starting this refund prohibits any
+later booking binding or new retry. Verified refund completion, refunded action and
+coupon reservation release commit together. Ambiguous/pending refund preserves the
+reservation and evidence; it cannot authorize another refund or booking. Existing
+booking cancellation refunds retain their separate purpose/invariants. To arrange a
+different time, refund this obligation and create a new ordinary booking.
+
+No-hold checkout does NOT guarantee the resource slot before fulfillment commits.
+Future slot guarantees require a separately designed durable temporary hold. The
+legacy Redis checkout stash rejects managed services; an unexpected legacy paid
+session for one is returned/logged as reconciliation-required rather than creating
+an unallocated booking or guessing a refund route. Redis history is not durable
+PaymentAttempt custody. Such sessions must be drained/reviewed before live activation.
+
+### Validation boundaries
+
+`resource-acceptance.database.test.ts` exercises real booking/API/staff writers,
+financial rollback/replay, frozen paid terms, controlled paid review resolution,
+configuration barriers and diagnostic corruption injection in PostgreSQL 17.
+Capacity/final-set authority remains the R1/0071 foundation suite; no TypeScript
+capacity algorithm exists. API callers remain resource-transparent. Unmanaged
+services create NULL plans and no claims, retaining existing settlement behavior.

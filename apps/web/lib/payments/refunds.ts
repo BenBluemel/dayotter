@@ -12,6 +12,7 @@ import {
   or,
   schema,
 } from "@dayotter/db";
+import { BookingError } from "../booking/booking-logic";
 import { restoreBookingCoupon } from "../booking/coupon-uses";
 import { restoreBookingCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "./booking-routing";
@@ -66,6 +67,11 @@ export async function decideBookingCancellation(
       .where(eq(schema.bookings.id, candidate.id))
       .for("update");
     if (!booking) return null;
+    if (booking.schedulingPlan && !["cancelled", "rejected"].includes(booking.status))
+      throw new BookingError(
+        "Resource booking cancellation is not available until lifecycle support is enabled",
+        409,
+      );
     const changed = booking.status !== "cancelled";
     // 0064 fulfilled attempts lack verified charge facts. They remain explicitly
     // legacy rather than inventing a RefundOperation snapshot from today's config.
@@ -283,11 +289,24 @@ export async function executeRefundOperation(
         .from(schema.paymentAttempts)
         .where(eq(schema.paymentAttempts.id, operation.attemptId))
         .for("update");
-      const [booking] = await tx
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.id, operation.bookingId))
-        .for("update");
+      const [booking] = operation.bookingId
+        ? await tx
+            .select()
+            .from(schema.bookings)
+            .where(eq(schema.bookings.id, operation.bookingId))
+            .for("update")
+        : [];
+      if (!operation.bookingId)
+        await tx
+          .select()
+          .from(schema.paymentReviewActions)
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, operation.attemptId),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          )
+          .for("update");
       const [current] = await tx
         .select()
         .from(schema.refundOperations)
@@ -295,7 +314,7 @@ export async function executeRefundOperation(
         .for("update");
       if (!current) throw new Error("Refund operation is missing");
       const status = verifyRefundEvidence(current, evidence);
-      if (!booking || booking.status !== "cancelled")
+      if (current.purpose === "cancellation" && (!booking || booking.status !== "cancelled"))
         throw new PaymentContradictionError("Refund booking is not cancelled");
       if (current.state === "requires_review") return;
       // An older pending read must not overwrite another worker's success.
@@ -312,7 +331,29 @@ export async function executeRefundOperation(
           nextRecoveryAt: new Date(Date.now() + 60000),
         })
         .where(eq(schema.refundOperations.id, id));
-      if (status === "succeeded")
+      if (status === "succeeded" && current.purpose === "unbooked_obligation") {
+        await tx
+          .update(schema.paymentReviewActions)
+          .set({ state: "refunded", resolvedAt: new Date() })
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, operation.attemptId),
+              eq(schema.paymentReviewActions.method, "refund"),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          );
+        const [use] = await tx
+          .select()
+          .from(schema.appointmentCouponUses)
+          .where(eq(schema.appointmentCouponUses.paymentAttemptId, operation.attemptId))
+          .for("update");
+        if (use?.status === "reserved")
+          await tx
+            .update(schema.appointmentCouponUses)
+            .set({ status: "released" })
+            .where(eq(schema.appointmentCouponUses.id, use.id));
+      }
+      if (status === "succeeded" && booking)
         await tx
           .update(schema.bookings)
           .set({ paymentStatus: "refunded" })

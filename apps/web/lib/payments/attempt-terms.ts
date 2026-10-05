@@ -2,6 +2,7 @@ import { type AppointmentPrice, decryptJson, sha256hex } from "@dayotter/core";
 import type { schema } from "@dayotter/db";
 import type Stripe from "stripe";
 import { z } from "zod";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import type { CreateBookingInput } from "../booking/create-booking";
 import { canonicalJson } from "./canonical-json";
 import { PaymentContradictionError, type PaymentRoute } from "./routing";
@@ -127,6 +128,17 @@ export function decodeAttempt(attempt: PaymentAttempt) {
   ) {
     throw new PaymentContradictionError("Saved checkout intent and pricing terms disagree");
   }
+  if (
+    attempt.schedulingPlan &&
+    (attempt.schedulingPlan.organizationId !== attempt.organizationId ||
+      attempt.schedulingPlan.eventTypeId !== attempt.eventTypeId ||
+      attempt.schedulingPlan.durationMinutes !== payload.resolvedDurationMinutes ||
+      attempt.schedulingDurationMinutes !== payload.resolvedDurationMinutes)
+  )
+    throw new ResourceInvariantError(
+      "resource_plan_completeness_violation",
+      new Error("Saved scheduling terms contradict checkout intent"),
+    );
   // Integrity check of immutable numbers only; never run quote/promotion selection at fulfillment.
   const p = quote.promotion ?? (quote.version === 2 ? quote.coupon : null);
   const saving = p
@@ -153,6 +165,7 @@ export function decodeAttempt(attempt: PaymentAttempt) {
     quote,
     route: attemptRoute(attempt),
     resolvedDurationMinutes: payload.resolvedDurationMinutes,
+    schedulingPlan: attempt.schedulingPlan ?? null,
   };
 }
 

@@ -1,8 +1,18 @@
 import { env } from "@/lib/server/env";
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, schema, sql } from "@dayotter/db";
+import {
+  and,
+  classifyResourceError,
+  eq,
+  getDb,
+  schema,
+  sql,
+  withResourceTransaction,
+} from "@dayotter/db";
 import { bookingDeclined, sendEmail } from "@dayotter/emails";
+import { mapInsertError } from "./booking-logic";
 import { finalizeConfirmedBooking } from "./finalize-booking";
+import { lockServiceAdmission } from "./resource-acceptance";
 
 /** Outcome of a host review action, mapped to HTTP status by the route. */
 export type ReviewResult = "ok" | "not_found" | "forbidden" | "not_pending" | "full";
@@ -70,12 +80,23 @@ export async function approveBooking(uid: string, hostUserId: string): Promise<R
   // another confirmed booking; the guard is belt-and-braces.
   let claimed: { id: string }[];
   try {
-    claimed = await db
-      .update(schema.bookings)
-      .set({ status: "confirmed" })
-      .where(and(eq(schema.bookings.id, booking.id), eq(schema.bookings.status, "pending")))
-      .returning({ id: schema.bookings.id });
+    const confirm = (writer: Pick<ReturnType<typeof getDb>, "update">) =>
+      writer
+        .update(schema.bookings)
+        .set({ status: "confirmed" })
+        .where(and(eq(schema.bookings.id, booking.id), eq(schema.bookings.status, "pending")))
+        .returning({ id: schema.bookings.id });
+    claimed = booking.schedulingPlan
+      ? await withResourceTransaction(db, async (tx) => {
+          // Pending already owns its claims. Take admission before the booking
+          // row lock; the deferred check proves that approval retains them.
+          await lockServiceAdmission(tx, booking.eventTypeId);
+          return confirm(tx);
+        })
+      : await confirm(db);
   } catch (err) {
+    if (booking.schedulingPlan && classifyResourceError(err)?.category === "invariant")
+      mapInsertError(err);
     // 23505 / exclusion violation: the slot was taken by another booking.
     logger.warn("booking approve conflict", {
       event: "booking_approve_conflict",
@@ -118,7 +139,7 @@ export async function declineBooking(
   });
   if (!booking) return "not_found";
   if (booking.hostId !== hostUserId) return "forbidden";
-  if (booking.status !== "pending") return "not_pending";
+  if (booking.status !== "pending" || booking.schedulingPlan) return "not_pending";
 
   const claimed = await db
     .update(schema.bookings)

@@ -18,6 +18,11 @@ import {
   scheduleScribe,
   scheduleWorkflowMessages,
 } from "./reminders";
+import {
+  lockPersonAdmission,
+  lockServiceAdmission,
+  rejectManagedRecurrence,
+} from "./resource-acceptance";
 import { reserveTravelBlocks } from "./travel";
 
 export interface FinalizeContext {
@@ -69,6 +74,8 @@ export async function finalizeConfirmedBooking(ctx: FinalizeContext): Promise<vo
   const recurrenceUid = booking.recurrenceUid;
   const duration = Math.round((end.getTime() - start.getTime()) / 60_000);
   const recurringCount = !isGroup ? Math.min(52, Math.max(1, eventType.recurringCount ?? 1)) : 1;
+  if (booking.schedulingPlan && recurringCount > 1)
+    throw new BookingError("Recurring resource appointments are not supported", 409);
   const isRecurring = recurringCount > 1 && Boolean(recurrenceUid);
 
   // Fan out to webhooks / CRM sync / plugin hooks (best-effort). This fires HERE,
@@ -272,6 +279,9 @@ export async function finalizeConfirmedBooking(ctx: FinalizeContext): Promise<vo
       const occEnd = new Date(occStart.getTime() + duration * 60_000);
       try {
         const occ = await db.transaction(async (tx) => {
+          const service = await lockServiceAdmission(tx, eventType.id);
+          rejectManagedRecurrence(service, true);
+          await lockPersonAdmission(tx, [host.id]);
           const quote = await quoteAppointmentPrice(
             {
               organizationId: eventType.organizationId,

@@ -1,7 +1,9 @@
 import { relations, sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -20,6 +22,7 @@ import {
 } from "./_shared";
 import { calendars } from "./calendar";
 import { organizations, users } from "./orgs";
+import { paymentAttempts } from "./payment-attempts";
 import type { AcceptedSchedulingPlan } from "./resources";
 import { eventTypes } from "./scheduling";
 
@@ -78,6 +81,12 @@ export const bookings = pgTable(
     /** Null retains unknown scheduling history on legacy/unmanaged rows. */
     schedulingPlan: jsonb("scheduling_plan").$type<AcceptedSchedulingPlan>(),
     allocationRevision: bigint("allocation_revision", { mode: "number" }),
+    schedulingAttemptId: uuid("scheduling_attempt_id").references(
+      (): AnyPgColumn => paymentAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    creationOperationKey: text("creation_operation_key"),
+    creationFingerprint: text("creation_fingerprint"),
 
     // Payments (Stripe). paymentStatus="none" for free event types.
     paymentStatus: paymentStatus("payment_status").notNull().default("none"),
@@ -93,6 +102,11 @@ export const bookings = pgTable(
     ...timestamps,
   },
   (t) => [
+    check(
+      "booking_creation_identity_check",
+      sql`(${t.creationOperationKey} IS NULL AND ${t.creationFingerprint} IS NULL) OR (${t.schedulingPlan} IS NOT NULL AND ${t.creationOperationKey} IS NOT NULL AND ${t.creationFingerprint} ~ '^[a-f0-9]{64}$' AND ${t.creationOperationKey} LIKE 'host-booking:' || ${t.hostId}::text || ':%') IS TRUE`,
+    ),
+    uniqueIndex("booking_creation_operation_idx").on(t.creationOperationKey),
     uniqueIndex("bookings_uid_idx").on(t.uid),
     uniqueIndex("bookings_id_org_event_idx").on(t.id, t.organizationId, t.eventTypeId),
     index("bookings_host_idx").on(t.hostId),

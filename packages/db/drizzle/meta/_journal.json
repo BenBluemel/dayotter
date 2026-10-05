@@ -505,6 +505,13 @@
       "when": 1791082040578,
       "tag": "0071_resource_claim_diagnostics",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1791084786673,
+      "tag": "0072_resource_booking_acceptance",
+      "breakpoints": true
     }
   ]
 }

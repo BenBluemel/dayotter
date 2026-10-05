@@ -1,6 +1,7 @@
 import { decryptJson, encryptJson, sha256hex } from "@dayotter/core";
 import { type Database, and, eq, getDb, inArray, isNull, schema } from "@dayotter/db";
 import type Stripe from "stripe";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import {
   PAYMENT_ATTEMPT_ID_PATTERN,
@@ -246,11 +247,20 @@ export async function processAppointmentEvent(
           );
         await releaseTerminalCouponReservation(attempt.id, db);
       }
+      const reviewed =
+        result === "requires_review"
+          ? await db.query.paymentAttempts.findFirst({
+              where: eq(schema.paymentAttempts.id, attempt.id),
+            })
+          : null;
       await db
         .update(schema.paymentEvents)
         .set({
           state: result === "requires_review" ? "requires_review" : "completed",
-          reviewCode: result === "requires_review" ? "booking_obligation_requires_review" : null,
+          reviewCode:
+            result === "requires_review"
+              ? (reviewed?.reviewCode ?? "booking_obligation_requires_review")
+              : null,
         })
         .where(
           and(eq(schema.paymentEvents.id, receipt.id), eq(schema.paymentEvents.state, "pending")),
@@ -258,11 +268,15 @@ export async function processAppointmentEvent(
     }
     return result;
   } catch (err) {
-    if (err instanceof PaymentContradictionError) {
-      await requirePaymentReview(receipt.attemptId, "stripe_terms_contradiction", db);
+    if (err instanceof ResourceInvariantError || err instanceof PaymentContradictionError) {
+      const code =
+        err instanceof ResourceInvariantError
+          ? "resource_invariant_requires_review"
+          : "stripe_terms_contradiction";
+      await requirePaymentReview(receipt.attemptId, code, db);
       await db
         .update(schema.paymentEvents)
-        .set({ state: "requires_review", reviewCode: "stripe_terms_contradiction" })
+        .set({ state: "requires_review", reviewCode: code })
         .where(
           and(eq(schema.paymentEvents.id, receipt.id), eq(schema.paymentEvents.state, "pending")),
         );

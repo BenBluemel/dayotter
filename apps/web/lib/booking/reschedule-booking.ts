@@ -45,6 +45,8 @@ export async function rescheduleBooking(
   if (!booking || booking.status === "cancelled") {
     throw new RescheduleError("Booking not found", 404);
   }
+  if (booking.schedulingPlan)
+    throw new RescheduleError("Resource booking moves require lifecycle support", 409);
   const eventType = await db.query.eventTypes.findFirst({
     where: eq(schema.eventTypes.id, booking.eventTypeId),
   });

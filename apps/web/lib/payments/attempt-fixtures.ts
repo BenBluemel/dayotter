@@ -77,6 +77,8 @@ export function fixtureAttempt(): PaymentAttempt {
     checkoutUrl: null,
     paymentIntentId: null,
     bookingId: null,
+    schedulingPlan: null,
+    schedulingDurationMinutes: null,
   };
 }
 

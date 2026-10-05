@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   refund: vi.fn(),
   lookup: vi.fn(),
   attempt: vi.fn(),
+  service: vi.fn(),
 }));
 vi.mock("./stripe", () => ({ retrieveSession: mocks.retrieve, refundPayment: mocks.refund }));
 vi.mock("./pending", () => ({ claimPendingBooking: mocks.claim }));
@@ -19,10 +20,15 @@ vi.mock("@dayotter/db", () => ({
   eq: vi.fn(),
   schema: {
     bookings: { paymentIntentId: "payment_intent_id" },
+    eventTypes: { id: "id" },
     paymentAttempts: { checkoutSessionId: "checkout_session_id", id: "id" },
   },
   getDb: () => ({
-    query: { bookings: { findFirst: mocks.lookup }, paymentAttempts: { findFirst: mocks.attempt } },
+    query: {
+      bookings: { findFirst: mocks.lookup },
+      paymentAttempts: { findFirst: mocks.attempt },
+      eventTypes: { findFirst: mocks.service },
+    },
   }),
 }));
 import { fulfillCheckout } from "./fulfill";
@@ -65,4 +71,37 @@ describe("checkout failure refunds", () => {
     await expect(fulfillCheckout("cs_test")).resolves.toEqual({ uid: "booked", pending: false });
     expect(mocks.refund).not.toHaveBeenCalled();
   });
+});
+
+it("legacy resource checkout fails closed without allocating or guessing a refund", async () => {
+  mocks.retrieve.mockResolvedValue({
+    payment_status: "paid",
+    payment_intent: "pi_test",
+    metadata: { token: "token" },
+  });
+  mocks.service.mockResolvedValue({ id: "event", resourceAdmissionEpoch: 1 });
+  await expect(fulfillCheckout("cs_test")).resolves.toMatchObject({
+    uid: null,
+    pending: true,
+    state: "requires_review",
+  });
+  expect(mocks.create).not.toHaveBeenCalled();
+  expect(mocks.refund).not.toHaveBeenCalled();
+});
+it("legacy checkout cannot guess a refund when resource admission changes during fulfillment", async () => {
+  mocks.retrieve.mockResolvedValue({
+    payment_status: "paid",
+    payment_intent: "pi_test",
+    metadata: { token: "token" },
+  });
+  mocks.service
+    .mockResolvedValueOnce({ id: "event", resourceAdmissionEpoch: 0 })
+    .mockResolvedValueOnce({ id: "event", resourceAdmissionEpoch: 1 });
+  mocks.create.mockRejectedValue(new BookingError("This service requires durable checkout", 409));
+  await expect(fulfillCheckout("cs_test")).resolves.toMatchObject({
+    uid: null,
+    pending: true,
+    state: "requires_review",
+  });
+  expect(mocks.refund).not.toHaveBeenCalled();
 });

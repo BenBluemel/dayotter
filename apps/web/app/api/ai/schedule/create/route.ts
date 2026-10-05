@@ -1,4 +1,5 @@
 import { aiEnabled } from "@/lib/ai/schedule-parse";
+import { BookingError } from "@/lib/booking/booking-logic";
 import { LOCATION_TYPES } from "@/lib/booking/event-type-input";
 import { createOtterEvent } from "@/lib/booking/otter-create";
 import { jsonError, withUser } from "@/lib/server/http";
@@ -11,6 +12,7 @@ import { z } from "zod";
 export const dynamic = "force-dynamic";
 
 const body = z.object({
+  requestId: z.string().uuid().optional(),
   title: z.string().min(1).max(200),
   startISO: z.string().datetime(),
   durationMinutes: z.number().int().min(5).max(1440),
@@ -76,6 +78,7 @@ export const POST = withUser(async (u, request) => {
   try {
     const result = await createOtterEvent({
       userId: u.id,
+      requestId: d.requestId,
       title: d.title,
       start,
       durationMinutes: d.durationMinutes,
@@ -111,6 +114,7 @@ export const POST = withUser(async (u, request) => {
       count: result.count,
     });
   } catch (err) {
+    if (err instanceof BookingError) return jsonError(err.message, err.status);
     logger.error("ai create failed", { event: "ai_create_failed", userId: u.id, err });
     return jsonError(
       isHold

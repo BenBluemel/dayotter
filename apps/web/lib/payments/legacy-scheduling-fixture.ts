@@ -13,7 +13,17 @@ export async function withPreResourceSchedulingSchema<T>(seed: () => Promise<T>)
       schema.eventTypes,
       ["resourceConfigurationRevision", "resourceAdmissionEpoch", "requiresHost"],
     ],
-    [schema.bookings, ["schedulingPlan", "allocationRevision"]],
+    [schema.paymentAttempts, ["schedulingPlan", "schedulingDurationMinutes"]],
+    [
+      schema.bookings,
+      [
+        "schedulingPlan",
+        "allocationRevision",
+        "schedulingAttemptId",
+        "creationOperationKey",
+        "creationFingerprint",
+      ],
+    ],
   ] as const) {
     const columns = (table as unknown as Record<symbol, Record<string, unknown>>)[key]!;
     for (const name of names) {

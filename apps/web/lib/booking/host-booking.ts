@@ -1,9 +1,17 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { primaryOrg } from "@/lib/billing/entitlements";
 import { writeBookingToCalendar } from "@/lib/calendar/host-calendar";
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, schema } from "@dayotter/db";
-import { BookingError } from "./booking-logic";
+import {
+  allocateBookingResources,
+  and,
+  eq,
+  getDb,
+  schema,
+  sql,
+  withResourceTransaction,
+} from "@dayotter/db";
+import { BookingError, mapInsertError } from "./booking-logic";
 import { calendarLocationFields } from "./event-type-input";
 import type { LocationTypeValue } from "./event-type-input";
 import { PERSONAL_EVENT_TYPE_SLUG } from "./personal-event-type";
@@ -16,6 +24,13 @@ import {
   scheduleOverflowCheck,
   scheduleScribe,
 } from "./reminders";
+
+import { canonicalJson } from "../payments/attempt-terms";
+import {
+  captureSchedulingPlan,
+  lockPersonAdmission,
+  rejectManagedRecurrence,
+} from "./resource-acceptance";
 
 const PERSONAL_SLUG = PERSONAL_EVENT_TYPE_SLUG;
 
@@ -55,6 +70,7 @@ export async function getOrCreatePersonalEventType(
 
 export interface HostBookingInput {
   userId: string;
+  requestId?: string;
   title: string;
   start: Date;
   end: Date;
@@ -91,6 +107,25 @@ export async function createHostBooking(
   input: HostBookingInput,
 ): Promise<HostBookingResult | null> {
   const db = getDb();
+  const fingerprint = createHash("sha256")
+    .update(
+      canonicalJson({
+        ...input,
+        start: input.start.toISOString(),
+        end: input.end.toISOString(),
+        requestId: undefined,
+      }),
+    )
+    .digest("hex");
+  const operationKey = `host-booking:${input.userId.toLowerCase()}:${input.requestId?.toLowerCase() ?? fingerprint}`;
+  const previous = await db.query.bookings.findFirst({
+    where: eq(schema.bookings.creationOperationKey, operationKey),
+  });
+  if (previous) {
+    if (previous.creationFingerprint !== fingerprint)
+      throw new BookingError("This request was already used for another appointment", 409);
+    return { uid: previous.uid, meetingUrl: previous.meetingUrl ?? undefined };
+  }
   const org = await primaryOrg(input.userId);
   if (!org) return null;
 
@@ -114,64 +149,92 @@ export async function createHostBooking(
 
   const uid = randomUUID();
   const attendees = (input.attendees ?? []).filter((a) => a.email.includes("@"));
-  const booking = await db.transaction(async (tx) => {
-    // Host creation has no payment collection workflow. A commercial service
-    // must have an authoritative zero-cash quote, just like the public path.
-    const [service] = await tx
-      .select()
-      .from(schema.eventTypes)
-      .where(eq(schema.eventTypes.id, eventTypeId!))
-      .for("share");
-    if (!service || service.organizationId !== org.id || service.ownerId !== input.userId)
-      throw new BookingError("Event type not found", 404);
-    if (!commercial && ((service.price ?? 0) !== 0 || !service.isPrivate || service.isActive))
-      throw new BookingError("Personal booking configuration requires review", 409);
-    const quote = commercial
-      ? await quoteAppointmentPrice(
-          {
-            organizationId: org.id,
-            eventTypeId: service.id,
-            appointmentStartsAt: input.start,
-            settlement: "cash",
-          },
-          tx,
-        )
-      : null;
-    if (quote && quote.amountToCollect > 0)
-      throw new BookingError("A payment is required; book through the public checkout", 402);
-    if (quote && quote.basePrice > 0 && input.recurrenceUid)
-      throw new BookingError("Commercial recurring checkout is not supported yet", 409);
-    const [row] = await tx
-      .insert(schema.bookings)
-      .values({
-        organizationId: org.id,
-        eventTypeId: service.id,
-        hostId: input.userId,
-        title: input.title,
-        description: input.notes,
-        startsAt: input.start,
-        endsAt: input.end,
-        timezone: input.timezone,
-        status: "confirmed",
-        locationType: input.location ?? null,
-        location: input.locationDetail ?? null,
-        recurrenceUid: input.recurrenceUid ?? null,
-        uid,
-      })
-      .returning();
-    if (!row) throw new BookingError("Couldn't create booking", 500);
-    if (quote) await persistBookingPricingSnapshot(row.id, quote, tx);
-    if (attendees.length)
-      await tx.insert(schema.bookingAttendees).values(
-        attendees.map((a) => ({
-          bookingId: row.id,
-          email: a.email,
-          name: a.name ?? null,
+  let replayed = false;
+  let booking: typeof schema.bookings.$inferSelect;
+  try {
+    booking = await withResourceTransaction(db, async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operationKey}))`);
+      const [previous] = await tx
+        .select()
+        .from(schema.bookings)
+        .where(eq(schema.bookings.creationOperationKey, operationKey));
+      if (previous) {
+        if (previous.creationFingerprint !== fingerprint)
+          throw new BookingError("This request was already used for another appointment", 409);
+        replayed = true;
+        return previous;
+      }
+      // Host creation has no payment collection workflow. A commercial service
+      // must have an authoritative zero-cash quote, just like the public path.
+      const [service] = await tx
+        .select()
+        .from(schema.eventTypes)
+        .where(eq(schema.eventTypes.id, eventTypeId!))
+        .for("share");
+      if (!service || service.organizationId !== org.id || service.ownerId !== input.userId)
+        throw new BookingError("Event type not found", 404);
+      if (!commercial && ((service.price ?? 0) !== 0 || !service.isPrivate || service.isActive))
+        throw new BookingError("Personal booking configuration requires review", 409);
+      rejectManagedRecurrence(service, Boolean(input.recurrenceUid));
+      const duration = (input.end.getTime() - input.start.getTime()) / 60_000;
+      const schedulingPlan = await captureSchedulingPlan(tx, service, duration, input.userId);
+      await lockPersonAdmission(tx, [input.userId]);
+      const quote = commercial
+        ? await quoteAppointmentPrice(
+            {
+              organizationId: org.id,
+              eventTypeId: service.id,
+              appointmentStartsAt: input.start,
+              settlement: "cash",
+            },
+            tx,
+          )
+        : null;
+      if (quote && quote.amountToCollect > 0)
+        throw new BookingError("A payment is required; book through the public checkout", 402);
+      if (quote && quote.basePrice > 0 && input.recurrenceUid)
+        throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+      const [row] = await tx
+        .insert(schema.bookings)
+        .values({
+          organizationId: org.id,
+          eventTypeId: service.id,
+          hostId: input.userId,
+          title: input.title,
+          description: input.notes,
+          startsAt: input.start,
+          endsAt: input.end,
           timezone: input.timezone,
-        })),
-      );
-    return row;
-  });
+          status: "confirmed",
+          locationType: input.location ?? null,
+          location: input.locationDetail ?? null,
+          recurrenceUid: input.recurrenceUid ?? null,
+          uid,
+          schedulingPlan,
+          allocationRevision: schedulingPlan ? 1 : null,
+          creationOperationKey: schedulingPlan ? operationKey : null,
+          creationFingerprint: schedulingPlan ? fingerprint : null,
+        })
+        .returning();
+      if (!row) throw new BookingError("Couldn't create booking", 500);
+      if (quote) await persistBookingPricingSnapshot(row.id, quote, tx);
+      if (attendees.length)
+        await tx.insert(schema.bookingAttendees).values(
+          attendees.map((a) => ({
+            bookingId: row.id,
+            email: a.email,
+            name: a.name ?? null,
+            timezone: input.timezone,
+          })),
+        );
+      if (schedulingPlan)
+        await allocateBookingResources(tx, row.id, "staff_creation", input.userId);
+      return row;
+    });
+  } catch (error) {
+    mapInsertError(error);
+  }
+  if (replayed) return { uid: booking.uid, meetingUrl: booking.meetingUrl ?? undefined };
 
   // Calendar write (best-effort) + record the reference for later move/delete.
   let meetingUrl: string | undefined;

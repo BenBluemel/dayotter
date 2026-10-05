@@ -1,5 +1,7 @@
+import { logger } from "@dayotter/core";
 import { type Database, and, eq, getDb, inArray, isNull, schema } from "@dayotter/db";
 import type Stripe from "stripe";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import { BookingError, createBooking } from "../booking/create-booking";
 import {
   type PaymentAttempt,
@@ -31,6 +33,17 @@ export async function requirePaymentReview(
       (attempt.checkoutSessionId || attempt.successFacts || attempt.bookingId)
     )
       return;
+    if (!attempt.bookingId)
+      await tx
+        .update(schema.paymentReviewActions)
+        .set({ state: "failed", resolvedAt: new Date() })
+        .where(
+          and(
+            eq(schema.paymentReviewActions.attemptId, attempt.id),
+            eq(schema.paymentReviewActions.method, "retry"),
+            eq(schema.paymentReviewActions.state, "active"),
+          ),
+        );
     await tx
       .update(schema.paymentAttempts)
       .set({
@@ -128,7 +141,6 @@ export async function fulfillObservedPayment(attemptId: string, db: Database = g
   ) {
     return { uid: null, pending: true, state: attempt.state };
   }
-  const terms = decodeAttempt(attempt);
   await db
     .update(schema.paymentAttempts)
     .set({ state: "fulfilling" })
@@ -140,6 +152,7 @@ export async function fulfillObservedPayment(attemptId: string, db: Database = g
       ),
     );
   try {
+    const terms = decodeAttempt(attempt);
     const result = await createBooking({
       ...terms.input,
       paymentAttemptId: attempt.id,
@@ -164,12 +177,18 @@ export async function fulfillObservedPayment(attemptId: string, db: Database = g
       });
       if (booking) return { uid: booking.uid, pending: false, state: "fulfilled" as const };
     }
-    if (
+    if (err instanceof ResourceInvariantError) {
+      logger.error("Resource scheduling invariant requires technical review", {
+        event: "resource_invariant_review",
+        attemptId: attempt.id,
+        identity: err.identity,
+      });
+      await requirePaymentReview(attempt.id, "resource_invariant_requires_review", db);
+    } else if (
       (err instanceof BookingError && err.status < 500) ||
       err instanceof PaymentContradictionError
     ) {
-      // No ambiguous best-effort refund here. The paid obligation remains visible;
-      // durable compensation and financial resolution belong to Slice 4.
+      // A failed booking leaves the verified capture owed until an authorized resolution.
       await requirePaymentReview(attempt.id, "booking_obligation_requires_review", db);
     } else {
       await db
@@ -191,6 +210,7 @@ export async function fulfillObservedPayment(attemptId: string, db: Database = g
       uid: null,
       pending: true,
       state:
+        err instanceof ResourceInvariantError ||
         (err instanceof BookingError && err.status < 500) ||
         err instanceof PaymentContradictionError
           ? ("requires_review" as const)

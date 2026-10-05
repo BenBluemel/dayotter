@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import { fixtureAttempt, fixturePaidSession } from "./attempt-fixtures";
 import { type PaymentAttempt, decodeAttempt } from "./attempt-terms";
 
@@ -80,4 +81,23 @@ it("browser visits do not establish success and transient reads remain retryable
   });
   mocks.retrieve.mockRejectedValue(new Error("Stripe unavailable"));
   await expect(fulfillCheckout("cs_saved")).rejects.toThrow("Stripe unavailable");
+});
+
+it("browser resource invariants enter technical review without Redis or refunds", async () => {
+  mocks.reconcile.mockRejectedValue(
+    new ResourceInvariantError(
+      "resource_plan_completeness_violation",
+      new Error("Corrupted scheduling custody"),
+    ),
+  );
+  await expect(fulfillCheckout("cs_saved")).resolves.toMatchObject({
+    uid: null,
+    pending: true,
+    state: "requires_review",
+  });
+  expect(mocks.review).toHaveBeenCalledWith(
+    mocks.attempt!.id,
+    "resource_invariant_requires_review",
+  );
+  expect(mocks.claim).not.toHaveBeenCalled();
 });
