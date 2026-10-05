@@ -5,6 +5,7 @@ type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 export type ResourceErrorIdentity =
   | "resource_capacity_conflict"
   | "resource_disabled"
+  | "resource_closed"
   | "resource_adoption_required"
   | "resource_plan_completeness_violation"
   | "resource_scope_violation"
@@ -13,6 +14,7 @@ export type ResourceErrorIdentity =
 const states: Record<ResourceErrorIdentity, string> = {
   resource_capacity_conflict: "23P01",
   resource_disabled: "23514",
+  resource_closed: "23514",
   resource_adoption_required: "23514",
   resource_plan_completeness_violation: "23514",
   resource_scope_violation: "23514",
@@ -46,6 +48,7 @@ export function classifyResourceError(
         category: [
           "resource_capacity_conflict",
           "resource_disabled",
+          "resource_closed",
           "resource_adoption_required",
         ].includes(identity)
           ? "conflict"

@@ -512,6 +512,13 @@
       "when": 1791084786673,
       "tag": "0072_resource_booking_acceptance",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1791236454621,
+      "tag": "0073_resource_availability",
+      "breakpoints": true
     }
   ]
 }

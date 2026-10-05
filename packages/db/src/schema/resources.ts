@@ -6,6 +6,7 @@ import {
   foreignKey,
   index,
   integer,
+  jsonb,
   pgTable,
   text,
   timestamp,
@@ -38,6 +39,16 @@ export interface AcceptedSchedulingPlan {
   minimumGapMinutes: number;
 }
 
+/** Resource-owned hours use the existing Schedule rule/override shape.
+ * NULL means unrestricted; an explicit schedule with no windows means closed.
+ * There is no person ownership or calendar-conflict identity here.
+ */
+export interface ResourceOpeningHours {
+  timezone: string;
+  rules: { dayOfWeek: number; startTime: string; endTime: string }[];
+  overrides: { date: string; startTime: string | null; endTime: string | null }[];
+}
+
 export const resources = pgTable(
   "resources",
   {
@@ -48,6 +59,7 @@ export const resources = pgTable(
     name: text("name").notNull(),
     capacity: integer("capacity").notNull().default(1),
     enabled: boolean("enabled").notNull().default(true),
+    openingHours: jsonb("opening_hours").$type<ResourceOpeningHours>(),
     allocationVersion: bigint("allocation_version", { mode: "number" }).notNull().default(0),
     ...timestamps,
   },

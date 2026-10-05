@@ -1,6 +1,6 @@
 # Resource scheduling: proposed architecture
 
-**Status: R1 foundation and R2 creation/paid acceptance implemented locally; real resource rollout remains inactive.**
+**Status: R1 foundation, R2 creation/paid acceptance and Slice 3 advisory resource availability implemented locally; real resource rollout remains inactive.**
 Original repository archaeology against validated/public Slice 7,
 commit `6b2796e05f1ff2bdea13c6bddee04c49e07e6879`, tree
 `e87a2e067395c717f2301faf07efd36448f98c2f`, inspected 2026-10-03.
@@ -598,19 +598,20 @@ If B also needs a ten-minute before buffer, its appointment cannot begin before
 and then apply the candidate's buffers again indiscriminately: calculate the
 candidate resource interval once and compare it with stored claim intervals.
 
-Retain current working-window semantics: the appointment fits opening hours;
-buffers may extend them. Changing this to require all setup/cleanup inside
-opening hours would be an explicit later policy change, not implicit allocator math.
+Retain current service working-window semantics: the appointment fits service hours;
+buffers may extend those hours. Slice 3 adds a separate, explicit optional resource
+opening-hours restriction: the complete resource interval, including setup/cleanup
+buffers, must fit that restriction. NULL resource hours impose no extra restriction.
 
 ## 10. Service schedules, availability and host-free consumers
 
 ### V1 opening-hour boundary and strict resolution
 
-V1 does NOT independently schedule Resources. Opening hours belong to the Event
-Type/service. Resource peak capacity filters service-generated candidates;
-multiple Resources have no separate hours and capacity two has no individual
-unit calendars. Later resource-specific hours should reuse/intersect the existing
-schedule abstraction, never introduce another scheduling engine.
+Service schedules still generate the candidate grid. Slice 3 adds optional
+resource-owned opening hours using the same `timezone`, weekly `rules` and date
+`overrides` abstraction, without person ownership or unit calendars. Resource peak
+capacity and explicit resource hours intersect service-generated candidates; a
+capacity-two resource shares one hours policy across both units.
 
 Resource-only services require an explicit schedule ID. Validate that exact row,
 owner/organization authorization and IANA timezone; capture the resolved ID,
@@ -1415,3 +1416,75 @@ configuration barriers and diagnostic corruption injection in PostgreSQL 17.
 Capacity/final-set authority remains the R1/0071 foundation suite; no TypeScript
 capacity algorithm exists. API callers remain resource-transparent. Unmanaged
 services create NULL plans and no claims, retaining existing settlement behavior.
+
+## Slice 3 implementation checkpoint: advisory resource availability
+
+The actual request path is SlotPicker/web/mobile/embed clients →
+`/api/availability/[eventTypeId]`, API-key clients →
+`/api/v1/event-types/[id]/availability`, and the public booking assistant →
+`getEventTypeAvailability` → `eventTypeHostSlots`/`hostSlots` → the pure person
+availability engine → `filterResourceAvailability`. Recommendations receive the
+filtered list. The authenticated host troubleshooter applies the same filter and
+reports resource-blocked counts/reasons without exposing claims or resource IDs.
+Personal focus recommendations remain person-only, rather than inventing a resource
+service identity.
+
+The resource filter is a read-only REPEATABLE READ transaction with two data
+queries, independent of candidate count. The first reads this service's requirements,
+resource scope/enabled/capacity, and eligibility proof. Staged requirements without
+an admission epoch and unsupported modes offer no slots. Malformed scope, schedule
+custody, quantities or opening-hour configuration fail closed with established
+technical invariant identities; disabled/impossible capacity offers no slots. A
+configuration revision change since person candidates were generated offers no
+slots rather than combining definitions.
+
+The second query selects only this organization's required resource IDs and
+unreleased claims whose stored `[starts_at, ends_at)` overlaps the complete
+candidate window, including candidate buffers. It clips/group-sums endpoints and
+computes weighted occupancy segments exactly as `resource_peak` does. Unreleased
+pending, confirmed, completed and no-show claims consume capacity; released claims
+do not. No booking-status join erases historical custody. Stored claims are already
+buffered and are not padded again. Each candidate subtracts its current before
+buffer and adds its current after buffer once, in elapsed UTC minutes. Binary
+search over disjoint blocked/open segments checks every requirement. Quantities
+are compared with the current capacity throughout the interval, not summed across
+non-overlapping claims. SQL outward rounding of occupancy endpoints preserves
+sub-millisecond conflicts for the existing millisecond-grid candidates.
+The existing partial GiST `resource_claim_range_idx` supports resource ID plus
+`tstzrange(...) && ...` with `released_at IS NULL`; no additional index is needed.
+Public windows remain bounded at 62 days and the resource-expanded evaluation is
+bounded at 64 days; extreme configurations that exceed that bound offer no slots.
+
+Migration 0073 adds nullable `resources.opening_hours`. NULL means unrestricted;
+explicit empty rules/overrides mean closed. The durable representation is the
+existing Schedule shape, owned by the resource itself: IANA timezone, weekday
+0–6, minute-precision `HH:mm`/`HH:mm:00` windows, and unique ISO-date overrides.
+An override replaces the entire day's weekly rules; paired NULL times close it.
+Same-day windows require end > start (24:00 is permitted as the end); overnight
+hours are represented as windows on both days. Adjacent/overlapping windows merge,
+while gaps cannot cover an appointment. Invalid documents are rejected by a named
+invariant at configuration and again at read time.
+
+`resource_open_windows` resolves local dates/clock boundaries in PostgreSQL for
+both the predictor and the existing claim INSERT guard. This keeps independent
+resource hours out of staff calendars and avoids different DST interpretations
+between display and acceptance. PostgreSQL's standard-time choice applies to
+ambiguous fall-back boundaries; nonexistent spring-forward boundaries use its
+forward interpretation, and collapsed/inverted windows offer no capacity. Buffers
+remain elapsed UTC intervals. Changes to hours use the existing resource-row fence;
+existing plans/claims are never rewritten or automatically repaired. Outside hours
+is the named expected conflict `resource_closed`, so paid acceptance retains the
+same durable owed-obligation review behavior as capacity/disabled conflicts.
+
+Availability acquires no admission/resource row locks, creates no claims or holds,
+and uses no Redis resource capacity state. It is advisory: a displayed candidate
+can become stale; Slice 2's whole-transaction admission and sorted resource fences
+still reject the race loser. Booking's person revalidation continues to use accepted
+terms; paid fulfillment retains frozen resource requirements and buffers.
+The database allocator remains authoritative for all creation paths.
+
+This slice does not implement host-free consumers, resource moves/cancel/reject,
+teams/groups, recurrence, UI, or legacy reconciliation. Live activation remains
+closed until the remaining lifecycle/consumer work and operational readiness pass.
+Legacy Redis checkout sessions still require draining/operator review before
+activation; this slice does not perform that work.

@@ -10,6 +10,7 @@ import {
 import { and, eq, getDb, gte, inArray, lte, ne, schema, sql } from "@dayotter/db";
 import { DateTime } from "luxon";
 import { recommendedSlots } from "./rank-slots";
+import { filterResourceAvailability } from "./resource-availability";
 
 /** Keep only group slots that still have a free seat. Pure - unit-tested. */
 export function filterOpenGroupSlots(
@@ -122,6 +123,22 @@ export function eventConstraints(eventType: EventTypeRow): EventConstraints {
   };
 }
 
+/** Reject corrupt timing before an engine loop can stop advancing. */
+function safeAvailabilityEvent(event: EventConstraints): boolean {
+  return (
+    Number.isSafeInteger(event.durationMinutes) &&
+    event.durationMinutes > 0 &&
+    Number.isSafeInteger(event.slotIntervalMinutes ?? event.durationMinutes) &&
+    (event.slotIntervalMinutes ?? event.durationMinutes) > 0 &&
+    [
+      event.bufferBeforeMinutes,
+      event.bufferAfterMinutes,
+      event.minimumNoticeMinutes,
+      event.offsetStartMinutes ?? 0,
+    ].every((v) => Number.isSafeInteger(v) && v >= 0)
+  );
+}
+
 /** Minutes of free time to enforce around the host's own bookings (0 = none). */
 function gapFor(eventType: EventTypeRow): number {
   return eventType.minimumGapMinutes ?? 0;
@@ -172,6 +189,8 @@ export async function hostSlots(
   /** For a group event type: don't let its own shared-slot bookings self-block. */
   ignoreGroupEventTypeId?: string,
 ): Promise<Slot[]> {
+  if (!safeAvailabilityEvent(event) || !Number.isSafeInteger(gapMinutes) || gapMinutes < 0)
+    return [];
   const db = getDb();
 
   // Schedule + calendar connections don't depend on each other - fetch together.
@@ -428,7 +447,10 @@ export async function troubleshootHostDay(
   event: EventConstraints,
   date: Date,
   gapMinutes = 0,
-): Promise<DayDiagnosis | null> {
+  eventType?: EventTypeRow,
+): Promise<(DayDiagnosis & { blockedByResources?: number }) | null> {
+  if (!safeAvailabilityEvent(event) || !Number.isSafeInteger(gapMinutes) || gapMinutes < 0)
+    return null;
   const db = getDb();
   const schedule = scheduleId
     ? await db.query.schedules.findFirst({
@@ -502,7 +524,24 @@ export async function troubleshootHostDay(
     now: new Date(),
   };
 
-  return explainDay(input);
+  const diagnosis = explainDay(input);
+  if (!eventType) return diagnosis;
+  const candidates = computeAvailability(input);
+  const filtered = await filterResourceAvailability(eventType, candidates);
+  const blockedByResources = candidates.length - filtered.length;
+  if (!blockedByResources) return diagnosis;
+  return {
+    ...diagnosis,
+    bookableSlots: filtered.length,
+    blockedByResources,
+    reasons: [
+      ...diagnosis.reasons.filter((reason) => !reason.endsWith("available.")),
+      `${blockedByResources} slot${blockedByResources === 1 ? " is" : "s are"} unavailable because required resources lack capacity or opening hours.`,
+      ...(filtered.length
+        ? [`${filtered.length} slot${filtered.length === 1 ? "" : "s"} available.`]
+        : []),
+    ],
+  };
 }
 
 export async function eventTypeHostIds(
@@ -615,6 +654,15 @@ export async function getEventTypeAvailability(
     durationOverride && isAllowedDuration(eventType, durationOverride)
       ? durationOverride
       : undefined;
+  if (
+    !safeAvailabilityEvent({
+      ...eventConstraints(eventType),
+      durationMinutes: duration ?? eventType.durationMinutes,
+    }) ||
+    !Number.isSafeInteger(eventType.minimumGapMinutes) ||
+    eventType.minimumGapMinutes < 0
+  )
+    return [];
   // Member selection only narrows a collective team event; ignore it otherwise.
   const selection = eventType.schedulingType === "collective" ? selectedHostIds : undefined;
   const { perHost } = await eventTypeHostSlots(
@@ -624,7 +672,7 @@ export async function getEventTypeAvailability(
     duration,
     selection,
   );
-  return combineHostSlots(perHost, eventType.schedulingType);
+  return filterResourceAvailability(eventType, combineHostSlots(perHost, eventType.schedulingType));
 }
 
 /** The host's real commitments (own bookings + external busy + focus blocks) in a window. */

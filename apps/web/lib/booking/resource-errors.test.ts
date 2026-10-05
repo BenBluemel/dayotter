@@ -9,10 +9,11 @@ describe("resource database diagnostics and transaction retries", () => {
       }),
     ).toEqual({ category: "conflict", identity: "resource_capacity_conflict" });
     expect(classifyResourceError({ code: "23P01", constraint: "bookings_no_overlap" })).toBeNull();
-    expect(classifyResourceError({ code: "23514", constraint: "resource_disabled" })).toEqual({
-      category: "conflict",
-      identity: "resource_disabled",
-    });
+    for (const constraint of ["resource_disabled", "resource_closed"])
+      expect(classifyResourceError({ code: "23514", constraint })).toEqual({
+        category: "conflict",
+        identity: constraint,
+      });
   });
   it("keeps corruption and composite scope failures distinct from contention", () => {
     for (const constraint of [
@@ -61,7 +62,11 @@ describe("resource database diagnostics and transaction retries", () => {
     expect(failed).toHaveBeenCalledTimes(3);
   });
   it("never retries capacity contention or invariant failure", async () => {
-    for (const constraint of ["resource_disabled", "resource_plan_completeness_violation"]) {
+    for (const constraint of [
+      "resource_disabled",
+      "resource_closed",
+      "resource_plan_completeness_violation",
+    ]) {
       const transaction = vi.fn().mockRejectedValue({ code: "23514", constraint });
       await expect(
         withResourceTransaction({ transaction } as unknown as Database, async () => null),
