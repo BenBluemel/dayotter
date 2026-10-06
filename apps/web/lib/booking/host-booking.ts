@@ -178,7 +178,7 @@ export async function createHostBooking(
       rejectManagedRecurrence(service, Boolean(input.recurrenceUid));
       const duration = (input.end.getTime() - input.start.getTime()) / 60_000;
       const schedulingPlan = await captureSchedulingPlan(tx, service, duration, input.userId);
-      await lockPersonAdmission(tx, [input.userId]);
+      await lockPersonAdmission(tx, (schedulingPlan?.requiresHost ?? true) ? [input.userId] : []);
       const quote = commercial
         ? await quoteAppointmentPrice(
             {
@@ -245,6 +245,7 @@ export async function createHostBooking(
       start: input.start,
       end: input.end,
       timezone: input.timezone,
+      transparency: booking.requiresHost ? "opaque" : "transparent",
       attendees: attendees.map((a) => ({ email: a.email, name: a.name })),
       ...calendarLocationFields(input.location, input.locationDetail),
     });
@@ -277,7 +278,7 @@ export async function createHostBooking(
     input.start,
     await reminderOffsetsForHost(input.userId),
   );
-  if (await hostWantsOverflowNotice(input.userId)) {
+  if (booking.requiresHost && (await hostWantsOverflowNotice(input.userId))) {
     await scheduleOverflowCheck(booking.id, input.end);
   }
   if (await hostWantsScribe(input.userId)) {

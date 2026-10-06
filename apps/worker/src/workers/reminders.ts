@@ -93,7 +93,12 @@ export function startRemindersWorker(): Worker<ReminderJob> {
       // few minutes behind - the "quick snap at the end of a meeting" an EA does.
       if (reminder.kind === "overflow") {
         const OVERFLOW_TIGHT_MS = 20 * 60_000;
-        if (booking.hostId && booking.status !== "cancelled" && booking.status !== "rejected") {
+        if (
+          booking.requiresHost &&
+          booking.hostId &&
+          booking.status !== "cancelled" &&
+          booking.status !== "rejected"
+        ) {
           const prefs = await db.query.userPreferences.findFirst({
             where: eq(schema.userPreferences.userId, booking.hostId),
             columns: { overflowNotifyEnabled: true },
@@ -102,6 +107,7 @@ export function startRemindersWorker(): Worker<ReminderJob> {
             const next = await db.query.bookings.findFirst({
               where: and(
                 eq(schema.bookings.hostId, booking.hostId),
+                eq(schema.bookings.requiresHost, true),
                 eq(schema.bookings.status, "confirmed"),
                 gt(schema.bookings.startsAt, booking.endsAt),
                 lt(

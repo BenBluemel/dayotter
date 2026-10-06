@@ -134,6 +134,7 @@ export async function inboxData(userId: string): Promise<InboxData> {
       db.query.bookings.findMany({
         where: and(
           eq(schema.bookings.hostId, userId),
+          eq(schema.bookings.requiresHost, true),
           eq(schema.bookings.status, "confirmed"),
           gte(schema.bookings.startsAt, now),
         ),

@@ -10,9 +10,15 @@ export async function captureSchedulingPlan(
   hostId: string,
   frozen?: AcceptedSchedulingPlan | null,
 ) {
-  if (!service.resourceAdmissionEpoch) return frozen ?? null;
+  if (!service.resourceAdmissionEpoch) {
+    if (service.requiresHost === false)
+      throw new BookingError(
+        "Resource scheduling must be activated before booking this service",
+        409,
+      );
+    return frozen ?? null;
+  }
   if (
-    !service.requiresHost ||
     service.schedulingType !== "individual" ||
     service.maxAttendees !== 1 ||
     service.recurringCount !== 1

@@ -255,7 +255,8 @@ async function createBookingOnce(
   if (frozenScheduling)
     eventType = {
       ...eventType,
-      ownerId: frozenScheduling.requiredHostIds[0]!,
+      ownerId: frozenScheduling.scheduleOwnerId,
+      requiresHost: frozenScheduling.requiresHost,
       scheduleId: frozenScheduling.scheduleId,
       durationMinutes: frozenScheduling.durationMinutes,
       durationOptions: [frozenScheduling.durationMinutes],
@@ -532,11 +533,16 @@ async function createBookingOnce(
       );
       await lockPersonAdmission(
         tx,
-        eventType.schedulingType === "collective" ? hostIds : [host.id],
+        (schedulingPlan?.requiresHost ?? true)
+          ? eventType.schedulingType === "collective"
+            ? hostIds
+            : [host.id]
+          : [],
       );
       // Public primary-person admission uses the same predicate after waiting
       // for other creators, including ordinary bookings competing with managed ones.
-      if (!isGroup) {
+      const requiresHost = schedulingPlan?.requiresHost ?? true;
+      if (!isGroup && requiresHost) {
         const before = schedulingPlan?.bufferBeforeMinutes ?? eventType.bufferBeforeMinutes;
         const after = schedulingPlan?.bufferAfterMinutes ?? eventType.bufferAfterMinutes;
         const candidateFrom = new Date(start.getTime() - before * 60_000);
@@ -548,6 +554,7 @@ async function createBookingOnce(
           .where(
             and(
               eq(schema.bookings.hostId, host.id),
+              eq(schema.bookings.requiresHost, true),
               inArray(schema.bookings.status, ["pending", "confirmed"]),
               sql`${schema.bookings.startsAt} - ${gap} * interval '1 minute' < ${candidateTo}`,
               sql`${schema.bookings.endsAt} + ${gap} * interval '1 minute' > ${candidateFrom}`,
@@ -564,7 +571,7 @@ async function createBookingOnce(
         eventType.weeklyBookingLimit != null ||
         eventType.monthlyBookingLimit != null ||
         eventType.yearlyBookingLimit != null ||
-        (!isGroup && Boolean(focusPrefs?.adaptiveAvailability));
+        (!isGroup && requiresHost && Boolean(focusPrefs?.adaptiveAvailability));
       if (capApplies) {
         const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const at = DateTime.fromJSDate(start).setZone(zone);
@@ -572,7 +579,7 @@ async function createBookingOnce(
           .setZone(host.timezone || "UTC")
           .startOf("week")
           .toISODate();
-        const keys: string[] = [`${host.id}:${legacyWeek}`];
+        const keys: string[] = requiresHost ? [`${host.id}:${legacyWeek}`] : [];
         for (const [unit, limit] of [
           ["day", eventType.dailyBookingLimit],
           ["week", eventType.weeklyBookingLimit],
@@ -583,7 +590,7 @@ async function createBookingOnce(
             keys.push(
               `service-cap:${eventType.id}:${zone}:${unit}:${at.startOf(unit).toISODate()}`,
             );
-        if (!isGroup && focusPrefs?.adaptiveAvailability)
+        if (!isGroup && requiresHost && focusPrefs?.adaptiveAvailability)
           keys.push(`person-cap:${host.id}:${zone}:day:${at.startOf("day").toISODate()}`);
         for (const key of keys.sort())
           await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${key}))`);
@@ -618,7 +625,7 @@ async function createBookingOnce(
       // Focus protection (host-wide cap across all event types). Backstops the
       // availability-level slot hiding for group events / direct API / races, so
       // an overloaded day can't be pushed past the host's daily meeting limit.
-      if (!isGroup && focusPrefs?.adaptiveAvailability) {
+      if (!isGroup && requiresHost && focusPrefs?.adaptiveAvailability) {
         const cap = focusPrefs.maxMeetingsPerDay ?? 5;
         const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const day = DateTime.fromJSDate(start).setZone(zone);
@@ -630,6 +637,7 @@ async function createBookingOnce(
           .where(
             and(
               eq(schema.bookings.hostId, host.id),
+              eq(schema.bookings.requiresHost, true),
               inArray(schema.bookings.status, ["confirmed", "pending"]),
               gte(schema.bookings.startsAt, dayStart),
               lt(schema.bookings.startsAt, nextDay),

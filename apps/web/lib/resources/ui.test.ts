@@ -180,4 +180,42 @@ describe("native resource administration UI", () => {
     );
     expect(html).toMatch(/<fieldset disabled="" aria-label="Resource opening hours"/);
   });
+  it("Slice 6 shows default host attendance, resource-only explanation and accepted-booking policy", () => {
+    const html = render(
+      createElement(ResourceRequirementsEditor, {
+        organizationId: "org",
+        resources: [equipment],
+        service: {
+          id: "service",
+          title: "Light Therapy",
+          version: 1,
+          managed: false,
+          requirements: [],
+        },
+      }),
+    );
+    expect(html).toMatch(/type="checkbox"[^>]*checked=""/);
+    expect(html).toContain("Requires host availability");
+    expect(html).toContain("At least one resource is required");
+    expect(html).toContain("Existing bookings keep their accepted policy");
+  });
+  it("Slice 6 resource-only UI preserves the owner and cannot save empty requirements", () => {
+    const html = render(
+      createElement(ResourceRequirementsEditor, {
+        organizationId: "org",
+        resources: [equipment],
+        service: {
+          id: "service",
+          title: "Light Therapy",
+          version: 1,
+          managed: true,
+          requiresHost: false,
+          requirements: [],
+        },
+      }),
+    );
+    expect(html).not.toMatch(/type="checkbox"[^>]*checked=""/);
+    expect(html).toContain("host stays responsible and receives notifications");
+    expect(html).toMatch(/disabled=""[^>]*>Save requirements/);
+  });
 });

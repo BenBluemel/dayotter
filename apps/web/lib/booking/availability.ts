@@ -188,6 +188,7 @@ export async function hostSlots(
   excludeBookingId?: string,
   /** For a group event type: don't let its own shared-slot bookings self-block. */
   ignoreGroupEventTypeId?: string,
+  requiresHost = true,
 ): Promise<Slot[]> {
   if (!safeAvailabilityEvent(event) || !Number.isSafeInteger(gapMinutes) || gapMinutes < 0)
     return [];
@@ -204,12 +205,39 @@ export async function hostSlots(
           where: and(eq(schema.schedules.userId, userId), eq(schema.schedules.isDefault, true)),
           with: { availabilityRules: true, dateOverrides: true },
         }),
-    db.query.calendarConnections.findMany({
-      where: eq(schema.calendarConnections.userId, userId),
-      with: { calendars: true },
-    }),
+    requiresHost
+      ? db.query.calendarConnections.findMany({
+          where: eq(schema.calendarConnections.userId, userId),
+          with: { calendars: true },
+        })
+      : Promise.resolve([]),
   ]);
   if (!schedule) return [];
+  if (!requiresHost) {
+    if (schedule.userId !== userId) return [];
+    // Service hours still use the selected schedule. Personal commitments,
+    // focus/lunch/OOO/team rules and external calendars are attendance constraints.
+    return computeAvailability({
+      schedule: {
+        timezone: schedule.timezone,
+        rules: schedule.availabilityRules.map(({ dayOfWeek, startTime, endTime }) => ({
+          dayOfWeek,
+          startTime,
+          endTime,
+        })),
+        overrides: schedule.dateOverrides.map(({ date, startTime, endTime }) => ({
+          date,
+          startTime,
+          endTime,
+        })),
+      },
+      busy: [],
+      event,
+      rangeStart,
+      rangeEnd,
+      now: new Date(),
+    });
+  }
 
   const calendarIds = connections
     .flatMap((c) => c.calendars)
@@ -390,6 +418,9 @@ function busyBlocksFor(
   return getDb().query.busyBlocks.findMany({
     where: and(
       inArray(schema.busyBlocks.calendarId, calendarIds),
+      sql`NOT EXISTS (SELECT 1 FROM booking_references ref JOIN bookings b ON b.id=ref.booking_id
+        WHERE NOT b.requires_host AND ref.calendar_id=${schema.busyBlocks.calendarId}
+        AND ref.external_event_id=${schema.busyBlocks.externalEventId})`,
       excludeBookingId
         ? sql`NOT EXISTS (SELECT 1 FROM booking_references ref
         WHERE ref.booking_id=${excludeBookingId}::uuid AND ref.calendar_id=${schema.busyBlocks.calendarId}
@@ -412,6 +443,7 @@ function bookingsFor(
   return getDb().query.bookings.findMany({
     where: and(
       inArray(schema.bookings.hostId, hostIds),
+      eq(schema.bookings.requiresHost, true),
       // `pending` (opt-in) requests hold their slot too, so it isn't offered to
       // someone else while the host is still deciding (see the slot indexes).
       inArray(schema.bookings.status, ["confirmed", "pending"]),
@@ -487,10 +519,13 @@ export async function troubleshootHostDay(
   const rangeStart = DateTime.fromJSDate(date, { zone }).startOf("day").toJSDate();
   const rangeEnd = DateTime.fromJSDate(date, { zone }).endOf("day").toJSDate();
 
-  const connections = await db.query.calendarConnections.findMany({
-    where: eq(schema.calendarConnections.userId, userId),
-    with: { calendars: true },
-  });
+  const requiresHost = eventType?.requiresHost ?? true;
+  const connections = requiresHost
+    ? await db.query.calendarConnections.findMany({
+        where: eq(schema.calendarConnections.userId, userId),
+        with: { calendars: true },
+      })
+    : [];
   const calendarIds = connections
     .flatMap((c) => c.calendars)
     .filter((cal) => cal.checkForConflicts)
@@ -498,13 +533,15 @@ export async function troubleshootHostDay(
 
   const [busyRows, ownBookings, blocks, prefs, teamRuleRows] = await Promise.all([
     calendarIds.length ? busyBlocksFor(calendarIds, rangeStart, rangeEnd) : Promise.resolve([]),
-    bookingsFor([userId], rangeStart, rangeEnd),
-    timeBlocksFor(userId, rangeStart, rangeEnd),
-    getDb().query.userPreferences.findFirst({
-      where: eq(schema.userPreferences.userId, userId),
-      columns: { lunchEnabled: true, lunchStartMinute: true, lunchEndMinute: true },
-    }),
-    teamRulesFor(userId),
+    requiresHost ? bookingsFor([userId], rangeStart, rangeEnd) : Promise.resolve([]),
+    requiresHost ? timeBlocksFor(userId, rangeStart, rangeEnd) : Promise.resolve([]),
+    requiresHost
+      ? getDb().query.userPreferences.findFirst({
+          where: eq(schema.userPreferences.userId, userId),
+          columns: { lunchEnabled: true, lunchStartMinute: true, lunchEndMinute: true },
+        })
+      : Promise.resolve(null),
+    requiresHost ? teamRulesFor(userId) : Promise.resolve([]),
   ]);
 
   const teamBusy = teamRuleRows.length
@@ -615,6 +652,8 @@ export async function eventTypeHostSlots(
   const event = durationOverride ? { ...base, durationMinutes: durationOverride } : base;
   const gap = gapFor(eventType);
 
+  if (!eventType.requiresHost && eventType.resourceAdmissionEpoch <= 0)
+    return { hostIds: [], perHost: [] };
   if (eventType.ownerId) {
     const capacity = eventType.maxAttendees ?? 1;
     const isGroup = capacity > 1;
@@ -627,6 +666,7 @@ export async function eventTypeHostSlots(
       gap,
       undefined,
       isGroup ? eventType.id : undefined,
+      eventType.requiresHost,
     );
     if (isGroup) {
       const counts = await groupSlotCounts(eventType.id, rangeStart, rangeEnd);
@@ -729,7 +769,7 @@ export async function recommendSlotsForEventType(
   const eventType = await getDb().query.eventTypes.findFirst({
     where: eq(schema.eventTypes.id, eventTypeId),
   });
-  if (!eventType?.ownerId) return [];
+  if (!eventType?.ownerId || !eventType.requiresHost) return [];
 
   // Time-of-day scoring uses the governing schedule's timezone.
   const schedule = eventType.scheduleId

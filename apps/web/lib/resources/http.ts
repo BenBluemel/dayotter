@@ -21,7 +21,7 @@ export function configurationErrorResponse(error: unknown) {
       resource_adoption_required:
         "Existing bookings or payments prevent this change. Keep the current configuration and arrange an operator review.",
       resource_plan_completeness_violation:
-        "Check the opening hours and resource quantities. Requirements need an individual service with one host, one attendee, and no recurrence.",
+        "Check the opening hours and resource quantities. Requirements need an individual service with a responsible host, one attendee, and no recurrence. Resource-only services need at least one resource.",
       resource_scope_violation: "Choose resources and services belonging to this organization.",
       resource_claim_lifecycle_violation:
         "Existing bookings prevent this change. Keep the current configuration and arrange an operator review.",

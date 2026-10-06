@@ -17,6 +17,7 @@ export interface ResourceService {
   title: string;
   version: number;
   managed: boolean;
+  requiresHost?: boolean;
   requirements: { id: string; quantity: number }[];
 }
 export async function resourceRequest(url: string, method: string, body?: unknown) {
@@ -129,13 +130,16 @@ export function ResourceRequirementsEditor({
   service,
   resources,
 }: { organizationId: string; service: ResourceService; resources: ResourceOption[] }) {
+  const [requiresHost, setRequiresHost] = useState(service.requiresHost ?? true);
+  const [savedRequiresHost, setSavedRequiresHost] = useState(service.requiresHost ?? true);
   const [rows, setRows] = useState(service.requirements);
   const [version, setVersion] = useState(service.version);
   const [savedRows, setSavedRows] = useState(service.requirements);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
-  const dirty = JSON.stringify(rows) !== JSON.stringify(savedRows);
+  const dirty =
+    requiresHost !== savedRequiresHost || JSON.stringify(rows) !== JSON.stringify(savedRows);
   return (
     <Card>
       <CardHeader
@@ -163,8 +167,11 @@ export function ResourceRequirementsEditor({
                 eventTypeId: service.id,
                 version,
                 requirements: rows,
+                requiresHost,
               });
               const current = result.service as ResourceService;
+              setRequiresHost(current.requiresHost ?? true);
+              setSavedRequiresHost(current.requiresHost ?? true);
               setVersion(current.version);
               setRows(current.requirements);
               setSavedRows(current.requirements);
@@ -176,6 +183,26 @@ export function ResourceRequirementsEditor({
             }
           }}
         >
+          <div className="space-y-2">
+            <label className="flex items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                checked={requiresHost}
+                disabled={saving}
+                onChange={(e) => {
+                  setRequiresHost(e.target.checked);
+                  setSaved(false);
+                }}
+              />
+              Requires host availability
+            </label>
+            <p className="text-sm text-[var(--color-muted)]">
+              Turn off for a resource-only service. The host stays responsible and receives
+              notifications, but their other appointments do not block this service. At least one
+              resource is required. The selected schedule still sets service hours. Existing
+              bookings keep their accepted policy.
+            </p>
+          </div>
           <ResourceRequirementRows
             resources={resources}
             value={rows}
@@ -187,7 +214,7 @@ export function ResourceRequirementsEditor({
           />
           <FormError>{error}</FormError>
           <FormSuccess>{saved ? "Resource requirements saved." : null}</FormSuccess>
-          <Button type="submit" disabled={saving || !dirty}>
+          <Button type="submit" disabled={saving || !dirty || (!requiresHost && !rows.length)}>
             {saving ? "Saving…" : "Save requirements"}
           </Button>
           <p className="text-sm text-[var(--color-muted)]">

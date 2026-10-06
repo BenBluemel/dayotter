@@ -1,6 +1,6 @@
 # Resource scheduling: proposed architecture
 
-**Status: resource foundation, booking/paid acceptance, availability, lifecycle, and Slice 5 management UI implemented locally; real resource rollout remains inactive.**
+**Status: resource foundation, booking/paid acceptance, availability, lifecycle, Slice 5 management UI, and Slice 6 resource-only scheduling implemented locally; real resource rollout remains inactive.**
 Original repository archaeology against validated/public Slice 7,
 commit `6b2796e05f1ff2bdea13c6bddee04c49e07e6879`, tree
 `e87a2e067395c717f2301faf07efd36448f98c2f`, inspected 2026-10-03.
@@ -1616,11 +1616,183 @@ end or Redis TTL alone does not prove readiness. Prefer fresh DEV test service I
 to rewriting historical commitments. Disable the service to stop new admissions;
 do not erase claims or reset its epoch as rollback.
 
-All implemented managed services still require one owner-host. `requires_host=false`
-is rejected by SQL and application admission. Different equipment therefore does
-not let two services with the same required host overlap. The equipment-only PEMF
-example above remains proposed behavior, not completed Slice 5 functionality.
+At the launch-audit/Slice 5 checkpoint, all managed services still required the
+owner-host. Slice 6 below supersedes that limitation while preserving the
+launch-readiness operator boundaries.
 
 Migration 0074 corrects coupon restoration on pending booking decline: `rejected`
 and `cancelled` coupon bookings both require one durable restoration. It changes
 trigger functions only and performs no backfill or resource activation.
+
+## Slice 6: optional host attendance / resource-only services
+
+Slice 6 enables the existing `event_types.requires_host` scheduling policy. The
+provider remains the service owner and mandatory `bookings.host_id`: authorization,
+organization membership, approval recipient, calendar ownership, notifications,
+booking history, dashboards, financial routing, and reporting retain their existing
+identity. Equipment continues using the separate generic resource domain.
+
+The smallest durable change is `bookings.requires_host NOT NULL DEFAULT true`,
+set by PostgreSQL from the authoritative accepted scheduling plan. Old bookings
+remain attended. The existing plan already contained `requiresHost`, `requiredHostIds`,
+and `scheduleOwnerId`; resource-only plans now have `requiresHost=false`, no required
+person IDs, and the real owner as `scheduleOwnerId`. The separate field makes person
+indexes and normal booking reads efficient and keeps legacy NULL-plan bookings
+unambiguously attended. No host IDs become nullable and no helpers become accounts.
+
+Migration **0075_resource_only_services** adds the field, narrows the existing unique
+and exclusion person constraints to attended bookings, enables false attendance for
+supported individual services, and adds guards proving field/plan consistency and
+immutability. Deferred definition checks require at least one equipment requirement
+when attendance is disabled; atomic replacements can temporarily delete all rows.
+Historical migrations, claim allocation functions, admission census, resource fences,
+and financial guards remain intact. Fresh generation includes the Drizzle snapshot
+and journal entry.
+
+Resource-only slots reuse the pure availability engine with the service's selected
+schedule (or the existing default schedule, frozen to its resolved ID on acceptance).
+Weekly service hours, date overrides, timezone/DST handling, duration, slot cadence,
+notice, offset, booking window, and buffers still apply. Provider bookings, external
+busy calendars, personal/focus/travel blocks, lunch, out-of-office, adaptive personal
+meeting caps, and person team agreements are attendance inputs and are omitted.
+Service booking caps remain authoritative at acceptance and rescheduling, as before;
+resource-only service caps use the organization's business timezone, frozen in the
+plan. Resource availability retains its bounded batch sweep, capacity, weighted
+quantity, hours, setup/cleanup buffers, tenancy and definition-revision checks.
+
+Ordinary attended availability excludes resource-only bookings from personal busy
+inputs. Exact provider-event mirrors of resource-only bookings are excluded from
+person busy-cache reads, including the internal team conflict view. Restoring
+attendance while removing equipment invalidates prior candidate revisions rather
+than returning slots computed under the old attendance policy.
+
+Acceptance uses server-derived current policy for free, coupon, prepaid and staff/AI
+bookings; durable paid fulfillment uses the accepted attempt policy. Resource-only
+admission omits person locks/checks and adaptive person limits, retains service cap
+locks, and uses the unchanged final transactional resource allocation. Stale equipment
+availability still loses safely at acceptance. Provider/financial effects remain
+outside retriable database transactions. No resource holds are introduced.
+
+Moves use the booking's frozen attendance, owner, resolved schedule, duration,
+buffers, gap and equipment quantities. Current resource hours/state and service
+limits remain live checks. Failed movement rolls back the booking and all claims;
+mutable service attendance never changes an existing booking's person commitment.
+Pending rows already own their resource claims. Approval retains them and never adds
+person capacity to a resource-only booking. Decline/cancellation release claims and
+restore coupons/packages through the existing durable, idempotent decision path.
+No-show/completion retain finite resource history. Migration 0074's coupon-restoration
+fix remains untouched.
+
+Zero-cash, promotion/coupon, package and paid resource-only appointments share the
+existing settlement and resource-safe fulfillment path. Payment attempts freeze
+attendance along with resource terms; later service edits in either direction do
+not reinterpret checkout custody. Equipment contention after payment keeps verified
+payment success and enters the existing paid-unbooked review state. Legacy Redis
+checkout remains fail-closed after activation; draining/reconciliation is operator
+work and is not implemented here.
+
+Calendar events remain visible to the responsible provider but are written/moved as
+free time: Google `transparent`, Microsoft `showAs=free`, and CalDAV `TRANSP:TRANSPARENT`.
+Ordinary writes stay busy. Owner/customer email, SMS/queue reminders, follow-ups,
+workflows, approval visibility and history retain their identity and routing. Personal
+prep/travel reservations and automatic attendance-delay overflow notices are skipped
+for resource-only bookings. Manual administrative notices and opted-in owner recap
+visibility remain available. Calendar sync keeps its existing free-event handling;
+no provider calls are made while computing slots or accepting claims.
+
+Owners/admins configure **Requires host availability** beside equipment requirements
+in the existing Resources and individual booking-type editors. Default is checked.
+The explanation distinguishes responsibility from personal attendance, preserves
+service hours and existing bookings, and requires equipment. Requirements and policy
+save atomically using the existing revision token, membership/service locks and tenant
+scope. Customer, foreign-organization, stale and empty resource-only edits fail safely.
+Controls follow the native responsive form and disabled-during-save conventions.
+
+Policy edits share `resource_configuration_revision`; no independent version system
+or new activation UI is added. Disabling attendance can be staged at epoch zero, but
+resource-only availability, checkout and booking writers all fail closed until guarded
+operator activation. Only the established `0 -> 1` transition is supported, and its
+historical booking/payment census remains unchanged. On activated services the edited
+policy affects future accepted terms only. Existing accepted bookings and checkouts
+remain frozen. No real configuration or service activation is performed by this slice.
+
+For Light & Balance, Energy requires Kimberly; Light Therapy requires Light x1 with
+no provider attendance; PEMF requires Mat x1 with no provider attendance. The explicit
+integration test accepts Energy at 10:00, verifies Light and PEMF still available,
+then accepts both under the same real provider. All three coexist. A second Energy,
+Light and PEMF are each unavailable and rejected by their own constrained capacity.
+
+DEV prerequisites remain: apply migration 0075 before new code starts, use isolated
+DEV credentials/runtime, retain provider/payment isolation, establish paid-unbooked
+review readiness, drain/review legacy Redis checkout custody, and census incompatible
+historical commitments. Configure real resources/hours/quantities and per-service
+attendance only with separate authorization. Prefer fresh DEV service IDs where
+historical commitments prevent activation. The earlier launch-audit activation SQL
+contains an obsolete `NOT e.requires_host` rejection; an operator must review/update
+that artifact for Slice 6 rather than run it unchanged for resource-only services.
+Quiesce callers and atomically enable/activate only after that review. Never reset an
+epoch, erase claims, or reinterpret accepted attendance as a rollback.
+
+
+### Slice 6 completion validation
+
+Validated on 2026-10-06 UTC (2026-10-05 in America/Boise), starting from local
+launch-audit commit `587af7d`. The final root run has **922 passing tests in 69
+files, with no skipped tests**: 818 web tests and 104 core tests. Core results are
+reused from the successful unchanged-core run through Turbo's local cache. The
+resource suites below are included in that total, not additional tests.
+
+| Check | Final result |
+| --- | --- |
+| Slice 6 real database integration | 17 passed, including the exact three-service case, authoritative duplicate rejection, equipment race, policy freezing, owner notifications, calendar inbox, API-key and assistant behavior |
+| Slice 1 resource foundation | 63 passed |
+| Slice 2 resource acceptance and launch-audit regressions | 65 passed; selected financial and pending cases run with both attendance policies |
+| Slice 3 resource availability | 38 passed; existing batch-query, timezone, opening-hours and buffer regressions retained |
+| Slice 4 lifecycle and migration 0074 decline restoration | 41 passed; selected coupon/package/no-show cases run with both policies |
+| Slice 5 authenticated configuration API / UI | 39 API/database and 13 UI tests passed |
+| Calendar provider output | 9 passed: actual Google, Microsoft and CalDAV create/update bodies, default busy behavior and explicit free behavior |
+| Person availability / service configuration / calendar regressions | Passed in the root run, including core availability/DST/troubleshooting, team/lunch/focus, event-type input, agenda, inbox, invite actions, recurrence and ICS suites |
+| Payment / coupon / package / pricing database regressions | Passed: package credits 59, refunds 35, fulfillment 32, attempts 5, pricing 12, coupons 7; root unit/routing/webhook suites also passed |
+| Pending/managed bookings | Passed in the acceptance, lifecycle and Slice 6 suites; approval omits the held person mutex and retains accepted equipment claims |
+| Workspace typecheck | All 16 tasks passed |
+| Changed-file Biome | All 32 changed TypeScript/TSX files passed; generated migration metadata is excluded by the repository configuration |
+| Production build | Passed; Next.js compiled, checked types, prerendered all 229 static pages and completed build traces |
+| Whitespace / generated schema | `git diff --check` passed; `pnpm db:generate` reports no changes; snapshot linkage checked and only the intended booking field/index changed |
+| Actual fresh migrations | `pnpm db:migrate` applied the complete journal through 0075 successfully to fresh disposable PostgreSQL 17 |
+| Actual upgrade SQL | Seeded a database through 0074, applied 0075, and compared original legacy/managed bookings, plans, claims and services: unchanged; every old booking remains attended |
+
+The explicit business fixture uses one actual owner, capacity-1 Light and Mat,
+and a 10:00 start. Energy is accepted first; Light and PEMF remain available and
+are then accepted. All three persist with attendance `[true, false, false]` and
+separate equipment claims. Each duplicate is unavailable and rejected both by
+public admission and by staff admission reaching the final database guards. A
+separate reverse-order case confirms resource-only occupancy does not block an
+attended service, including a cached calendar mirror.
+
+All database validation used the labeled `dayotter-slice6-pg17` disposable
+PostgreSQL 17 container: loopback-only port 55486, tmpfs data, test credentials,
+and separate test databases. It is removed after validation. Redis was pointed
+at a closed loopback port; no live Redis was used. Financial and calendar
+transports were mocked; no live payment, provider, production or DEV data was
+accessed. UI checks use native component rendering rather than a live browser.
+
+The actual final diff was reviewed for ownership/attendance conflation, global
+host-conflict bypass, unbounded services, client policy forgery, tenancy, calendar
+busy leakage, paid/pending custody, lifecycle rollback, lock ordering, activation
+bypass, stale edits, buffers/timezones, query growth and upgrade safety. Review
+fixes include frozen owner lookup for paid resource-only custody, ignoring exact
+resource-only calendar mirrors in person conflicts, omitting personal prep/travel
+and overflow effects, invalidating candidates when attendance is restored while
+requirements are removed, and filtering resource-only bookings from calendar
+inbox clashes. Interrupted migration syntax and adapter enum typing were corrected.
+Historical financial fixtures now omit the additive field when intentionally
+running against pre-resource schemas; absent historical service fields retain
+attended semantics. Failed intermediate checks were corrected and rerun; no
+timeout or failing test is treated as successful validation.
+
+No nullable-host expansion, fake helpers, generalized people/resources model,
+resource-lock ordering change, claim transaction boundary change, Redis drain,
+provider integration redesign or deployment is introduced. The Compose overlay
+remains untracked and byte-identical to the starting checkpoint. Publication and
+real service configuration/activation require separate authorization; the DEV
+prerequisites immediately above still apply.

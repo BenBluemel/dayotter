@@ -38,6 +38,8 @@ export interface NewCalendarEvent {
   timezone: string;
   attendees: EventAttendee[];
   location?: string;
+  /** Keep owner calendar visibility without reserving their time. */
+  transparency?: "opaque" | "transparent";
   /** Request a provider-generated video conference (Meet / Teams). */
   createConference?: boolean;
 }

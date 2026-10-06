@@ -100,6 +100,8 @@ export async function rescheduleBooking(
     new Date(newStart.getTime() + SLOT_REVALIDATION_WINDOW_MS),
     plan?.minimumGapMinutes ?? eventType.minimumGapMinutes,
     booking.id, // don't let the booking being moved block its own new slot
+    undefined,
+    booking.requiresHost,
   );
   if (!slots.some((s) => s.start.getTime() === newStart.getTime())) {
     throw new RescheduleError("That time is no longer available", 409);
@@ -145,6 +147,7 @@ export async function rescheduleBooking(
     attendees: booking.attendees.map((a) => ({ email: a.email, name: a.name ?? undefined })),
     location: eventType.locationDetail ?? undefined,
     createConference: AUTO_CONFERENCE.includes(eventType.location),
+    transparency: booking.requiresHost ? "opaque" : "transparent",
   });
   if (!(await stillCurrent())) return;
   if (meetingUrl) {
@@ -183,7 +186,7 @@ export async function rescheduleBooking(
   // the new end time under the host's same opt-in, else the host silently loses
   // the "running late" notice and post-meeting recap for a moved booking.
   if (booking.hostId) {
-    if (await hostWantsOverflowNotice(booking.hostId)) {
+    if (booking.requiresHost && (await hostWantsOverflowNotice(booking.hostId))) {
       await scheduleOverflowCheck(booking.id, newEnd);
     }
     if (await hostWantsScribe(booking.hostId)) {
@@ -202,6 +205,7 @@ export async function rescheduleBooking(
     bookingId: booking.id,
     hostId: booking.hostId,
     title: booking.title,
+    requiresHost: booking.requiresHost,
     startsAt: newStart,
     endsAt: newEnd,
   }).catch(() => {});
@@ -212,6 +216,7 @@ export async function rescheduleBooking(
     startsAt: newStart,
     endsAt: newEnd,
     place: eventType.locationDetail,
+    requiresHost: booking.requiresHost,
   });
 
   if (!(await stillCurrent())) return;

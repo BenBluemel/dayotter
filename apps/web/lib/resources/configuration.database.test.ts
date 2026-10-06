@@ -555,4 +555,188 @@ describe.skipIf(!testUrl)("resource configuration authenticated PostgreSQL API",
       );
     }
   });
+  it("Slice 6 defaults to host attendance and owner/admin edits preserve service ownership and staged activation", async () => {
+    const id = await service();
+    const before = await readService(id);
+    const r = await create();
+    expect(before.requires_host).toBe(true);
+    const response = await PUT(
+      request("PUT", {
+        organizationId: org,
+        eventTypeId: id,
+        version: Number(before.resource_configuration_revision),
+        requirements: [{ id: r.id, quantity: 1 }],
+        requiresHost: false,
+      }),
+      undefined,
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()).service).toMatchObject({ requiresHost: false, managed: false });
+    const after = await readService(id);
+    expect(after).toMatchObject({
+      owner_id: host,
+      description: before.description,
+      price: before.price,
+      requires_host: false,
+      resource_admission_epoch: "0",
+    });
+    await db.$client.query(
+      "update memberships set role='admin' where organization_id=$1 and user_id=$2",
+      [org, host],
+    );
+    try {
+      expect(
+        (
+          await PUT(
+            request("PUT", {
+              organizationId: org,
+              eventTypeId: id,
+              version: Number(after.resource_configuration_revision),
+              requirements: [{ id: r.id, quantity: 1 }],
+              requiresHost: true,
+            }),
+            undefined,
+          )
+        ).status,
+      ).toBe(200);
+    } finally {
+      await db.$client.query(
+        "update memberships set role='owner' where organization_id=$1 and user_id=$2",
+        [org, host],
+      );
+    }
+    expect((await readService(id)).requires_host).toBe(true);
+  });
+  it("Slice 6 rejects customer and cross-organization attendance mutation", async () => {
+    const id = await service();
+    const r = await create();
+    for (const userId of [customer, outsider]) {
+      state.userId = userId;
+      const response = await PUT(
+        request("PUT", {
+          organizationId: org,
+          eventTypeId: id,
+          version: 1,
+          requirements: [{ id: r.id, quantity: 1 }],
+          requiresHost: false,
+        }),
+        undefined,
+      );
+      expect(response.status).toBe(403);
+    }
+    state.userId = outsider;
+    const response = await PUT(
+      request("PUT", {
+        organizationId: otherOrg,
+        eventTypeId: id,
+        version: 1,
+        requirements: [],
+        requiresHost: false,
+      }),
+      undefined,
+    );
+    expect(response.status).toBe(404);
+    expect((await readService(id)).requires_host).toBe(true);
+  });
+  it("Slice 6 rejects stale attendance edits, cross-org equipment and unconstrained resource-only services", async () => {
+    const id = await service();
+    const r = await create();
+    const before = await readService(id);
+    const input = {
+      organizationId: org,
+      eventTypeId: id,
+      version: Number(before.resource_configuration_revision),
+      requirements: [{ id: r.id, quantity: 1 }],
+      requiresHost: false,
+    };
+    expect((await PUT(request("PUT", input), undefined)).status).toBe(200);
+    expect((await PUT(request("PUT", { ...input, requiresHost: true }), undefined)).status).toBe(
+      409,
+    );
+    const after = await readService(id);
+    expect(
+      (
+        await PUT(
+          request("PUT", {
+            ...input,
+            version: Number(after.resource_configuration_revision),
+            requirements: [],
+          }),
+          undefined,
+        )
+      ).status,
+    ).toBe(400);
+    expect((await readService(id)).requires_host).toBe(false);
+    // Switching back and removing equipment is one atomic, valid edit.
+    expect(
+      (
+        await PUT(
+          request("PUT", {
+            ...input,
+            version: Number(after.resource_configuration_revision),
+            requirements: [],
+            requiresHost: true,
+          }),
+          undefined,
+        )
+      ).status,
+    ).toBe(200);
+    const foreign = randomUUID();
+    await db.$client.query(
+      "insert into resources(id,organization_id,name,capacity) values($1,$2,'Other Light',1)",
+      [foreign, otherOrg],
+    );
+    const current = await readService(id);
+    expect(
+      (
+        await PUT(
+          request("PUT", {
+            ...input,
+            version: Number(current.resource_configuration_revision),
+            requirements: [{ id: foreign, quantity: 1 }],
+          }),
+          undefined,
+        )
+      ).status,
+    ).toBe(400);
+    expect((await readService(id)).requires_host).toBe(true);
+  });
+  it("Slice 6 database guard prevents removing the final resource and accepts atomic replacement", async () => {
+    const id = await service();
+    const r = await create();
+    const replacement = await create();
+    expect(
+      (
+        await PUT(
+          request("PUT", {
+            organizationId: org,
+            eventTypeId: id,
+            version: 1,
+            requirements: [{ id: r.id, quantity: 1 }],
+            requiresHost: false,
+          }),
+          undefined,
+        )
+      ).status,
+    ).toBe(200);
+    await expect(
+      db.$client.query("delete from event_type_resource_requirements where event_type_id=$1", [id]),
+    ).rejects.toBeDefined();
+    const current = await readService(id);
+    expect(
+      (
+        await PUT(
+          request("PUT", {
+            organizationId: org,
+            eventTypeId: id,
+            version: Number(current.resource_configuration_revision),
+            requirements: [{ id: replacement.id, quantity: 1 }],
+            requiresHost: false,
+          }),
+          undefined,
+        )
+      ).status,
+    ).toBe(200);
+    expect((await readService(id)).requires_host).toBe(false);
+  });
 });

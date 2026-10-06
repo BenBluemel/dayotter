@@ -1,5 +1,5 @@
 import { resolvePublicIp } from "@dayotter/core";
-import icalGenerator from "ical-generator";
+import icalGenerator, { ICalEventTransparency } from "ical-generator";
 import ical from "node-ical";
 // tsdav is CommonJS; a named ESM import isn't statically resolvable at runtime,
 // so import the default and destructure.
@@ -174,6 +174,10 @@ export class AppleCalendarAdapter implements CalendarAdapter {
       start: event.start,
       end: event.end,
       summary: event.title,
+      transparency:
+        event.transparency === "transparent"
+          ? ICalEventTransparency.TRANSPARENT
+          : ICalEventTransparency.OPAQUE,
       description: event.description,
       location: event.location,
       attendees: event.attendees.map((a) => ({ email: a.email, name: a.name })),
@@ -202,6 +206,10 @@ export class AppleCalendarAdapter implements CalendarAdapter {
       start: event.start,
       end: event.end,
       summary: event.title,
+      transparency:
+        event.transparency === "transparent"
+          ? ICalEventTransparency.TRANSPARENT
+          : ICalEventTransparency.OPAQUE,
       description: event.description,
       location: event.location,
       attendees: event.attendees.map((a) => ({ email: a.email, name: a.name })),

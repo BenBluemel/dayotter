@@ -80,18 +80,17 @@ export async function filterResourceAvailability(
         if (!context.length) return [];
         const current = context[0]!.service;
         const required = context.filter((row) => row.requirement !== null);
-        // No requirements means the existing availability behavior, including
-        // person/group/team rules, remains exactly the same.
-        if (!required.length) return slots;
         if (
           current.resourceConfigurationRevision !== eventType.resourceConfigurationRevision ||
           current.resourceAdmissionEpoch !== eventType.resourceAdmissionEpoch
         )
           return []; // The host candidates were computed from a stale definition.
+        // Check the revision even when requirements were removed: candidates
+        // may have skipped person conflicts under the previous attendance policy.
+        if (!required.length) return current.requiresHost ? slots : [];
         if (
           !current.isActive ||
           current.resourceAdmissionEpoch <= 0 ||
-          !current.requiresHost ||
           !current.ownerId ||
           current.schedulingType !== "individual" ||
           current.maxAttendees !== 1 ||

@@ -180,6 +180,7 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     resources: { id: string; quantity?: number }[] = [],
     price = 0,
     managed = true,
+    requiresHost = true,
   ) {
     const host = randomUUID();
     const schedule = randomUUID();
@@ -216,6 +217,11 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
       await db
         .update(schema.eventTypes)
         .set({ resourceAdmissionEpoch: 1 })
+        .where(eq(schema.eventTypes.id, e!.id));
+    if (!requiresHost)
+      await db
+        .update(schema.eventTypes)
+        .set({ requiresHost: false })
         .where(eq(schema.eventTypes.id, e!.id));
     return (await db.query.eventTypes.findFirst({ where: eq(schema.eventTypes.id, e!.id) }))!;
   }
@@ -332,27 +338,30 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     await expect(book(ordinary, "2030-01-01T10:35:00.000Z")).rejects.toMatchObject({ status: 409 });
     expect(await counts(ordinary.id)).toEqual({ b: 0, c: 0 });
   });
-  it("pending managed acceptance owns claims and approval retains them", async () => {
-    const e = await service([{ id: await resource() }]);
-    await db
-      .update(schema.eventTypes)
-      .set({ requiresConfirmation: true })
-      .where(eq(schema.eventTypes.id, e.id));
-    const booking = await book(e);
-    expect(booking.status).toBe("pending");
-    const claims = await db.query.bookingResourceClaims.findMany({
-      where: eq(schema.bookingResourceClaims.bookingId, booking.id),
-    });
-    expect(claims).toHaveLength(1);
-    expect(await approveBooking(booking.uid, e.ownerId!)).toBe("ok");
-    expect(await approveBooking(booking.uid, e.ownerId!)).toBe("not_pending");
-    expect(
-      await db.query.bookingResourceClaims.findMany({
+  it.each([true, false])(
+    "pending managed acceptance owns claims and approval retains them (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], 0, true, requiresHost);
+      await db
+        .update(schema.eventTypes)
+        .set({ requiresConfirmation: true })
+        .where(eq(schema.eventTypes.id, e.id));
+      const booking = await book(e);
+      expect(booking.status).toBe("pending");
+      const claims = await db.query.bookingResourceClaims.findMany({
         where: eq(schema.bookingResourceClaims.bookingId, booking.id),
-      }),
-    ).toEqual(claims);
-    expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
-  });
+      });
+      expect(claims).toHaveLength(1);
+      expect(await approveBooking(booking.uid, e.ownerId!)).toBe("ok");
+      expect(await approveBooking(booking.uid, e.ownerId!)).toBe("not_pending");
+      expect(
+        await db.query.bookingResourceClaims.findMany({
+          where: eq(schema.bookingResourceClaims.bookingId, booking.id),
+        }),
+      ).toEqual(claims);
+      expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
+    },
+  );
   it("managed free acceptance creates immutable plan, weighted claims and settlement atomically", async () => {
     const r = await resource(2);
     const e = await service([{ id: r, quantity: 2 }]);
@@ -413,37 +422,43 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
       (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))?.schedulingPlan,
     ).toEqual(b.schedulingPlan);
   });
-  it("100% coupon acceptance and replay use one coupon and one allocation without Stripe", async () => {
-    const e = await service([{ id: await resource() }], 5000);
-    const c = await coupon(e);
-    const input = { ...intent(e), couponCode: c.code, couponCustomerUserId: client };
-    const a = await createBooking(input);
-    const b = await createBooking(input);
-    expect(a.uid).toBe(b.uid);
-    expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
-    expect(
-      (
+  it.each([true, false])(
+    "100% coupon acceptance and replay use one coupon and one allocation without Stripe (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], 5000, true, requiresHost);
+      const c = await coupon(e);
+      const input = { ...intent(e), couponCode: c.code, couponCustomerUserId: client };
+      const a = await createBooking(input);
+      const b = await createBooking(input);
+      expect(a.uid).toBe(b.uid);
+      expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
+      expect(
+        (
+          await db.query.appointmentCouponUses.findMany({
+            where: eq(schema.appointmentCouponUses.couponId, c.id),
+          })
+        ).map((u) => u.status),
+      ).toEqual(["redeemed"]);
+    },
+  );
+  it.each([true, false])(
+    "resource conflict rolls back zero-cash coupon use and settlement (requiresHost=%s)",
+    async (requiresHost) => {
+      const r = await resource();
+      await occupied(r);
+      const e = await service([{ id: r }], 5000, true, requiresHost);
+      const c = await coupon(e);
+      await expect(
+        createBooking({ ...intent(e), couponCode: c.code, couponCustomerUserId: client }),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
+      expect(
         await db.query.appointmentCouponUses.findMany({
           where: eq(schema.appointmentCouponUses.couponId, c.id),
-        })
-      ).map((u) => u.status),
-    ).toEqual(["redeemed"]);
-  });
-  it("resource conflict rolls back zero-cash coupon use and settlement", async () => {
-    const r = await resource();
-    await occupied(r);
-    const e = await service([{ id: r }], 5000);
-    const c = await coupon(e);
-    await expect(
-      createBooking({ ...intent(e), couponCode: c.code, couponCustomerUserId: client }),
-    ).rejects.toMatchObject({ status: 409 });
-    expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
-    expect(
-      await db.query.appointmentCouponUses.findMany({
-        where: eq(schema.appointmentCouponUses.couponId, c.id),
-      }),
-    ).toHaveLength(0);
-  });
+        }),
+      ).toHaveLength(0);
+    },
+  );
   async function packageInput(e: typeof schema.eventTypes.$inferSelect) {
     const [p] = await db
       .insert(schema.sessionPackages)
@@ -466,71 +481,91 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
       },
     };
   }
-  it("package booking and replay consume one credit and allocate once", async () => {
-    const e = await service([{ id: await resource() }], 5000);
-    const p = await packageInput(e);
-    const a = await createBooking(p.input);
-    const b = await createBooking(p.input);
-    expect(a.uid).toBe(b.uid);
-    expect(
-      (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, p.credit) }))
-        ?.usedCredits,
-    ).toBe(1);
-    expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
-  });
-  it("resource conflict consumes no package credit", async () => {
-    const r = await resource();
-    await occupied(r);
-    const e = await service([{ id: r }], 5000);
-    const p = await packageInput(e);
-    await expect(createBooking(p.input)).rejects.toMatchObject({ status: 409 });
-    expect(
-      (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, p.credit) }))
-        ?.usedCredits,
-    ).toBe(0);
-    expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
-  });
-  it("checkout freezes terms without claims; fulfillment uses accepted resources after edits", async () => {
-    const old = await resource();
-    const replacement = await resource();
-    const e = await service([{ id: old }], 5000);
-    const a = await paid(e);
-    expect(a.schedulingPlan?.resources[0]?.id).toBe(old);
-    expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
-    await db
-      .update(schema.eventTypeResourceRequirements)
-      .set({ resourceId: replacement })
-      .where(eq(schema.eventTypeResourceRequirements.eventTypeId, e.id));
-    const result = await fulfillObservedPayment(a.id, db);
-    expect(result.state).toBe("fulfilled");
-    expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
-      uid: result.uid,
-      state: "fulfilled",
-    });
-    const b = await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid!) });
-    expect(b?.schedulingPlan).toEqual(a.schedulingPlan);
-    expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
-  });
-  it("payment success survives lost-slot review; automatic replay does not allocate", async () => {
-    const r = await resource();
-    const e = await service([{ id: r }], 5000);
-    const a = await paid(e);
-    await occupied(r);
-    expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
-      state: "requires_review",
-      uid: null,
-    });
-    expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
-      state: "requires_review",
-      uid: null,
-    });
-    const owed = await db.query.paymentAttempts.findFirst({
-      where: eq(schema.paymentAttempts.id, a.id),
-    });
-    expect(owed?.successFacts).toEqual(a.successFacts);
-    expect(owed?.reviewCode).toBe("booking_obligation_requires_review");
-    expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
-  });
+  it.each([true, false])(
+    "package booking and replay consume one credit and allocate once (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], 5000, true, requiresHost);
+      const p = await packageInput(e);
+      const a = await createBooking(p.input);
+      const b = await createBooking(p.input);
+      expect(a.uid).toBe(b.uid);
+      expect(
+        (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, p.credit) }))
+          ?.usedCredits,
+      ).toBe(1);
+      expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
+    },
+  );
+  it.each([true, false])(
+    "resource conflict consumes no package credit (requiresHost=%s)",
+    async (requiresHost) => {
+      const r = await resource();
+      await occupied(r);
+      const e = await service([{ id: r }], 5000, true, requiresHost);
+      const p = await packageInput(e);
+      await expect(createBooking(p.input)).rejects.toMatchObject({ status: 409 });
+      expect(
+        (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, p.credit) }))
+          ?.usedCredits,
+      ).toBe(0);
+      expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
+    },
+  );
+  it.each([true, false])(
+    "checkout freezes terms without claims; fulfillment uses accepted resources after edits (requiresHost=%s)",
+    async (requiresHost) => {
+      const old = await resource();
+      const replacement = await resource();
+      const e = await service([{ id: old }], 5000, true, requiresHost);
+      const a = await paid(e);
+      expect(a.schedulingPlan?.resources[0]?.id).toBe(old);
+      expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
+      await db
+        .update(schema.eventTypeResourceRequirements)
+        .set({ resourceId: replacement })
+        .where(eq(schema.eventTypeResourceRequirements.eventTypeId, e.id));
+      await db
+        .update(schema.eventTypes)
+        .set({ requiresHost: !requiresHost })
+        .where(eq(schema.eventTypes.id, e.id));
+      const result = await fulfillObservedPayment(a.id, db);
+      const frozenBooking = await db.query.bookings.findFirst({
+        where: eq(schema.bookings.uid, result.uid!),
+      });
+      expect(frozenBooking?.requiresHost).toBe(requiresHost);
+      expect(result.state).toBe("fulfilled");
+      expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
+        uid: result.uid,
+        state: "fulfilled",
+      });
+      const b = await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid!) });
+      expect(b?.schedulingPlan).toEqual(a.schedulingPlan);
+      expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
+    },
+  );
+  it.each([true, false])(
+    "payment success survives lost-slot review; automatic replay does not allocate (requiresHost=%s)",
+    async (requiresHost) => {
+      const r = await resource();
+      const e = await service([{ id: r }], 5000, true, requiresHost);
+      const a = await paid(e);
+      await occupied(r);
+      expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
+        state: "requires_review",
+        uid: null,
+      });
+      expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
+        state: "requires_review",
+        uid: null,
+      });
+      const owed = await db.query.paymentAttempts.findFirst({
+        where: eq(schema.paymentAttempts.id, a.id),
+      });
+      expect(owed?.successFacts).toEqual(a.successFacts);
+      expect(owed?.reviewCode).toBe("booking_obligation_requires_review");
+      expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
+    },
+  );
   async function review(couponCode = false) {
     const r = await resource();
     const e = await service([{ id: r }], 5000);
@@ -707,6 +742,7 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     const payload = {
       ...intent(e),
       checkoutRequestId: randomUUID(),
+      requiresHost: false,
       schedulingPlan: { resources: [] },
       resourceIds: [randomUUID()],
     };
@@ -723,6 +759,7 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     expect(again.status).toBe(201);
     expect((await again.json()).uid).toBe(result.uid);
     const b = await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid) });
+    expect(b?.requiresHost).toBe(true);
     expect(b?.schedulingPlan?.resources).toEqual([{ id: r, quantity: 1, name: "Light" }]);
     expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
   });
@@ -758,30 +795,33 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
   });
-  it("paid coupon fulfillment and response-loss replay redeem and allocate once", async () => {
-    const e = await service([{ id: await resource() }], 5000);
-    const c = await coupon(e, 5000);
-    await db
-      .update(schema.eventTypes)
-      .set({ depositAmount: 1000 })
-      .where(eq(schema.eventTypes.id, e.id));
-    const a = await paid(e, c.code);
-    expect(a.amount).toBe(1000);
-    const result = await fulfillObservedPayment(a.id, db);
-    expect(result.state).toBe("fulfilled");
-    expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
-      uid: result.uid,
-      state: "fulfilled",
-    });
-    expect(
-      (
-        await db.query.appointmentCouponUses.findFirst({
-          where: eq(schema.appointmentCouponUses.couponId, c.id),
-        })
-      )?.status,
-    ).toBe("redeemed");
-    expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
-  });
+  it.each([true, false])(
+    "paid coupon fulfillment and response-loss replay redeem and allocate once (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], 5000, true, requiresHost);
+      const c = await coupon(e, 5000);
+      await db
+        .update(schema.eventTypes)
+        .set({ depositAmount: 1000 })
+        .where(eq(schema.eventTypes.id, e.id));
+      const a = await paid(e, c.code);
+      expect(a.amount).toBe(1000);
+      const result = await fulfillObservedPayment(a.id, db);
+      expect(result.state).toBe("fulfilled");
+      expect(await fulfillObservedPayment(a.id, db)).toMatchObject({
+        uid: result.uid,
+        state: "fulfilled",
+      });
+      expect(
+        (
+          await db.query.appointmentCouponUses.findFirst({
+            where: eq(schema.appointmentCouponUses.couponId, c.id),
+          })
+        )?.status,
+      ).toBe("redeemed");
+      expect(await counts(e.id)).toEqual({ b: 1, c: 1 });
+    },
+  );
   it.each(["direct", "webhook"])(
     "0071 malformed claim under competing demand becomes technical review through %s",
     async (surface) => {
@@ -1400,71 +1440,76 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     expect(after?.recoveryFailures).toBe(0);
     expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
   });
-  it("paid resource move preserves accepted settlement; capacity failure leaves the paid booking intact", async () => {
-    const r = await resource();
-    const e = await service([{ id: r }], 5000);
-    const c = await coupon(e, 5000);
-    const a = await paid(e, c.code);
-    const result = await fulfillObservedPayment(a.id, db);
-    await finalizePaymentBooking(a.id, db);
-    const b = (await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid!) }))!;
-    const snapshot = await db.query.bookingPricingSnapshots.findFirst({
-      where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
-    });
-    const savedAttempt = await db.query.paymentAttempts.findFirst({
-      where: eq(schema.paymentAttempts.id, a.id),
-    });
-    const to = new Date("2030-01-01T11:00:00Z");
-    await admitBookingReschedule(db, b, e, to, new Date(to.getTime() + 1800000));
-    expect(
-      await db.query.bookingPricingSnapshots.findFirst({
+  it.each([true, false])(
+    "paid resource move preserves accepted settlement; capacity failure leaves the paid booking intact (requiresHost=%s)",
+    async (requiresHost) => {
+      const r = await resource();
+      const e = await service([{ id: r }], 5000, true, requiresHost);
+      const c = await coupon(e, 5000);
+      const a = await paid(e, c.code);
+      const result = await fulfillObservedPayment(a.id, db);
+      await finalizePaymentBooking(a.id, db);
+      const b = (await db.query.bookings.findFirst({
+        where: eq(schema.bookings.uid, result.uid!),
+      }))!;
+      const snapshot = await db.query.bookingPricingSnapshots.findFirst({
         where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
-      }),
-    ).toEqual(snapshot);
-    expect(
-      await db.query.paymentAttempts.findFirst({ where: eq(schema.paymentAttempts.id, a.id) }),
-    ).toEqual(savedAttempt);
-    expect(
-      (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!.paymentStatus,
-    ).toBe("paid");
-    const blocker = await service([{ id: r }]);
-    await book(blocker, "2030-01-01T12:00:00Z");
-    const current = (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!;
-    await expect(
-      admitBookingReschedule(
-        db,
+      });
+      const savedAttempt = await db.query.paymentAttempts.findFirst({
+        where: eq(schema.paymentAttempts.id, a.id),
+      });
+      const to = new Date("2030-01-01T11:00:00Z");
+      await admitBookingReschedule(db, b, e, to, new Date(to.getTime() + 1800000));
+      expect(
+        await db.query.bookingPricingSnapshots.findFirst({
+          where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
+        }),
+      ).toEqual(snapshot);
+      expect(
+        await db.query.paymentAttempts.findFirst({ where: eq(schema.paymentAttempts.id, a.id) }),
+      ).toEqual(savedAttempt);
+      expect(
+        (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!.paymentStatus,
+      ).toBe("paid");
+      const blocker = await service([{ id: r }]);
+      await book(blocker, "2030-01-01T12:00:00Z");
+      const current = (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!;
+      await expect(
+        admitBookingReschedule(
+          db,
+          current,
+          e,
+          new Date("2030-01-01T12:00:00Z"),
+          new Date("2030-01-01T12:30:00Z"),
+        ),
+      ).rejects.toBeDefined();
+      expect(await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) })).toEqual(
         current,
-        e,
-        new Date("2030-01-01T12:00:00Z"),
-        new Date("2030-01-01T12:30:00Z"),
-      ),
-    ).rejects.toBeDefined();
-    expect(await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) })).toEqual(
-      current,
-    );
-    expect(
-      await db.query.refundOperations.findMany({
-        where: eq(schema.refundOperations.bookingId, b.id),
-      }),
-    ).toHaveLength(0);
-    const decisions = await Promise.all([
-      decideBookingCancellation(b.uid, undefined, db),
-      decideBookingCancellation(b.uid, undefined, db),
-    ]);
-    expect(decisions.filter((d) => d!.changed)).toHaveLength(1);
-    expect(decisions.every((d) => d!.operation?.id === decisions[0]!.operation!.id)).toBe(true);
-    expect(
-      await db.query.appointmentCouponRestorations.findMany({
-        where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
-      }),
-    ).toHaveLength(1);
-    expect(
-      (
-        await db.query.bookingResourceClaims.findMany({
-          where: eq(schema.bookingResourceClaims.bookingId, b.id),
-        })
-      ).every((c) => c.releasedAt),
-    ).toBe(true);
-    expect(await executeRefundOperation(decisions[0]!.operation!.id, db)).toBe("refunded");
-  });
+      );
+      expect(
+        await db.query.refundOperations.findMany({
+          where: eq(schema.refundOperations.bookingId, b.id),
+        }),
+      ).toHaveLength(0);
+      const decisions = await Promise.all([
+        decideBookingCancellation(b.uid, undefined, db),
+        decideBookingCancellation(b.uid, undefined, db),
+      ]);
+      expect(decisions.filter((d) => d!.changed)).toHaveLength(1);
+      expect(decisions.every((d) => d!.operation?.id === decisions[0]!.operation!.id)).toBe(true);
+      expect(
+        await db.query.appointmentCouponRestorations.findMany({
+          where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
+        }),
+      ).toHaveLength(1);
+      expect(
+        (
+          await db.query.bookingResourceClaims.findMany({
+            where: eq(schema.bookingResourceClaims.bookingId, b.id),
+          })
+        ).every((c) => c.releasedAt),
+      ).toBe(true);
+      expect(await executeRefundOperation(decisions[0]!.operation!.id, db)).toBe("refunded");
+    },
+  );
 });

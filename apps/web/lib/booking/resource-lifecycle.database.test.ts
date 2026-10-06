@@ -147,6 +147,7 @@ describe.skipIf(!url)("Resource booking lifecycle PostgreSQL", () => {
   async function service(
     requirements: { id: string; quantity?: number }[] = [],
     organizationId = org,
+    requiresHost = true,
   ) {
     const host = randomUUID();
     const schedule = randomUUID();
@@ -190,6 +191,11 @@ describe.skipIf(!url)("Resource booking lifecycle PostgreSQL", () => {
       await db
         .update(schema.eventTypes)
         .set({ resourceAdmissionEpoch: 1 })
+        .where(eq(schema.eventTypes.id, e!.id));
+    if (!requiresHost)
+      await db
+        .update(schema.eventTypes)
+        .set({ requiresHost: false })
         .where(eq(schema.eventTypes.id, e!.id));
     return (await db.query.eventTypes.findFirst({ where: eq(schema.eventTypes.id, e!.id) }))!;
   }
@@ -560,211 +566,226 @@ describe.skipIf(!url)("Resource booking lifecycle PostgreSQL", () => {
     attendee: { name: "Client", email: "client@example.test", timezone: "UTC" },
     bookingRequestId: randomUUID(),
   });
-  it("declining a pending zero-cash coupon booking restores its use and resource capacity exactly once", async () => {
-    const migrations = new URL("../../../../packages/db/drizzle/", import.meta.url);
-    const legacy = await readFile(new URL("0069_appointment_coupons.sql", migrations), "utf8");
-    // Seed the already-accepted pending booking with the actual pre-0074 guards.
-    for (const name of ["guard_coupon_restoration", "check_coupon_booking"]) {
-      const start = legacy.indexOf(`CREATE FUNCTION ${name}(`);
-      const end = legacy.indexOf("END $$;", start) + "END $$;".length;
-      await db.$client.query(
-        legacy.slice(start, end).replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"),
-      );
-    }
-    const r = await resource();
-    const e = await service([{ id: r }]);
-    await db
-      .update(schema.eventTypes)
-      .set({ price: 5000, currency: "usd", requiresConfirmation: true })
-      .where(eq(schema.eventTypes.id, e.id));
-    const [coupon] = await db
-      .insert(schema.appointmentCoupons)
-      .values({
-        organizationId: org,
-        code: `C${randomUUID().replaceAll("-", "").toUpperCase()}`,
-        discountKind: "percentage",
-        startsAt: new Date("2029-01-01Z"),
-        endsAt: new Date("2031-01-01Z"),
-        validityTimezone: "UTC",
-        discountValue: 10000,
-        globalLimit: 1,
-        perCustomerLimit: 1,
-      })
-      .returning();
-    await db
-      .insert(schema.appointmentCouponEventTypes)
-      .values({ organizationId: org, couponId: coupon!.id, eventTypeId: e.id });
-    const observer = await service([{ id: r }]);
-    const input = {
-      ...intent(e),
-      couponCode: coupon!.code,
-      couponCustomerUserId: clientUser,
-      bookingRequestId: randomUUID(),
-    };
-    const result = await createBooking(input);
-    const b = (await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid) }))!;
-    await db.$client.query(
-      await readFile(new URL("0074_resource_decline_coupon_restoration.sql", migrations), "utf8"),
-    );
-    expect(await reload(b.id)).toEqual(b); // Function-only upgrade preserves accepted rows.
-    expect(b.status).toBe("pending");
-    expect(await offered(observer)).toEqual([]);
-    // Even a raw rejection with released resource claims must restore the coupon.
-    await expect(
-      db.transaction(async (tx) => {
-        await tx
-          .update(schema.bookings)
-          .set({ status: "rejected" })
-          .where(eq(schema.bookings.id, b.id));
-        await tx.execute(sql`select resource_release_booking(${b.id}::uuid)`);
-      }),
-    ).rejects.toBeDefined();
-    expect((await reload(b.id))!.status).toBe("pending");
-    expect((await claims(b.id))[0]!.releasedAt).toBeNull();
-    const results = await Promise.all([
-      declineBooking(b.uid, e.ownerId!),
-      declineBooking(b.uid, e.ownerId!),
-    ]);
-    expect(results.filter((result) => result === "ok")).toHaveLength(1);
-    expect((await reload(b.id))!.status).toBe("rejected");
-    expect((await claims(b.id))[0]!.releaseReason).toBe("rejected");
-    expect(await offered(observer)).toEqual([slot()]);
-    expect(
-      await db.query.appointmentCouponRestorations.findMany({
-        where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
-      }),
-    ).toHaveLength(1);
-    expect(
-      (await db.query.appointmentCouponUses.findFirst({
-        where: eq(schema.appointmentCouponUses.bookingId, b.id),
-      }))!.status,
-    ).toBe("restored");
-    expect(await approveBooking(b.uid, e.ownerId!)).toBe("not_pending");
-    await createBooking({ ...input, bookingRequestId: randomUUID() });
-    expect(await offered(observer)).toEqual([]);
-    expect(
-      (
-        await db.query.appointmentCouponUses.findMany({
-          where: eq(schema.appointmentCouponUses.couponId, coupon!.id),
+  it.each([true, false])(
+    "declining a pending zero-cash coupon booking restores its use and resource capacity exactly once (requiresHost=%s)",
+    async (requiresHost) => {
+      const migrations = new URL("../../../../packages/db/drizzle/", import.meta.url);
+      const legacy = await readFile(new URL("0069_appointment_coupons.sql", migrations), "utf8");
+      // Seed the already-accepted pending booking with the actual pre-0074 guards.
+      for (const name of ["guard_coupon_restoration", "check_coupon_booking"]) {
+        const start = legacy.indexOf(`CREATE FUNCTION ${name}(`);
+        const end = legacy.indexOf("END $$;", start) + "END $$;".length;
+        await db.$client.query(
+          legacy.slice(start, end).replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION"),
+        );
+      }
+      const r = await resource();
+      const e = await service([{ id: r }], org, requiresHost);
+      await db
+        .update(schema.eventTypes)
+        .set({ price: 5000, currency: "usd", requiresConfirmation: true })
+        .where(eq(schema.eventTypes.id, e.id));
+      const [coupon] = await db
+        .insert(schema.appointmentCoupons)
+        .values({
+          organizationId: org,
+          code: `C${randomUUID().replaceAll("-", "").toUpperCase()}`,
+          discountKind: "percentage",
+          startsAt: new Date("2029-01-01Z"),
+          endsAt: new Date("2031-01-01Z"),
+          validityTimezone: "UTC",
+          discountValue: 10000,
+          globalLimit: 1,
+          perCustomerLimit: 1,
         })
-      )
-        .map((use) => use.status)
-        .sort(),
-    ).toEqual(["redeemed", "restored"]);
-  });
-  it("reschedule preserves pricing and limited coupon; concurrent cancellation restores exactly once", async () => {
-    const e = await service([{ id: await resource() }]);
-    await db
-      .update(schema.eventTypes)
-      .set({ price: 5000, currency: "usd" })
-      .where(eq(schema.eventTypes.id, e.id));
-    const [coupon] = await db
-      .insert(schema.appointmentCoupons)
-      .values({
-        organizationId: org,
-        code: `C${randomUUID().replaceAll("-", "").toUpperCase()}`,
-        discountKind: "percentage",
-        startsAt: new Date("2029-01-01Z"),
-        endsAt: new Date("2031-01-01Z"),
-        validityTimezone: "UTC",
-        discountValue: 10000,
-        globalLimit: 1,
-        perCustomerLimit: 1,
-      })
-      .returning();
-    await db
-      .insert(schema.appointmentCouponEventTypes)
-      .values({ organizationId: org, couponId: coupon!.id, eventTypeId: e.id });
-    const result = await createBooking({
-      ...intent(e),
-      couponCode: coupon!.code,
-      couponCustomerUserId: clientUser,
-    });
-    const b = (await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid) }))!;
-    const snapshot = await db.query.bookingPricingSnapshots.findFirst({
-      where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
-    });
-    await db
-      .update(schema.appointmentCoupons)
-      .set({ isActive: false })
-      .where(eq(schema.appointmentCoupons.id, coupon!.id));
-    await db.update(schema.eventTypes).set({ price: 9900 }).where(eq(schema.eventTypes.id, e.id));
-    await rescheduleBooking(b.uid, at("11:00").toISOString());
-    expect(
-      await db.query.bookingPricingSnapshots.findFirst({
+        .returning();
+      await db
+        .insert(schema.appointmentCouponEventTypes)
+        .values({ organizationId: org, couponId: coupon!.id, eventTypeId: e.id });
+      const observer = await service([{ id: r }]);
+      const input = {
+        ...intent(e),
+        couponCode: coupon!.code,
+        couponCustomerUserId: clientUser,
+        bookingRequestId: randomUUID(),
+      };
+      const result = await createBooking(input);
+      const b = (await db.query.bookings.findFirst({
+        where: eq(schema.bookings.uid, result.uid),
+      }))!;
+      await db.$client.query(
+        await readFile(new URL("0074_resource_decline_coupon_restoration.sql", migrations), "utf8"),
+      );
+      expect(await reload(b.id)).toEqual(b); // Function-only upgrade preserves accepted rows.
+      expect(b.status).toBe("pending");
+      expect(await offered(observer)).toEqual([]);
+      // Even a raw rejection with released resource claims must restore the coupon.
+      await expect(
+        db.transaction(async (tx) => {
+          await tx
+            .update(schema.bookings)
+            .set({ status: "rejected" })
+            .where(eq(schema.bookings.id, b.id));
+          await tx.execute(sql`select resource_release_booking(${b.id}::uuid)`);
+        }),
+      ).rejects.toBeDefined();
+      expect((await reload(b.id))!.status).toBe("pending");
+      expect((await claims(b.id))[0]!.releasedAt).toBeNull();
+      const results = await Promise.all([
+        declineBooking(b.uid, e.ownerId!),
+        declineBooking(b.uid, e.ownerId!),
+      ]);
+      expect(results.filter((result) => result === "ok")).toHaveLength(1);
+      expect((await reload(b.id))!.status).toBe("rejected");
+      expect((await claims(b.id))[0]!.releaseReason).toBe("rejected");
+      expect(await offered(observer)).toEqual([slot()]);
+      expect(
+        await db.query.appointmentCouponRestorations.findMany({
+          where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
+        }),
+      ).toHaveLength(1);
+      expect(
+        (await db.query.appointmentCouponUses.findFirst({
+          where: eq(schema.appointmentCouponUses.bookingId, b.id),
+        }))!.status,
+      ).toBe("restored");
+      expect(await approveBooking(b.uid, e.ownerId!)).toBe("not_pending");
+      await createBooking({ ...input, bookingRequestId: randomUUID() });
+      expect(await offered(observer)).toEqual([]);
+      expect(
+        (
+          await db.query.appointmentCouponUses.findMany({
+            where: eq(schema.appointmentCouponUses.couponId, coupon!.id),
+          })
+        )
+          .map((use) => use.status)
+          .sort(),
+      ).toEqual(["redeemed", "restored"]);
+    },
+  );
+  it.each([true, false])(
+    "reschedule preserves pricing and limited coupon; concurrent cancellation restores exactly once (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], org, requiresHost);
+      await db
+        .update(schema.eventTypes)
+        .set({ price: 5000, currency: "usd" })
+        .where(eq(schema.eventTypes.id, e.id));
+      const [coupon] = await db
+        .insert(schema.appointmentCoupons)
+        .values({
+          organizationId: org,
+          code: `C${randomUUID().replaceAll("-", "").toUpperCase()}`,
+          discountKind: "percentage",
+          startsAt: new Date("2029-01-01Z"),
+          endsAt: new Date("2031-01-01Z"),
+          validityTimezone: "UTC",
+          discountValue: 10000,
+          globalLimit: 1,
+          perCustomerLimit: 1,
+        })
+        .returning();
+      await db
+        .insert(schema.appointmentCouponEventTypes)
+        .values({ organizationId: org, couponId: coupon!.id, eventTypeId: e.id });
+      const result = await createBooking({
+        ...intent(e),
+        couponCode: coupon!.code,
+        couponCustomerUserId: clientUser,
+      });
+      const b = (await db.query.bookings.findFirst({
+        where: eq(schema.bookings.uid, result.uid),
+      }))!;
+      const snapshot = await db.query.bookingPricingSnapshots.findFirst({
         where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
-      }),
-    ).toEqual(snapshot);
-    const uses = await db.query.appointmentCouponUses.findMany({
-      where: eq(schema.appointmentCouponUses.bookingId, b.id),
-    });
-    expect(uses).toHaveLength(1);
-    expect(uses[0]!.status).toBe("redeemed");
-    await Promise.all([
-      decideBookingCancellation(b.uid, undefined, db),
-      decideBookingCancellation(b.uid, undefined, db),
-    ]);
-    expect(
-      await db.query.appointmentCouponRestorations.findMany({
-        where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
-      }),
-    ).toHaveLength(1);
-    expect(
-      (await db.query.appointmentCouponUses.findFirst({
+      });
+      await db
+        .update(schema.appointmentCoupons)
+        .set({ isActive: false })
+        .where(eq(schema.appointmentCoupons.id, coupon!.id));
+      await db.update(schema.eventTypes).set({ price: 9900 }).where(eq(schema.eventTypes.id, e.id));
+      await rescheduleBooking(b.uid, at("11:00").toISOString());
+      expect(
+        await db.query.bookingPricingSnapshots.findFirst({
+          where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
+        }),
+      ).toEqual(snapshot);
+      const uses = await db.query.appointmentCouponUses.findMany({
         where: eq(schema.appointmentCouponUses.bookingId, b.id),
-      }))!.status,
-    ).toBe("restored");
-  });
-  it("package move consumes no extra credit, preserves paid state, and cancellation restores once", async () => {
-    const e = await service([{ id: await resource() }]);
-    await db
-      .update(schema.eventTypes)
-      .set({ price: 5000, currency: "usd" })
-      .where(eq(schema.eventTypes.id, e.id));
-    const [p] = await db
-      .insert(schema.sessionPackages)
-      .values({
-        organizationId: org,
-        eventTypeId: e.id,
-        name: "Two sessions",
-        sessionCount: 2,
-        priceAmount: 5000,
-      })
-      .returning();
-    const credit = await grantPackageToCustomer(
-      e.ownerId!,
-      p!.id,
-      "client@example.test",
-      randomUUID(),
-      db,
-    );
-    const result = await createBooking({
-      ...intent(e),
-      redeemCredit: true,
-      creditOwnerUserId: clientUser,
-      creditRequestId: randomUUID(),
-    });
-    const b = (await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid) }))!;
-    await rescheduleBooking(b.uid, at("11:00").toISOString());
-    expect((await reload(b.id))!.paymentStatus).toBe("paid");
-    expect(
-      (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, credit) }))!
-        .usedCredits,
-    ).toBe(1);
-    await Promise.all([
-      decideBookingCancellation(b.uid, undefined, db),
-      decideBookingCancellation(b.uid, undefined, db),
-    ]);
-    expect(
-      (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, credit) }))!
-        .usedCredits,
-    ).toBe(0);
-    const mutations = await db.query.packageCreditMutations.findMany({
-      where: eq(schema.packageCreditMutations.bookingId, b.id),
-    });
-    expect(mutations.filter((m) => m.kind === "redemption")).toHaveLength(1);
-    expect(mutations.filter((m) => m.kind === "restoration")).toHaveLength(1);
-  });
+      });
+      expect(uses).toHaveLength(1);
+      expect(uses[0]!.status).toBe("redeemed");
+      await Promise.all([
+        decideBookingCancellation(b.uid, undefined, db),
+        decideBookingCancellation(b.uid, undefined, db),
+      ]);
+      expect(
+        await db.query.appointmentCouponRestorations.findMany({
+          where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
+        }),
+      ).toHaveLength(1);
+      expect(
+        (await db.query.appointmentCouponUses.findFirst({
+          where: eq(schema.appointmentCouponUses.bookingId, b.id),
+        }))!.status,
+      ).toBe("restored");
+    },
+  );
+  it.each([true, false])(
+    "package move consumes no extra credit, preserves paid state, and cancellation restores once (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], org, requiresHost);
+      await db
+        .update(schema.eventTypes)
+        .set({ price: 5000, currency: "usd" })
+        .where(eq(schema.eventTypes.id, e.id));
+      const [p] = await db
+        .insert(schema.sessionPackages)
+        .values({
+          organizationId: org,
+          eventTypeId: e.id,
+          name: "Two sessions",
+          sessionCount: 2,
+          priceAmount: 5000,
+        })
+        .returning();
+      const credit = await grantPackageToCustomer(
+        e.ownerId!,
+        p!.id,
+        "client@example.test",
+        randomUUID(),
+        db,
+      );
+      const result = await createBooking({
+        ...intent(e),
+        redeemCredit: true,
+        creditOwnerUserId: clientUser,
+        creditRequestId: randomUUID(),
+      });
+      const b = (await db.query.bookings.findFirst({
+        where: eq(schema.bookings.uid, result.uid),
+      }))!;
+      await rescheduleBooking(b.uid, at("11:00").toISOString());
+      expect((await reload(b.id))!.paymentStatus).toBe("paid");
+      expect(
+        (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, credit) }))!
+          .usedCredits,
+      ).toBe(1);
+      await Promise.all([
+        decideBookingCancellation(b.uid, undefined, db),
+        decideBookingCancellation(b.uid, undefined, db),
+      ]);
+      expect(
+        (await db.query.packageCredits.findFirst({ where: eq(schema.packageCredits.id, credit) }))!
+          .usedCredits,
+      ).toBe(0);
+      const mutations = await db.query.packageCreditMutations.findMany({
+        where: eq(schema.packageCreditMutations.bookingId, b.id),
+      });
+      expect(mutations.filter((m) => m.kind === "redemption")).toHaveLength(1);
+      expect(mutations.filter((m) => m.kind === "restoration")).toHaveLength(1);
+    },
+  );
   it("prediction excludes only owned reserved blocks and exact calendar mirrors", async () => {
     const e = await service([{ id: await resource() }]);
     const b = await book(e);
@@ -939,19 +960,22 @@ describe.skipIf(!url)("Resource booking lifecycle PostgreSQL", () => {
     ).toBe(200);
     expect((await claims(pending.id))[0]!.releaseReason).toBe("rejected");
   });
-  it("host no-show retains finite claims and cannot revive a cancelled booking", async () => {
-    const e = await service([{ id: await resource() }]);
-    const b = await book(e);
-    mock.hostId = e.ownerId!;
-    const ctx = { params: Promise.resolve({ uid: b.uid }) };
-    expect((await noShowRoute(request({ noShow: true }), ctx)).status).toBe(200);
-    expect((await claims(b.id))[0]!.releasedAt).toBeNull();
-    expect((await noShowRoute(request({ noShow: false }), ctx)).status).toBe(200);
-    await decideBookingCancellation(b.uid, undefined, db);
-    expect((await noShowRoute(request({ noShow: false }), ctx)).status).toBe(409);
-    expect((await reload(b.id))!.status).toBe("cancelled");
-    expect((await claims(b.id))[0]!.releasedAt).not.toBeNull();
-  });
+  it.each([true, false])(
+    "host no-show retains finite claims and cannot revive a cancelled booking (requiresHost=%s)",
+    async (requiresHost) => {
+      const e = await service([{ id: await resource() }], org, requiresHost);
+      const b = await book(e);
+      mock.hostId = e.ownerId!;
+      const ctx = { params: Promise.resolve({ uid: b.uid }) };
+      expect((await noShowRoute(request({ noShow: true }), ctx)).status).toBe(200);
+      expect((await claims(b.id))[0]!.releasedAt).toBeNull();
+      expect((await noShowRoute(request({ noShow: false }), ctx)).status).toBe(200);
+      await decideBookingCancellation(b.uid, undefined, db);
+      expect((await noShowRoute(request({ noShow: false }), ctx)).status).toBe(409);
+      expect((await reload(b.id))!.status).toBe("cancelled");
+      expect((await claims(b.id))[0]!.releasedAt).not.toBeNull();
+    },
+  );
   it("move prediction uses frozen quantities and excludes only its own old commitment", async () => {
     const r = await resource(2);
     const e = await service([{ id: r, quantity: 2 }]);

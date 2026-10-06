@@ -39,7 +39,6 @@ export async function admitBookingReschedule(
       (service.resourceAdmissionEpoch !== predictedService.resourceAdmissionEpoch ||
         service.resourceConfigurationRevision !== predictedService.resourceConfigurationRevision ||
         !service.isActive ||
-        !service.requiresHost ||
         service.schedulingType !== "individual" ||
         service.maxAttendees !== 1 ||
         service.recurringCount !== 1)
@@ -52,13 +51,16 @@ export async function admitBookingReschedule(
       if (requirement)
         throw new BookingError("This booking requires scheduling adoption review", 409);
     }
-    await lockPersonAdmission(tx, expected.hostId ? [expected.hostId] : []);
+    await lockPersonAdmission(
+      tx,
+      expected.requiresHost && expected.hostId ? [expected.hostId] : [],
+    );
     const plan = expected.schedulingPlan;
     const host = expected.hostId
       ? await tx.query.users.findFirst({ where: eq(schema.users.id, expected.hostId) })
       : null;
     const prefs =
-      !expected.isGroup && expected.hostId
+      expected.requiresHost && !expected.isGroup && expected.hostId
         ? await tx.query.userPreferences.findFirst({
             where: eq(schema.userPreferences.userId, expected.hostId),
           })
@@ -74,12 +76,13 @@ export async function admitBookingReschedule(
     ] as const;
     const keys: string[] = [];
     if (limits.some(([, limit]) => limit != null) || prefs?.adaptiveAvailability) {
-      keys.push(
-        `${expected.hostId}:${DateTime.fromJSDate(startsAt)
-          .setZone(host?.timezone || "UTC")
-          .startOf("week")
-          .toISODate()}`,
-      );
+      if (expected.requiresHost)
+        keys.push(
+          `${expected.hostId}:${DateTime.fromJSDate(startsAt)
+            .setZone(host?.timezone || "UTC")
+            .startOf("week")
+            .toISODate()}`,
+        );
       for (const [unit, limit] of limits)
         if (limit != null)
           keys.push(`service-cap:${service.id}:${zone}:${unit}:${at.startOf(unit).toISODate()}`);
@@ -117,7 +120,8 @@ export async function admitBookingReschedule(
       if (
         !schedule ||
         schedule.userId !== plan.scheduleOwnerId ||
-        !plan.requiredHostIds.includes(current.hostId!)
+        plan.scheduleOwnerId !== current.hostId ||
+        (plan.requiresHost && !plan.requiredHostIds.includes(current.hostId!))
       )
         throw new BookingError("Accepted scheduling terms require review", 409);
       if (endsAt.getTime() - startsAt.getTime() !== plan.durationMinutes * 60000)
@@ -145,7 +149,7 @@ export async function admitBookingReschedule(
         "This prepaid booking needs finalization review before rescheduling",
         409,
       );
-    if (!current.isGroup && current.hostId) {
+    if (current.requiresHost && !current.isGroup && current.hostId) {
       const before = plan?.bufferBeforeMinutes ?? service.bufferBeforeMinutes;
       const after = plan?.bufferAfterMinutes ?? service.bufferAfterMinutes;
       const gap = plan?.minimumGapMinutes ?? service.minimumGapMinutes;
@@ -155,6 +159,7 @@ export async function admitBookingReschedule(
         .where(
           and(
             eq(schema.bookings.hostId, current.hostId),
+            eq(schema.bookings.requiresHost, true),
             ne(schema.bookings.id, current.id),
             inArray(schema.bookings.status, ["pending", "confirmed"]),
             sql`${schema.bookings.startsAt} - ${gap} * interval '1 minute' < ${new Date(endsAt.getTime() + after * 60000)}`,
@@ -189,7 +194,7 @@ export async function admitBookingReschedule(
       const result = await tx.execute<{
         count: number;
       }>(sql`select count(*)::int as count from bookings
-        where host_id=${current.hostId}::uuid and id<>${current.id}::uuid and status in ('pending','confirmed')
+        where requires_host AND host_id=${current.hostId}::uuid and id<>${current.id}::uuid and status in ('pending','confirmed')
         and starts_at>=${beginning.toJSDate()} and starts_at<${beginning.plus({ days: 1 }).toJSDate()}`);
       if (result.rows[0]!.count >= (prefs.maxMeetingsPerDay ?? 5))
         throw new BookingError("That day is protected for focus", 409);

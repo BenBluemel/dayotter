@@ -78,6 +78,8 @@ export const bookings = pgTable(
     /** Why the booking was last moved (shown to the host on the booking page). */
     rescheduleReason: text("reschedule_reason"),
 
+    /** Frozen capacity participation; hostId remains the responsible provider. */
+    requiresHost: boolean("requires_host").notNull().default(true),
     /** Null retains unknown scheduling history on legacy/unmanaged rows. */
     schedulingPlan: jsonb("scheduling_plan").$type<AcceptedSchedulingPlan>(),
     allocationRevision: bigint("allocation_revision", { mode: "number" }),
@@ -126,7 +128,7 @@ export const bookings = pgTable(
     uniqueIndex("bookings_host_slot_active_idx")
       .on(t.hostId, t.startsAt)
       .where(
-        sql`${t.status} IN ('confirmed', 'pending') AND ${t.isGroup} = false AND ${t.allowOverlap} = false`,
+        sql`${t.status} IN ('confirmed', 'pending') AND ${t.isGroup} = false AND ${t.allowOverlap} = false AND ${t.requiresHost} = true`,
       ),
   ],
 );

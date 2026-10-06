@@ -17,6 +17,7 @@ export async function withPreResourceSchedulingSchema<T>(seed: () => Promise<T>)
     [
       schema.bookings,
       [
+        "requiresHost",
         "schedulingPlan",
         "allocationRevision",
         "schedulingAttemptId",

@@ -66,7 +66,10 @@ export async function decideBookingCancellation(
       .where(eq(schema.paymentAttempts.bookingId, candidate.id))
       .for("update");
     await lockServiceAdmission(tx, candidate.eventTypeId);
-    await lockPersonAdmission(tx, candidate.hostId ? [candidate.hostId] : []);
+    await lockPersonAdmission(
+      tx,
+      candidate.requiresHost && candidate.hostId ? [candidate.hostId] : [],
+    );
     const [booking] = await tx
       .select()
       .from(schema.bookings)

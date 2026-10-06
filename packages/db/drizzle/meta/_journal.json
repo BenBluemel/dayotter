@@ -526,6 +526,13 @@
       "when": 1791249108575,
       "tag": "0074_resource_decline_coupon_restoration",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1791261780044,
+      "tag": "0075_resource_only_services",
+      "breakpoints": true
     }
   ]
 }

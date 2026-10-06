@@ -59,6 +59,7 @@ export const requirementsInput = z
     organizationId: z.string().uuid(),
     eventTypeId: z.string().uuid(),
     version: z.number().int().positive(),
+    requiresHost: z.boolean().optional(),
     requirements: z
       .array(z.object({ id: z.string().uuid().toLowerCase(), quantity }).strict())
       .max(100),
@@ -118,6 +119,7 @@ export async function listResourceConfiguration(
           title: schema.eventTypes.title,
           slug: schema.eventTypes.slug,
           version: schema.eventTypes.resourceConfigurationRevision,
+          requiresHost: schema.eventTypes.requiresHost,
           managed: sql<boolean>`${schema.eventTypes.resourceAdmissionEpoch} > 0`,
         })
         .from(schema.eventTypes)
@@ -216,6 +218,8 @@ export async function saveRequirements(
         "This service changed. Reload its requirements before saving again.",
         409,
       );
+    if (!(d.requiresHost ?? service.requiresHost) && !d.requirements.length)
+      throw new ConfigurationError("Resource-only services require at least one resource.", 400);
     const existing = await tx
       .select({
         id: schema.eventTypeResourceRequirements.resourceId,
@@ -231,9 +235,17 @@ export async function saveRequirements(
         sql`select resource_set_requirements(${d.eventTypeId}::uuid, ${JSON.stringify(d.requirements)}::jsonb)`,
       );
     }
+    if (d.requiresHost !== undefined && d.requiresHost !== service.requiresHost)
+      await tx
+        .update(schema.eventTypes)
+        .set({ requiresHost: d.requiresHost })
+        .where(eq(schema.eventTypes.id, d.eventTypeId));
     // Staging is not operational activation. This interface never changes admission epochs.
     const [saved] = await tx
-      .select({ version: schema.eventTypes.resourceConfigurationRevision })
+      .select({
+        version: schema.eventTypes.resourceConfigurationRevision,
+        requiresHost: schema.eventTypes.requiresHost,
+      })
       .from(schema.eventTypes)
       .where(eq(schema.eventTypes.id, d.eventTypeId));
     return {
@@ -242,6 +254,7 @@ export async function saveRequirements(
         title: service.title,
         version: saved!.version,
         managed: service.resourceAdmissionEpoch > 0,
+        requiresHost: saved!.requiresHost,
         requirements: d.requirements,
       },
     };

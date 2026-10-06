@@ -309,6 +309,7 @@ export class GoogleCalendarAdapter implements CalendarAdapter {
   private toGoogleEvent(event: NewCalendarEvent): calendar_v3.Schema$Event {
     const body: calendar_v3.Schema$Event = {
       summary: event.title,
+      transparency: event.transparency ?? "opaque",
       description: event.description,
       location: event.location,
       start: { dateTime: event.start.toISOString(), timeZone: event.timezone },

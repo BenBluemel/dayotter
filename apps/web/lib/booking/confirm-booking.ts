@@ -97,7 +97,10 @@ export async function approveBooking(uid: string, hostUserId: string): Promise<R
             .where(eq(schema.paymentAttempts.bookingId, booking.id))
             .for("update");
           await lockServiceAdmission(tx, booking.eventTypeId);
-          await lockPersonAdmission(tx, booking.hostId ? [booking.hostId] : []);
+          await lockPersonAdmission(
+            tx,
+            booking.requiresHost && booking.hostId ? [booking.hostId] : [],
+          );
           return confirm(tx);
         })
       : await confirm(db);
