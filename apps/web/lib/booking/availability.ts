@@ -217,9 +217,11 @@ export async function hostSlots(
     .map((cal) => cal.id);
 
   const [busyRows, existingBookings, blocks, prefs, teamRuleRows, oooRows] = await Promise.all([
-    calendarIds.length ? busyBlocksFor(calendarIds, rangeStart, rangeEnd) : Promise.resolve([]),
+    calendarIds.length
+      ? busyBlocksFor(calendarIds, rangeStart, rangeEnd, excludeBookingId)
+      : Promise.resolve([]),
     bookingsFor([userId], rangeStart, rangeEnd, excludeBookingId, ignoreGroupEventTypeId),
-    timeBlocksFor(userId, rangeStart, rangeEnd),
+    timeBlocksFor(userId, rangeStart, rangeEnd, excludeBookingId),
     getDb().query.userPreferences.findFirst({
       where: eq(schema.userPreferences.userId, userId),
       columns: {
@@ -310,10 +312,18 @@ export async function hostSlots(
 }
 
 /** The user's personal / focus blocks overlapping the window. */
-function timeBlocksFor(userId: string, rangeStart: Date, rangeEnd: Date) {
+function timeBlocksFor(
+  userId: string,
+  rangeStart: Date,
+  rangeEnd: Date,
+  excludeBookingId?: string,
+) {
   return getDb().query.timeBlocks.findMany({
     where: and(
       eq(schema.timeBlocks.userId, userId),
+      excludeBookingId
+        ? sql`(${schema.timeBlocks.bookingId} IS NULL OR ${schema.timeBlocks.bookingId} <> ${excludeBookingId}::uuid)`
+        : undefined,
       lte(schema.timeBlocks.startsAt, rangeEnd),
       gte(schema.timeBlocks.endsAt, rangeStart),
     ),
@@ -371,10 +381,20 @@ function outOfOfficeFor(userId: string, rangeStart: Date, rangeEnd: Date) {
 
 /** Busy blocks that OVERLAP the window (not just those that start inside it - a
  * long meeting starting before rangeStart still blocks the window's opening). */
-function busyBlocksFor(calendarIds: string[], rangeStart: Date, rangeEnd: Date) {
+function busyBlocksFor(
+  calendarIds: string[],
+  rangeStart: Date,
+  rangeEnd: Date,
+  excludeBookingId?: string,
+) {
   return getDb().query.busyBlocks.findMany({
     where: and(
       inArray(schema.busyBlocks.calendarId, calendarIds),
+      excludeBookingId
+        ? sql`NOT EXISTS (SELECT 1 FROM booking_references ref
+        WHERE ref.booking_id=${excludeBookingId}::uuid AND ref.calendar_id=${schema.busyBlocks.calendarId}
+        AND ref.external_event_id=${schema.busyBlocks.externalEventId})`
+        : undefined,
       lte(schema.busyBlocks.startsAt, rangeEnd),
       gte(schema.busyBlocks.endsAt, rangeStart),
     ),

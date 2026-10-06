@@ -1,6 +1,7 @@
 import { decryptJson, encryptJson, logger } from "@dayotter/core";
-import { type Database, and, eq, getDb, schema } from "@dayotter/db";
+import { type Database, and, eq, getDb, schema, withResourceTransaction } from "@dayotter/db";
 import { type FinalizeContext, finalizeConfirmedBooking } from "../booking/finalize-booking";
+import { lockServiceAdmission } from "../booking/resource-acceptance";
 
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
@@ -61,16 +62,17 @@ export async function finalizePaymentBooking(attemptId: string, db: Database = g
     const context = decryptJson<FinalizeContext>(attempt.finalizationContext);
     context.booking.startsAt = new Date(context.booking.startsAt);
     context.booking.endsAt = new Date(context.booking.endsAt);
-    // Share cancellation's attempt -> booking lock order. Reading the booking
+    // Share cancellation's attempt -> service -> booking lock order. Reading the booking
     // and then claiming outside this transaction could start a stale finalizer
     // after cancellation/refund had already been accepted.
-    const claimed = await db.transaction(async (tx) => {
+    const claimed = await withResourceTransaction(db, async (tx) => {
       const [locked] = await tx
         .select()
         .from(schema.paymentAttempts)
         .where(eq(schema.paymentAttempts.id, attempt.id))
         .for("update");
       if (locked?.finalizationState !== "pending") return [];
+      await lockServiceAdmission(tx, locked.eventTypeId);
       const [current] = await tx
         .select()
         .from(schema.bookings)

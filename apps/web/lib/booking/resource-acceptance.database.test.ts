@@ -12,16 +12,18 @@ import {
 import { bindAttemptSession, prepareAppointmentAttempt } from "../payments/attempts";
 import { listPaidReview, resolvePaidReview } from "../payments/paid-review";
 import { processAppointmentEvent, receiveAppointmentEvent } from "../payments/payment-events";
+import { finalizePaymentBooking } from "../payments/payment-finalization";
 import { fulfillObservedPayment, observePaymentSuccess } from "../payments/payment-work";
 import { recoverAppointmentPayments } from "../payments/recovery";
 import { fixtureRefundCharge, fixtureRefundEvidence } from "../payments/refund-fixtures";
-import { executeRefundOperation } from "../payments/refunds";
+import { decideBookingCancellation, executeRefundOperation } from "../payments/refunds";
 import { ResourceInvariantError } from "./booking-logic";
-import { approveBooking, declineBooking } from "./confirm-booking";
+import { approveBooking } from "./confirm-booking";
 import { createBooking } from "./create-booking";
 import { createHostBooking } from "./host-booking";
 import { createInternalTeamBooking } from "./internal-team-booking";
 import { createOtterEvent } from "./otter-create";
+import { admitBookingReschedule } from "./reschedule-admission";
 const mock = vi.hoisted(() => ({
   db: null as unknown as ReturnType<typeof createDatabase>,
   pi: vi.fn(),
@@ -330,7 +332,7 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     await expect(book(ordinary, "2030-01-01T10:35:00.000Z")).rejects.toMatchObject({ status: 409 });
     expect(await counts(ordinary.id)).toEqual({ b: 0, c: 0 });
   });
-  it("pending managed acceptance owns claims; approval retains them and decline fails closed", async () => {
+  it("pending managed acceptance owns claims and approval retains them", async () => {
     const e = await service([{ id: await resource() }]);
     await db
       .update(schema.eventTypes)
@@ -342,7 +344,6 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
       where: eq(schema.bookingResourceClaims.bookingId, booking.id),
     });
     expect(claims).toHaveLength(1);
-    expect(await declineBooking(booking.uid, e.ownerId!)).toBe("not_pending");
     expect(await approveBooking(booking.uid, e.ownerId!)).toBe("ok");
     expect(await approveBooking(booking.uid, e.ownerId!)).toBe("not_pending");
     expect(
@@ -1398,5 +1399,72 @@ describe.skipIf(!url)("Resource booking acceptance PostgreSQL", () => {
     });
     expect(after?.recoveryFailures).toBe(0);
     expect(await counts(e.id)).toEqual({ b: 0, c: 0 });
+  });
+  it("paid resource move preserves accepted settlement; capacity failure leaves the paid booking intact", async () => {
+    const r = await resource();
+    const e = await service([{ id: r }], 5000);
+    const c = await coupon(e, 5000);
+    const a = await paid(e, c.code);
+    const result = await fulfillObservedPayment(a.id, db);
+    await finalizePaymentBooking(a.id, db);
+    const b = (await db.query.bookings.findFirst({ where: eq(schema.bookings.uid, result.uid!) }))!;
+    const snapshot = await db.query.bookingPricingSnapshots.findFirst({
+      where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
+    });
+    const savedAttempt = await db.query.paymentAttempts.findFirst({
+      where: eq(schema.paymentAttempts.id, a.id),
+    });
+    const to = new Date("2030-01-01T11:00:00Z");
+    await admitBookingReschedule(db, b, e, to, new Date(to.getTime() + 1800000));
+    expect(
+      await db.query.bookingPricingSnapshots.findFirst({
+        where: eq(schema.bookingPricingSnapshots.bookingId, b.id),
+      }),
+    ).toEqual(snapshot);
+    expect(
+      await db.query.paymentAttempts.findFirst({ where: eq(schema.paymentAttempts.id, a.id) }),
+    ).toEqual(savedAttempt);
+    expect(
+      (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!.paymentStatus,
+    ).toBe("paid");
+    const blocker = await service([{ id: r }]);
+    await book(blocker, "2030-01-01T12:00:00Z");
+    const current = (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) }))!;
+    await expect(
+      admitBookingReschedule(
+        db,
+        current,
+        e,
+        new Date("2030-01-01T12:00:00Z"),
+        new Date("2030-01-01T12:30:00Z"),
+      ),
+    ).rejects.toBeDefined();
+    expect(await db.query.bookings.findFirst({ where: eq(schema.bookings.id, b.id) })).toEqual(
+      current,
+    );
+    expect(
+      await db.query.refundOperations.findMany({
+        where: eq(schema.refundOperations.bookingId, b.id),
+      }),
+    ).toHaveLength(0);
+    const decisions = await Promise.all([
+      decideBookingCancellation(b.uid, undefined, db),
+      decideBookingCancellation(b.uid, undefined, db),
+    ]);
+    expect(decisions.filter((d) => d!.changed)).toHaveLength(1);
+    expect(decisions.every((d) => d!.operation?.id === decisions[0]!.operation!.id)).toBe(true);
+    expect(
+      await db.query.appointmentCouponRestorations.findMany({
+        where: eq(schema.appointmentCouponRestorations.bookingId, b.id),
+      }),
+    ).toHaveLength(1);
+    expect(
+      (
+        await db.query.bookingResourceClaims.findMany({
+          where: eq(schema.bookingResourceClaims.bookingId, b.id),
+        })
+      ).every((c) => c.releasedAt),
+    ).toBe(true);
+    expect(await executeRefundOperation(decisions[0]!.operation!.id, db)).toBe("refunded");
   });
 });

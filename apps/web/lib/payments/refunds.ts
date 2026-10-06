@@ -10,10 +10,13 @@ import {
   lte,
   ne,
   or,
+  releaseBookingResources,
   schema,
+  withResourceTransaction,
 } from "@dayotter/db";
 import { BookingError } from "../booking/booking-logic";
 import { restoreBookingCoupon } from "../booking/coupon-uses";
+import { lockPersonAdmission, lockServiceAdmission } from "../booking/resource-acceptance";
 import { restoreBookingCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "./booking-routing";
 import { validatePaymentIntentTerms } from "./payment-success";
@@ -47,13 +50,14 @@ export function publicRefundState(operation: RefundOperation): PublicRefundState
 }
 
 /** Existing authorization lives at the capability-UID/API callers. Lock order is
- * attempt -> booking -> operation, shared with fulfillment/finalization. No Stripe I/O here. */
+ * attempt -> service -> person -> booking -> financial -> resources, shared with fulfillment/finalization. No Stripe I/O here. */
 export async function decideBookingCancellation(
   uid: string,
   reason?: string,
   db: Database = getDb(),
+  declineHostId?: string,
 ) {
-  return db.transaction(async (tx) => {
+  return withResourceTransaction(db, async (tx) => {
     const candidate = await tx.query.bookings.findFirst({ where: eq(schema.bookings.uid, uid) });
     if (!candidate) return null;
     const [attempt] = await tx
@@ -61,18 +65,21 @@ export async function decideBookingCancellation(
       .from(schema.paymentAttempts)
       .where(eq(schema.paymentAttempts.bookingId, candidate.id))
       .for("update");
+    await lockServiceAdmission(tx, candidate.eventTypeId);
+    await lockPersonAdmission(tx, candidate.hostId ? [candidate.hostId] : []);
     const [booking] = await tx
       .select()
       .from(schema.bookings)
       .where(eq(schema.bookings.id, candidate.id))
       .for("update");
     if (!booking) return null;
-    if (booking.schedulingPlan && !["cancelled", "rejected"].includes(booking.status))
-      throw new BookingError(
-        "Resource booking cancellation is not available until lifecycle support is enabled",
-        409,
-      );
-    const changed = booking.status !== "cancelled";
+    if (declineHostId && (booking.hostId !== declineHostId || booking.status !== "pending"))
+      return null;
+    if (declineHostId && booking.paymentStatus === "paid")
+      throw new BookingError("Cancel this paid booking through the refund path", 409);
+    const targetStatus = declineHostId ? "rejected" : "cancelled";
+    const changed =
+      booking.status !== "cancelled" && !(booking.schedulingPlan && booking.status === "rejected");
     // 0064 fulfilled attempts lack verified charge facts. They remain explicitly
     // legacy rather than inventing a RefundOperation snapshot from today's config.
     const durable = Boolean(attempt?.successFacts);
@@ -92,7 +99,7 @@ export async function decideBookingCancellation(
     if (changed)
       await tx
         .update(schema.bookings)
-        .set({ status: "cancelled", cancelledAt: new Date(), cancelReason: reason ?? null })
+        .set({ status: targetStatus, cancelledAt: new Date(), cancelReason: reason ?? null })
         .where(eq(schema.bookings.id, booking.id));
     const creditRestoration = await restoreBookingCredit(tx, booking);
     await restoreBookingCoupon(tx, booking);
@@ -146,6 +153,8 @@ export async function decideBookingCancellation(
           })
           .where(eq(schema.paymentAttempts.id, attempt.id));
     }
+    // Existing restoration/refund custody is complete before the full resource fence.
+    if (booking.schedulingPlan) await releaseBookingResources(tx, booking.id);
     return { booking, changed, durable, operation, creditRestoration };
   });
 }

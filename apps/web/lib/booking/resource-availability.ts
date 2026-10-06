@@ -224,3 +224,36 @@ export async function filterResourceAvailability(
     mapInsertError(error);
   }
 }
+
+/** A move has one candidate and a proven immutable plan. Reuse PostgreSQL's
+ * interval/peak/hours semantics, excluding only this booking's old commitment.
+ * This is advisory; the transactional replacement still fences and rechecks.
+ */
+export async function acceptedBookingResourceAvailable(
+  booking: typeof schema.bookings.$inferSelect,
+  startsAt: Date,
+  endsAt: Date,
+  db: Database = getDb(),
+): Promise<boolean> {
+  const plan = booking.schedulingPlan;
+  if (!plan) return true;
+  try {
+    const result = await db.execute<{ available: boolean }>(sql`
+      WITH candidate AS (
+        SELECT resource_occupied_interval(${startsAt}::timestamptz, ${endsAt}::timestamptz,
+          ${JSON.stringify(plan)}::jsonb) AS occupied
+      ) SELECT NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(${JSON.stringify(plan.resources)}::jsonb) x
+        LEFT JOIN resources r ON r.id=(x->>'id')::uuid AND r.organization_id=${booking.organizationId}::uuid
+        CROSS JOIN candidate c
+        WHERE r.id IS NULL OR NOT r.enabled OR (x->>'quantity')::integer<=0
+          OR (x->>'quantity')::integer>r.capacity
+          OR NOT resource_open_during(r.opening_hours,lower(c.occupied),upper(c.occupied))
+          OR resource_peak(r.id,lower(c.occupied),upper(c.occupied),${booking.id}::uuid)
+             +(x->>'quantity')::integer>r.capacity
+      ) AS available`);
+    return result.rows[0]?.available === true;
+  } catch (error) {
+    mapInsertError(error);
+  }
+}

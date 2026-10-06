@@ -10,9 +10,10 @@ import {
   withResourceTransaction,
 } from "@dayotter/db";
 import { bookingDeclined, sendEmail } from "@dayotter/emails";
+import { decideBookingCancellation } from "../payments/refunds";
 import { mapInsertError } from "./booking-logic";
 import { finalizeConfirmedBooking } from "./finalize-booking";
-import { lockServiceAdmission } from "./resource-acceptance";
+import { lockPersonAdmission, lockServiceAdmission } from "./resource-acceptance";
 
 /** Outcome of a host review action, mapped to HTTP status by the route. */
 export type ReviewResult = "ok" | "not_found" | "forbidden" | "not_pending" | "full";
@@ -78,19 +79,25 @@ export async function approveBooking(uid: string, hostUserId: string): Promise<R
   // the slot is already held by this pending row (the partial unique index +
   // no-overlap constraint include `pending`), so the flip can't collide with
   // another confirmed booking; the guard is belt-and-braces.
-  let claimed: { id: string }[];
+  let claimed: (typeof schema.bookings.$inferSelect)[];
   try {
     const confirm = (writer: Pick<ReturnType<typeof getDb>, "update">) =>
       writer
         .update(schema.bookings)
         .set({ status: "confirmed" })
         .where(and(eq(schema.bookings.id, booking.id), eq(schema.bookings.status, "pending")))
-        .returning({ id: schema.bookings.id });
+        .returning();
     claimed = booking.schedulingPlan
       ? await withResourceTransaction(db, async (tx) => {
           // Pending already owns its claims. Take admission before the booking
           // row lock; the deferred check proves that approval retains them.
+          await tx
+            .select()
+            .from(schema.paymentAttempts)
+            .where(eq(schema.paymentAttempts.bookingId, booking.id))
+            .for("update");
           await lockServiceAdmission(tx, booking.eventTypeId);
+          await lockPersonAdmission(tx, booking.hostId ? [booking.hostId] : []);
           return confirm(tx);
         })
       : await confirm(db);
@@ -106,6 +113,9 @@ export async function approveBooking(uid: string, hostUserId: string): Promise<R
     return "full";
   }
   if (claimed.length === 0) return "not_pending";
+  // A pending move may have committed since the preflight read. Finalize the
+  // row actually confirmed, never the earlier scheduling revision.
+  Object.assign(booking, claimed[0]);
 
   const { attendee, guests } = splitAttendees(booking.attendees, booking.timezone);
   await finalizeConfirmedBooking({
@@ -139,14 +149,11 @@ export async function declineBooking(
   });
   if (!booking) return "not_found";
   if (booking.hostId !== hostUserId) return "forbidden";
-  if (booking.status !== "pending" || booking.schedulingPlan) return "not_pending";
+  if (booking.status !== "pending") return "not_pending";
 
-  const claimed = await db
-    .update(schema.bookings)
-    .set({ status: "rejected", cancelReason: reason ?? null })
-    .where(and(eq(schema.bookings.id, booking.id), eq(schema.bookings.status, "pending")))
-    .returning({ id: schema.bookings.id });
-  if (claimed.length === 0) return "not_pending";
+  const decision = await decideBookingCancellation(uid, reason, db, hostUserId);
+  if (!decision?.changed) return "not_pending";
+  Object.assign(booking, decision.booking);
 
   const appUrl = env.APP_URL;
   try {

@@ -1,11 +1,11 @@
 import { env } from "@/lib/server/env";
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, gte, lt, ne, schema, sql } from "@dayotter/db";
+import { and, eq, getDb, schema } from "@dayotter/db";
 import { bookingRescheduled, sendEmail } from "@dayotter/emails";
-import { DateTime } from "luxon";
 import { reserveRuleBlocks } from "../automation/apply-rules";
 import { updateBookingCalendarEvent } from "../calendar/host-calendar";
 import { SLOT_REVALIDATION_WINDOW_MS, eventConstraints, hostSlots } from "./availability";
+import { BookingError, mapInsertError } from "./booking-logic";
 import { AUTO_CONFERENCE } from "./event-type-input";
 import { fanOutBookingLifecycle } from "./lifecycle";
 import {
@@ -18,6 +18,8 @@ import {
   scheduleScribe,
   scheduleWorkflowMessages,
 } from "./reminders";
+import { admitBookingReschedule } from "./reschedule-admission";
+import { acceptedBookingResourceAvailable } from "./resource-availability";
 import { reserveTravelBlocks } from "./travel";
 
 export class RescheduleError extends Error {
@@ -42,11 +44,9 @@ export async function rescheduleBooking(
     where: eq(schema.bookings.uid, uid),
     with: { attendees: true, host: true },
   });
-  if (!booking || booking.status === "cancelled") {
+  if (!booking || !["pending", "confirmed"].includes(booking.status)) {
     throw new RescheduleError("Booking not found", 404);
   }
-  if (booking.schedulingPlan)
-    throw new RescheduleError("Resource booking moves require lifecycle support", 409);
   const eventType = await db.query.eventTypes.findFirst({
     where: eq(schema.eventTypes.id, booking.eventTypeId),
   });
@@ -72,10 +72,25 @@ export async function rescheduleBooking(
   // Validate the new slot against the booking's actual host only (not the whole
   // team) - the host is already fixed, so there's no need to fan out. Validate at
   // the booking's real duration, too.
-  const scheduleId = eventType.ownerId === booking.hostId ? eventType.scheduleId : null;
+  const plan = booking.schedulingPlan;
+  const scheduleId =
+    plan?.scheduleId ?? (eventType.ownerId === booking.hostId ? eventType.scheduleId : null);
+  if (plan) {
+    const schedule = await db.query.schedules.findFirst({
+      where: eq(schema.schedules.id, plan.scheduleId),
+    });
+    if (!schedule || schedule.userId !== plan.scheduleOwnerId)
+      throw new RescheduleError("Accepted scheduling terms require review", 409);
+  }
   const constraints = {
     ...eventConstraints(eventType),
     durationMinutes: Math.round(durationMs / 60_000),
+    ...(plan
+      ? {
+          bufferBeforeMinutes: plan.bufferBeforeMinutes,
+          bufferAfterMinutes: plan.bufferAfterMinutes,
+        }
+      : {}),
   };
   const slots = await hostSlots(
     booking.hostId,
@@ -83,122 +98,42 @@ export async function rescheduleBooking(
     constraints,
     new Date(newStart.getTime() - SLOT_REVALIDATION_WINDOW_MS),
     new Date(newStart.getTime() + SLOT_REVALIDATION_WINDOW_MS),
-    0,
+    plan?.minimumGapMinutes ?? eventType.minimumGapMinutes,
     booking.id, // don't let the booking being moved block its own new slot
   );
   if (!slots.some((s) => s.start.getTime() === newStart.getTime())) {
     throw new RescheduleError("That time is no longer available", 409);
   }
 
-  // Focus cap: don't let a reschedule move a booking INTO an already-capped day.
-  const focusPrefs =
-    !booking.isGroup && booking.hostId
-      ? await db.query.userPreferences.findFirst({
-          where: eq(schema.userPreferences.userId, booking.hostId),
-          columns: { adaptiveAvailability: true, maxMeetingsPerDay: true },
-        })
-      : null;
-  const zone = booking.host?.timezone || "UTC";
-  const targetDay = DateTime.fromJSDate(newStart).setZone(zone);
-  const dayStart = targetDay.startOf("day").toJSDate();
-  const nextDay = targetDay.startOf("day").plus({ days: 1 }).toJSDate();
-  const weekStartD = targetDay.startOf("week");
+  if (!(await acceptedBookingResourceAvailable(booking, newStart, newEnd, db)))
+    throw new RescheduleError("That appointment is unavailable", 409);
 
-  // Cap checks + the move run in one transaction, serialized on host+week so a
-  // concurrent booking can't slip the day/week cap (mirrors createBooking). A
-  // same-slot collision (23505/23P01) maps to a clean 409 instead of a 500.
+  let moved: typeof booking | typeof schema.bookings.$inferSelect | null;
   try {
-    await db.transaction(async (tx) => {
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtext(${`${booking.hostId}:${weekStartD.toISODate()}`}))`,
-      );
-
-      const [current] = await tx
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.id, booking.id))
-        .for("update");
-      if (!current || current.status === "cancelled")
-        throw new RescheduleError("Booking is not available for rescheduling", 409);
-      const redemption = await tx.query.packageCreditMutations.findFirst({
-        where: and(
-          eq(schema.packageCreditMutations.bookingId, booking.id),
-          eq(schema.packageCreditMutations.kind, "redemption"),
-        ),
-      });
-      if (
-        redemption &&
-        ["pending", "running", "requires_review"].includes(redemption.finalizationState ?? "")
-      )
-        throw new RescheduleError(
-          "This prepaid booking needs finalization review before rescheduling",
-          409,
-        );
-
-      const countOnDay = async (byEventType: boolean) => {
-        const [{ count } = { count: 0 }] = await tx
-          .select({ count: sql<number>`count(*)::int` })
-          .from(schema.bookings)
-          .where(
-            and(
-              byEventType
-                ? eq(schema.bookings.eventTypeId, eventType.id)
-                : eq(schema.bookings.hostId, booking.hostId),
-              eq(schema.bookings.status, "confirmed"),
-              ne(schema.bookings.id, booking.id),
-              gte(schema.bookings.startsAt, dayStart),
-              lt(schema.bookings.startsAt, nextDay),
-            ),
-          );
-        return count;
-      };
-
-      if (eventType.dailyBookingLimit != null) {
-        if ((await countOnDay(true)) >= eventType.dailyBookingLimit) {
-          throw new RescheduleError("That day is fully booked. Please pick another day.", 409);
-        }
-      }
-      if (focusPrefs?.adaptiveAvailability) {
-        if ((await countOnDay(false)) >= (focusPrefs.maxMeetingsPerDay ?? 5)) {
-          throw new RescheduleError(
-            "That day is protected for focus and has reached its meeting limit.",
-            409,
-          );
-        }
-      }
-      if (eventType.weeklyBookingLimit != null) {
-        const weekStart = weekStartD.toJSDate();
-        const nextWeek = weekStartD.plus({ weeks: 1 }).toJSDate();
-        const [{ count } = { count: 0 }] = await tx
-          .select({ count: sql<number>`count(*)::int` })
-          .from(schema.bookings)
-          .where(
-            and(
-              eq(schema.bookings.eventTypeId, eventType.id),
-              eq(schema.bookings.status, "confirmed"),
-              ne(schema.bookings.id, booking.id),
-              gte(schema.bookings.startsAt, weekStart),
-              lt(schema.bookings.startsAt, nextWeek),
-            ),
-          );
-        if (count >= eventType.weeklyBookingLimit) {
-          throw new RescheduleError("That week is fully booked. Please pick another week.", 409);
-        }
-      }
-
-      await tx
-        .update(schema.bookings)
-        .set({ startsAt: newStart, endsAt: newEnd, rescheduleReason: reason ?? null })
-        .where(eq(schema.bookings.id, booking.id));
-    });
-  } catch (err) {
-    if (err instanceof RescheduleError) throw err;
-    const code = (err as { code?: string })?.code;
-    if (code === "23505" || code === "23P01") {
-      throw new RescheduleError("That time was just booked", 409);
+    moved = await admitBookingReschedule(db, booking, eventType, newStart, newEnd, reason);
+  } catch (error) {
+    try {
+      mapInsertError(error);
+    } catch (mapped) {
+      if (mapped instanceof BookingError) throw new RescheduleError(mapped.message, mapped.status);
+      throw mapped;
     }
-    throw err;
   }
+  if (!moved) return;
+  // Pending requests hold capacity but have no provider event/reminder suite yet.
+  if (moved.status === "pending") return;
+  const stillCurrent = async () => {
+    const current = await db.query.bookings.findFirst({
+      where: eq(schema.bookings.id, booking.id),
+    });
+    return (
+      current?.status === "confirmed" &&
+      current.startsAt.getTime() === newStart.getTime() &&
+      current.endsAt.getTime() === newEnd.getTime() &&
+      current.allocationRevision === moved.allocationRevision
+    );
+  };
+  if (!(await stillCurrent())) return;
 
   // Move the calendar event (best-effort).
   const meetingUrl = await updateBookingCalendarEvent(booking.id, {
@@ -211,8 +146,22 @@ export async function rescheduleBooking(
     location: eventType.locationDetail ?? undefined,
     createConference: AUTO_CONFERENCE.includes(eventType.location),
   });
+  if (!(await stillCurrent())) return;
   if (meetingUrl) {
-    await db.update(schema.bookings).set({ meetingUrl }).where(eq(schema.bookings.id, booking.id));
+    await db
+      .update(schema.bookings)
+      .set({ meetingUrl })
+      .where(
+        and(
+          eq(schema.bookings.id, booking.id),
+          eq(schema.bookings.status, "confirmed"),
+          eq(schema.bookings.startsAt, newStart),
+          eq(schema.bookings.endsAt, newEnd),
+          ...(moved.allocationRevision == null
+            ? []
+            : [eq(schema.bookings.allocationRevision, moved.allocationRevision)]),
+        ),
+      );
   }
 
   // Replace reminders at the host's preferred lead times.
@@ -242,6 +191,7 @@ export async function rescheduleBooking(
     }
   }
 
+  if (!(await stillCurrent())) return;
   // Move the booking's reserved travel / prep / buffer blocks to the new time
   // (else the old ones linger and new ones would double up).
   await db
@@ -264,6 +214,7 @@ export async function rescheduleBooking(
     place: eventType.locationDetail,
   });
 
+  if (!(await stillCurrent())) return;
   logger.info("booking rescheduled", {
     event: "booking_rescheduled",
     bookingId: booking.id,

@@ -1488,3 +1488,63 @@ teams/groups, recurrence, UI, or legacy reconciliation. Live activation remains
 closed until the remaining lifecycle/consumer work and operational readiness pass.
 Legacy Redis checkout sessions still require draining/operator review before
 activation; this slice does not perform that work.
+
+### Implemented application slice 4: booking lifecycle
+
+Ordinary moves now use `rescheduleBooking` → `admitBookingReschedule`. The
+capability-UID web/mobile endpoint, confirmed Otter reschedule/batch-shift tools,
+and confirmed SMS actions share this writer. API-key v1 exposes create/list only;
+there is no separate API-key time/status mutation. Calendar sync updates provider
+mirrors, not accepted booking times. Assistant metadata edits cannot change time,
+host, service, or booking status. Raw managed time/cancellation writes remain
+protected by the existing revision and deferred completeness guards.
+
+Moves retain booking ID/UID, actual duration, settlement, coupon/redemption and
+pricing snapshot, and the original immutable scheduling plan. Its schedule ID is
+used with live person hours/timezone/overrides, without falling back to a newly
+selected/default schedule. Prediction excludes only that booking's own row,
+reserved blocks and exact calendar/event reference pairs. Resource opening hours,
+enabled state, capacity and original quantities/buffers are enforced by the same
+SQL allocator/claim guards used for fresh acceptance. Current service admission
+is rechecked; staged requirements on an unproven legacy row fail closed rather
+than inventing an accepted plan.
+
+The whole database move transaction retries bounded `40001`/`40P01` failures.
+It locks payment attempt → service admission SHARE → person mutex → complete
+sorted destination cap keys (including legacy host/week compatibility) → booking.
+Original cap occupancy is decreasing, so it needs no additional old-period locks.
+It checks pending/confirmed status, expected scheduling revision, actual duration,
+service configuration, finalization custody, person gap and day/week/month/year/
+focus caps before tentatively updating the host index and allocation revision.
+The existing allocator fences the complete original resource set in UUID order,
+checks destination capacity excluding that booking, and replaces all claims in
+the same transaction. Old claims retain their interval/quantity/name, release
+reason/time and successor predecessor links. Any later failure rolls everything
+back. Duplicate same-destination requests converge without another revision.
+
+Cancellation, per-occurrence series cancellation, confirmed assistant/SMS cancel
+and refund recovery share `decideBookingCancellation`. Host decline also uses
+that decision with a locked pending/host check and terminal `rejected` status.
+Paid pending decline fails closed and requires the established cancellation/
+refund path. Attempt → service → person → booking locks precede the status change,
+existing credit/coupon restoration and durable refund obligation, then resource
+release. No counting cap locks are needed for a decrease. Terminal repeats retain
+release timestamps and history and do not add restorations or obligations. Release
+works even when a resource or service is disabled or its hours have changed.
+
+Approval retains pending claims and finalizes the row actually confirmed. Worker
+completion and host no-show/revert acquire service admission before booking
+writes; conditional updates cannot revive cancelled/rejected bookings. Completed
+and no-show claims retain their finite historical occupancy. Paid finalization
+claims its work under attempt → service → booking order; ordinary moves refuse
+pending/running/review finalization rather than racing an original paid finalizer.
+Post-commit reschedule work checks the committed revision and conditionally saves
+meeting metadata. Provider/email/queue delivery retains its established
+best-effort boundary; no exactly-once external-effects subsystem was added.
+
+No schema/index changes or historical adoption/backfill were needed. This slice
+does not activate live services, introduce holds, add UI or enable resource
+recurrence/host-free modes. **Legacy Redis checkout sessions must still be
+drained and reviewed by an operator before activation.** Coordinated activation,
+reviewed legacy adoption and the existing operational readiness checks remain
+separate work.

@@ -1,4 +1,5 @@
-import { declineBooking } from "@/lib/booking/confirm-booking";
+import { BookingError } from "@/lib/booking/booking-logic";
+import { type ReviewResult, declineBooking } from "@/lib/booking/confirm-booking";
 import { jsonError, withUser } from "@/lib/server/http";
 import { enforceRateLimit } from "@/lib/server/rate-limit";
 import { NextResponse } from "next/server";
@@ -22,7 +23,13 @@ export const POST = withUser(async (u, request, ctx: { params: Promise<{ uid: st
   const parsed = body.safeParse(await request.json().catch(() => ({})));
   const reason = parsed.success ? parsed.data.reason?.trim() || undefined : undefined;
 
-  const result = await declineBooking(uid, u.id, reason);
+  let result: ReviewResult;
+  try {
+    result = await declineBooking(uid, u.id, reason);
+  } catch (error) {
+    if (error instanceof BookingError) return jsonError(error.message, error.status);
+    throw error;
+  }
   switch (result) {
     case "ok":
       return NextResponse.json({ ok: true, status: "rejected" });
