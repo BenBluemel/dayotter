@@ -8,12 +8,12 @@ import { cn } from "@/lib/cn";
 import { Check, Copy, Plus, X } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
-interface Range {
+export interface Range {
   start: string; // "HH:MM"
   end: string;
 }
 
-interface Override {
+export interface Override {
   date: string; // "YYYY-MM-DD"
   start: string | null; // null = unavailable all day
   end: string | null;
@@ -36,19 +36,20 @@ function timezoneList(current: string): string[] {
     const all = (
       Intl as unknown as { supportedValuesOf?: (k: string) => string[] }
     ).supportedValuesOf?.("timeZone");
-    if (all?.length) return all;
+    if (all?.length) return [...new Set([current, "UTC", ...all])];
   } catch {
     /* older runtime */
   }
   return [current, "UTC"];
 }
 
-function Toggle({ on, onClick }: { on: boolean; onClick: () => void }) {
+function Toggle({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={on}
+      aria-label={label}
       onClick={onClick}
       className={cn(
         // Border in BOTH states + inline-flex/items-center so the knob stays
@@ -76,12 +77,21 @@ export function AvailabilityEditor({
   initial,
   scheduleId,
   sidebar,
+  onSave,
+  resourceHours = false,
+  allowInitialSave = false,
+  disabled = false,
 }: {
   initial: { timezone: string; days: Range[][]; overrides?: Override[] };
   /** When set, save to this named schedule; otherwise the legacy default endpoint. */
   scheduleId?: string;
   /** Slotted into the top of the right-hand side panel (the schedule switcher). */
   sidebar?: ReactNode;
+  /** Shared editor; resource writes use their own authorized configuration endpoint. */
+  onSave?: (hours: { timezone: string; days: Range[][]; overrides: Override[] }) => Promise<void>;
+  resourceHours?: boolean;
+  allowInitialSave?: boolean;
+  disabled?: boolean;
 }) {
   const [timezone, setTimezone] = useState(initial.timezone);
   const [days, setDays] = useState<Range[][]>(initial.days);
@@ -165,31 +175,45 @@ export function AvailabilityEditor({
   async function save() {
     setSaving(true);
     setError(null);
-    const res = await fetch(scheduleId ? `/api/schedules/${scheduleId}` : "/api/schedule", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        timezone,
-        days: days.map((ranges, dayOfWeek) => ({ dayOfWeek, ranges })),
-        overrides,
-      }),
-    });
-    setSaving(false);
-    if (!res.ok) {
-      setError("Could not save. Check your times and try again.");
-      return;
+    try {
+      if (onSave) {
+        await onSave({ timezone, days, overrides });
+      } else {
+        const res = await fetch(scheduleId ? `/api/schedules/${scheduleId}` : "/api/schedule", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            timezone,
+            days: days.map((ranges, dayOfWeek) => ({ dayOfWeek, ranges })),
+            overrides,
+          }),
+        });
+        if (!res.ok) throw new Error("Could not save. Check your times and try again.");
+      }
+      setSaved(true);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Could not save. Try again.");
+    } finally {
+      setSaving(false);
     }
-    setSaved(true);
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start">
+    <fieldset
+      disabled={disabled || (resourceHours && saving)}
+      aria-label={resourceHours ? "Resource opening hours" : "Availability"}
+      className="grid min-w-0 gap-6 border-0 p-0 lg:grid-cols-[minmax(0,1fr)_20rem] lg:items-start"
+    >
       {/* MAIN (left): the weekly grid + a single always-reachable Save. */}
       <div className="space-y-6">
         <Card>
           <CardHeader
             title="Weekly hours"
-            description="The hours you're open for bookings each week. Toggle a day off to block it entirely."
+            description={
+              resourceHours
+                ? "The resource must be open for the entire appointment, including buffers. Turn a day off to close it."
+                : "The hours you're open for bookings each week. Toggle a day off to block it entirely."
+            }
             action={
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 <span className="mr-1 text-xs font-medium uppercase tracking-wide text-[var(--color-faint)]">
@@ -228,6 +252,7 @@ export function AvailabilityEditor({
                 >
                   <div className="flex w-36 shrink-0 items-center gap-3 sm:self-start sm:pt-1.5">
                     <Toggle
+                      label={`Available on ${DAY_LABELS[dow]}`}
                       on={on}
                       onClick={() => update(dow, on ? [] : [{ start: "09:00", end: "17:00" }])}
                     />
@@ -247,6 +272,7 @@ export function AvailabilityEditor({
                           <div key={i} className="flex items-center gap-2">
                             <input
                               type="time"
+                              aria-label={`${DAY_LABELS[dow]} start time`}
                               step={900}
                               value={r.start}
                               onChange={(e) =>
@@ -261,7 +287,9 @@ export function AvailabilityEditor({
                             />
                             <span className="text-[var(--color-muted)]">–</span>
                             <input
-                              type="time"
+                              type={resourceHours || r.end.startsWith("24:00") ? "text" : "time"}
+                              placeholder="HH:MM (or 24:00)"
+                              aria-label={`${DAY_LABELS[dow]} end time`}
                               step={900}
                               value={r.end}
                               onChange={(e) =>
@@ -318,10 +346,10 @@ export function AvailabilityEditor({
 
         {/* Save lives with the hours it saves; sticky so it's always reachable. */}
         <div className="sticky bottom-4 z-10 flex items-center gap-3 rounded-[var(--radius-lg)] border border-[var(--color-border)] bg-[var(--color-surface)]/95 px-4 py-3 shadow-[var(--shadow-card)] backdrop-blur">
-          <Button onClick={save} disabled={saving || !dirty}>
-            {saving ? "Saving…" : "Save availability"}
+          <Button onClick={save} disabled={saving || (!dirty && !allowInitialSave)}>
+            {saving ? "Saving…" : resourceHours ? "Save resource hours" : "Save availability"}
           </Button>
-          {dirty ? (
+          {dirty || allowInitialSave ? (
             <span className="text-sm text-[var(--color-amber)]">Unsaved changes</span>
           ) : saved ? (
             <span className="inline-flex items-center gap-1.5 text-sm text-[var(--color-success)]">
@@ -378,6 +406,7 @@ export function AvailabilityEditor({
                     <span className="w-32 shrink-0 text-sm font-medium">{o.date}</span>
                     <div className="flex flex-1 items-center gap-3">
                       <Toggle
+                        label={`Available on ${o.date}`}
                         on={!unavailable}
                         onClick={() =>
                           patchOverride(
@@ -394,6 +423,7 @@ export function AvailabilityEditor({
                         <div className="flex items-center gap-2">
                           <input
                             type="time"
+                            aria-label="Override start time"
                             step={900}
                             value={o.start ?? "09:00"}
                             onChange={(e) => patchOverride(o.date, { start: e.target.value })}
@@ -401,7 +431,9 @@ export function AvailabilityEditor({
                           />
                           <span className="text-[var(--color-muted)]">–</span>
                           <input
-                            type="time"
+                            type={resourceHours || o.end?.startsWith("24:00") ? "text" : "time"}
+                            placeholder="HH:MM (or 24:00)"
+                            aria-label="Override end time"
                             step={900}
                             value={o.end ?? "17:00"}
                             onChange={(e) => patchOverride(o.date, { end: e.target.value })}
@@ -444,6 +476,6 @@ export function AvailabilityEditor({
           </CardBody>
         </Card>
       </aside>
-    </div>
+    </fieldset>
   );
 }

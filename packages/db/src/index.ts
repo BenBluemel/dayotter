@@ -24,3 +24,5 @@ export {
   withResourceTransaction,
   type ResourceErrorIdentity,
 } from "./resources";
+
+export type { ResourceOpeningHours } from "./schema/resources";

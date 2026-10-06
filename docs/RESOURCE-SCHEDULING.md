@@ -1,13 +1,14 @@
 # Resource scheduling: proposed architecture
 
-**Status: R1 foundation, R2 creation/paid acceptance and Slice 3 advisory resource availability implemented locally; real resource rollout remains inactive.**
+**Status: resource foundation, booking/paid acceptance, availability, lifecycle, and Slice 5 management UI implemented locally; real resource rollout remains inactive.**
 Original repository archaeology against validated/public Slice 7,
 commit `6b2796e05f1ff2bdea13c6bddee04c49e07e6879`, tree
 `e87a2e067395c717f2301faf07efd36448f98c2f`, inspected 2026-10-03.
 The public Slice 7 branch is `feature/promotions`; PR #1 is not merged. The
 architecture baseline on `feature/payment-routing` is `b30941e`. The R1 checkpoint
-at the end identifies the local allocation foundation; no Resource UI, live service
-activation, runtime configuration change or production migration/deployment occurs.
+and Slice 3–5 checkpoints at the end identify the successive local implementations.
+The Resource UI now exists; no live service activation, runtime configuration change
+or production migration/deployment is implied by these checkpoints.
 
 [BUSINESS-RULES.md](BUSINESS-RULES.md) remains business-policy authority.
 [PRICING-ARCHITECTURE.md](PRICING-ARCHITECTURE.md),
@@ -777,10 +778,20 @@ review with a stable classified cause. Lost response after commit returns the
 same booking; provider-effect failure neither duplicates nor releases allocation.
 Abandoned checkout has no resource claim to release.
 
-### Current operational gap: a launch prerequisite, not existing functionality
+### Historical Slice 7 gap, resolved by R2 operator APIs
 
-`recoverAppointmentPayments` selects prepared/open/payment_succeeded/fulfilling,
-not ordinary `requires_review`. `fulfillObservedPayment` will not auto-resume those
+The following paragraphs record the **pre-resource Slice 7 baseline**, not the
+current branch. Migration 0072 makes `refund_operations.booking_id` nullable for
+`unbooked_obligation`, and `lib/payments/paid-review.ts` plus `/api/payments/review`
+now provide authorized original-time retry and full saved-route refund resolution.
+There is no payment-review dashboard or scheduled recovery runner. Operators must
+exercise and assign this workflow before positive-cash resource testing/activation;
+the admission epoch does not enforce an operational-readiness flag. Technical/legacy
+review remains outside the ordinary scheduling-contention resolution API.
+
+At the Slice 7 baseline, `recoverAppointmentPayments` selected
+prepared/open/payment_succeeded/fulfilling, not ordinary `requires_review`. At that baseline, `fulfillObservedPayment` would not
+auto-resume those
 review states. `refund_operations.booking_id` is NOT NULL, purpose is cancellation,
 and `executeRefundOperation` requires a cancelled booking. Slice 7 therefore does
 NOT already offer a normal refund for successful payment with no booking. Do not
@@ -1548,3 +1559,68 @@ recurrence/host-free modes. **Legacy Redis checkout sessions must still be
 drained and reviewed by an operator before activation.** Coordinated activation,
 reviewed legacy adoption and the existing operational readiness checks remain
 separate work.
+
+## Slice 5: resource configuration UI
+
+Organization owners and admins can manage generic resources at
+`/settings/resources`: name, positive capacity, enabled state, optional resource-owned
+weekly opening hours, timezone, and date overrides. The existing settings navigation,
+form components, confirmation dialog, and availability editor are reused. NULL hours
+remain unrestricted; explicit empty hours remain closed. End-of-day `24:00` values are
+preserved. No person accounts, claim mutation endpoints, or inventory concepts are added.
+
+Requirements can be edited for organization services from Resources settings and from
+an administrator's individual booking-type editor. Requirements save independently of
+ordinary service fields, preserving pricing and other configuration. Disabled existing
+requirements remain visible; removing them is explicit. PostgreSQL rejects invalid,
+unsupported, cross-organization, or impossible plans without partial changes.
+
+Authenticated configuration endpoints call the shared configuration operations rather
+than implementing resource admission in route handlers. Mutations keep organization
+owner/admin membership locked through commit, reject stale configuration tokens, and
+use bounded whole-transaction retries. Requirement edits acquire the service exclusively
+before the existing complete sorted resource fence. Resource-global edits acquire only
+the resource fence and never subsequently lock services, bookings, or financial custody.
+Existing SQL guards remain authoritative for capacity reduction, enable/disable, opening
+hours, and requirement validation. Reads use an organization-scoped repeatable-read
+snapshot with a fixed number of queries and expose configuration only, never claims.
+
+**Saving requirements does not activate a service.** Admission epochs are never changed
+by this UI/API. Existing managed services use their established admission gate. Newly
+configured services retain staged requirements, which public resource-aware availability
+fails closed on until coordinated activation. The UI labels this prerequisite. Operators
+must still drain/review legacy Redis checkout sessions and incompatible commitments and
+establish paid-unbooked reconciliation readiness before live activation. This slice does
+not perform or bypass that operational work.
+
+Focused PostgreSQL API tests cover configuration CRUD, authorization/tenancy, stale
+edits, safe and unsafe capacity changes, retained accepted claims and financial facts,
+enablement, hours/overrides, invalid configuration, requirements, and actual capacity
+and role-revocation races. Frontend checks use the repository's existing static-render
+style, exercising native controls, empty states, retained disabled resources, error
+presentation, and hours round-tripping. No schema or index changes are required.
+
+## Launch-audit clarification: current activation limits
+
+Resource requirements are configured per event type. Epoch zero stages them; the
+resource-aware public availability path offers no slots, but epoch-zero booking
+writers still use legacy admission. Keep staged test services inactive and quiesce
+callers until the operator atomically enables the service and changes its epoch.
+Saving requirements alone is not an admission shutdown.
+
+The supported epoch transition is only `0 -> 1`, through guarded PostgreSQL DML;
+there is no browser activation endpoint, reverse transition, or legacy booking
+adoption API. The census conservatively includes every non-cancelled/non-rejected
+NULL-plan booking, even completed historical bookings. Waiting for appointment
+end or Redis TTL alone does not prove readiness. Prefer fresh DEV test service IDs
+to rewriting historical commitments. Disable the service to stop new admissions;
+do not erase claims or reset its epoch as rollback.
+
+All implemented managed services still require one owner-host. `requires_host=false`
+is rejected by SQL and application admission. Different equipment therefore does
+not let two services with the same required host overlap. The equipment-only PEMF
+example above remains proposed behavior, not completed Slice 5 functionality.
+
+Migration 0074 corrects coupon restoration on pending booking decline: `rejected`
+and `cancelled` coupon bookings both require one durable restoration. It changes
+trigger functions only and performs no backfill or resource activation.
