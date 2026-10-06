@@ -1,0 +1,2 @@
+SELECT :'readiness'::jsonb;
+ROLLBACK;

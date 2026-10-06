@@ -1,6 +1,11 @@
 # Resource scheduling: proposed architecture
 
 **Status: resource foundation, booking/paid acceptance, availability, lifecycle, Slice 5 management UI, and Slice 6 resource-only scheduling implemented locally; real resource rollout remains inactive.**
+The current reviewed DEV readiness/activation procedure is checked in at
+[deploy/resources/README.md](../deploy/resources/README.md). It supports valid
+resource-only services, binds activation to a reviewed configuration snapshot,
+and supersedes the archived pre-Slice-6 operator SQL without activating services.
+
 Original repository archaeology against validated/public Slice 7,
 commit `6b2796e05f1ff2bdea13c6bddee04c49e07e6879`, tree
 `e87a2e067395c717f2301faf07efd36448f98c2f`, inspected 2026-10-03.
@@ -1728,10 +1733,17 @@ review readiness, drain/review legacy Redis checkout custody, and census incompa
 historical commitments. Configure real resources/hours/quantities and per-service
 attendance only with separate authorization. Prefer fresh DEV service IDs where
 historical commitments prevent activation. The earlier launch-audit activation SQL
-contains an obsolete `NOT e.requires_host` rejection; an operator must review/update
-that artifact for Slice 6 rather than run it unchanged for resource-only services.
-Quiesce callers and atomically enable/activate only after that review. Never reset an
-epoch, erase claims, or reinterpret accepted attendance as a rollback.
+contains an obsolete `NOT e.requires_host` rejection and is superseded by the
+[checked-in operator procedure](../deploy/resources/README.md); do not run the
+archived SQL for this cutover. The new tooling validates optional attendance,
+exact staged resource mappings, enabled capacity/hours, owned schedules/timezones,
+frozen booking policy, and the existing conservative booking/payment census.
+Activation rechecks a reviewed configuration snapshot under the service gate and
+preserves the one-way transition. Energy remains host-attended at epoch zero;
+only Light and PEMF require resource activation. External writer/Redis/payment
+review remains explicit operator work. Quiesce callers and atomically enable/activate
+only after that review. Never reset an epoch, erase claims, or reinterpret accepted
+attendance as a rollback.
 
 
 ### Slice 6 completion validation
@@ -1796,3 +1808,32 @@ provider integration redesign or deployment is introduced. The Compose overlay
 remains untracked and byte-identical to the starting checkpoint. Publication and
 real service configuration/activation require separate authorization; the DEV
 prerequisites immediately above still apply.
+
+
+## Operator readiness/activation update after Slice 6
+
+The current source of truth for operator commands is
+[deploy/resources/README.md](../deploy/resources/README.md), with a shared read-only
+state query and explicit inspect/activate/verify modes. The old `/tmp` launch-audit
+files remain archival evidence. No migration, application admission, payment, or
+lifecycle behavior changes in this tooling update. The supplied DEV configuration
+is treated as operator input; this session does not inspect or change DEV/runtime.
+
+Readiness retains staged-epoch checks, organization/member/schedule integrity,
+enabled resource capacity and opening hours, exact expected attendance and equipment
+mappings, immutable booking-policy checks, and `resource_incompatible_commitments`
+including historical NULL plans and unresolved unbound NULL/empty payment terms.
+Organization-wide payment/refund and equivalent legacy booking review remains
+visible. Redis/provider outcomes cannot be inferred from SQL. Acknowledgements
+record completed external maintenance/legacy/cash review and cannot substitute for it.
+
+Activation locks service rows in sorted order, reads the full scoped equipment
+union and schedules under locks, rechecks current state, and compares the exact
+reviewed snapshot (including configuration revisions, resource allocation versions,
+hours/rules/overrides and timezones). READ COMMITTED is deliberate: waiters must see
+newly committed bookings/attempts for the authoritative census. Only the selected
+equipment services transition atomically from epoch 0 to 1; person-only Energy
+remains unchanged. Precommit accepted-plan proof supports both reviewed attended
+equipment and resource-only equipment. Failures roll back both services; repeated
+activation/reset and automatic retry are not supported. Configuration writers are
+part of the required quiesced boundary throughout activation.
