@@ -1,6 +1,6 @@
 # Payment architecture: direct Stripe and retained Connect support
 
-Status: **Slices 1–5 implemented and validated on `feature/payment-routing`, through `7ff1a9a8eac39151ae76db0dfc3bc50535542348`. Slice 3: `4ec3d98`; Slice 4: `c407ac8`, validation fixes: `0a90317`; Slice 5: `7ff1a9a`. Slices 6–7 remain proposed.**
+Status: **Slices 1–5 were implemented and validated on `feature/payment-routing`, through `7ff1a9a8eac39151ae76db0dfc3bc50535542348`. Slice 3: `4ec3d98`; Slice 4: `c407ac8`, validation fixes: `0a90317`; Slice 5: `7ff1a9a`. Slices 6–7 are implemented and validated on `feature/promotions` as part of the current PR. Production payments remain unchanged.**
 
 Review date: 2026-10-01. Inspection baseline: commit `698897a` on
 `feature/promotions`, including the uncommitted appointment-promotion foundation.
@@ -28,7 +28,7 @@ payment/refund obligations, cash/package settlement, and recovery.
 IMPLEMENTED** means approved policy awaiting implementation. **FUTURE / DEFERRED**
 means additional work; unresolved choices are explicitly identified in the
 business rules. The original source map/risk audit below remains historical;
-read the Slice 1–6 implementation sections for current guarantees and limits.
+read the Slice 1–7 implementation sections for current guarantees and limits.
 Do not treat an original audit finding or an earlier slice exclusion as an
 unfixed current problem when a later slice explicitly supersedes it.
 
@@ -1281,7 +1281,11 @@ series are not given fabricated financial allocations.
 
 External calendar/email/reminder delivery for free/staff bookings and recurring
 expansion still lacks a universal durable outbox. A committed booking is retained
-and returned on retry without blindly replaying those effects. Slice 7 adds authenticated coupon selection, checkout reservation, booking
+and returned on retry without blindly replaying those effects.
+
+## Slice 7 implementation: authenticated appointment coupons
+
+Slice 7 adds authenticated coupon selection, checkout reservation, booking
 redemption, exactly-once cancellation restoration, immutable quote attribution,
 and owner/admin and customer UI. Staff coupon entry still depends on a safe
 authenticated-customer commercial booking flow. Ambiguous Stripe attempts hold
