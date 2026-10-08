@@ -3,9 +3,11 @@
 import { BookingsCalendar } from "@/components/bookings-calendar";
 import { EmptyState } from "@/components/page-header";
 import { Card } from "@/components/ui/card";
+import type { HistoryStatus } from "@/lib/booking/booking-history";
 import { eventColorVar } from "@/lib/booking/event-type-input";
 import { cn } from "@/lib/cn";
 import { DateTime } from "luxon";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -32,33 +34,36 @@ const STATUS_LABEL: Record<string, string> = { no_show: "no-show" };
 
 type Tab = "calendar" | "history";
 
-// History status filters. Each maps one or more raw booking statuses to a
-// friendly label; a filter only shows when the history actually contains it.
-const FILTERS: { key: string; label: string; match: (status: string) => boolean }[] = [
-  { key: "all", label: "All", match: () => true },
-  { key: "confirmed", label: "Confirmed", match: (s) => s === "confirmed" },
-  { key: "completed", label: "Completed", match: (s) => s === "completed" },
-  { key: "cancelled", label: "Cancelled", match: (s) => s === "cancelled" || s === "rejected" },
-  { key: "no_show", label: "No-show", match: (s) => s === "no_show" },
-  { key: "pending", label: "Pending", match: (s) => s === "pending" },
+const FILTERS: { key: HistoryStatus; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "confirmed", label: "Confirmed" },
+  { key: "completed", label: "Completed" },
+  { key: "cancelled", label: "Cancelled" },
+  { key: "no_show", label: "No-show" },
+  { key: "pending", label: "Pending" },
 ];
 
 /** Bookings surface: a colour-coded calendar (month/week/agenda) plus a full
  *  history list (including past + cancelled). */
-export function BookingsWorkspace({ tz, history }: { tz: string; history: HistoryBooking[] }) {
+export function BookingsWorkspace({
+  tz,
+  history,
+  query,
+  statusFilter,
+  hasMore,
+}: {
+  tz: string;
+  history: HistoryBooking[];
+  query: string;
+  statusFilter: HistoryStatus;
+  hasMore: boolean;
+}) {
   // Default to History so the server-loaded rows render immediately; the
   // calendar fetches its own range only when that tab is opened.
   const [tab, setTab] = useState<Tab>("history");
-  const [statusFilter, setStatusFilter] = useState("all");
-
-  // Only surface filters that match at least one booking (besides "All"), and
-  // only bother showing the row when there's more than one status to filter by.
-  const availableFilters = FILTERS.filter(
-    (f) => f.key === "all" || history.some((b) => f.match(b.status)),
-  );
-  const showFilters = availableFilters.length > 2;
   const active = FILTERS.find((f) => f.key === statusFilter) ?? FILTERS[0]!;
-  const shownHistory = history.filter((b) => active.match(b.status));
+  const historyUrl = (q: string, status: string) =>
+    `/bookings?${new URLSearchParams({ q, status })}`;
 
   return (
     <>
@@ -82,39 +87,76 @@ export function BookingsWorkspace({ tz, history }: { tz: string; history: Histor
 
       {tab === "calendar" ? (
         <BookingsCalendar tz={tz} />
-      ) : history.length === 0 ? (
-        <EmptyState
-          title="No bookings yet"
-          description="Calm waters for now - when someone books one of your booking types, it surfaces here."
-        />
       ) : (
         <>
-          {showFilters ? (
-            <div className="mb-4 flex flex-wrap gap-1.5">
-              {availableFilters.map((f) => (
-                <button
-                  key={f.key}
-                  type="button"
-                  onClick={() => setStatusFilter(f.key)}
-                  className={cn(
-                    "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                    statusFilter === f.key
-                      ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
-                      : "border-[var(--color-border-strong)] text-[var(--color-muted)] hover:text-[var(--color-text)]",
-                  )}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
-          ) : null}
-          {shownHistory.length === 0 ? (
-            <p className="py-10 text-center text-sm text-[var(--color-muted)]">
-              No {active.label.toLowerCase()} bookings.
+          <form action="/bookings" method="get" className="mb-4 flex flex-wrap items-end gap-2">
+            <input type="hidden" name="status" value={statusFilter} />
+            <label className="flex flex-1 flex-col gap-1 text-sm">
+              Search appointments
+              <input
+                key={query}
+                name="q"
+                defaultValue={query}
+                type="search"
+                placeholder="Client name, email, or appointment title"
+                className="rounded-md border border-[var(--color-border-strong)] bg-[var(--color-surface)] px-3 py-2"
+              />
+            </label>
+            <button
+              type="submit"
+              className="rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm text-white"
+            >
+              Search
+            </button>
+            {query ? (
+              <Link
+                href={historyUrl("", statusFilter)}
+                className="px-3 py-2 text-sm text-[var(--color-accent)]"
+              >
+                Clear search
+              </Link>
+            ) : null}
+          </form>
+          <div className="mb-4 flex flex-wrap gap-1.5">
+            {FILTERS.map((f) => (
+              <Link
+                key={f.key}
+                href={historyUrl(query, f.key)}
+                aria-current={statusFilter === f.key ? "page" : undefined}
+                className={cn(
+                  "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                  statusFilter === f.key
+                    ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                    : "border-[var(--color-border-strong)] text-[var(--color-muted)] hover:text-[var(--color-text)]",
+                )}
+              >
+                {f.label}
+              </Link>
+            ))}
+          </div>
+          {hasMore ? (
+            <p role="status" className="mb-4 text-sm text-[var(--color-muted)]">
+              Showing 100 appointments. Narrow your search or choose a status to see fewer results.
             </p>
+          ) : null}
+          {history.length === 0 ? (
+            <EmptyState
+              title={
+                query
+                  ? "No matching appointments"
+                  : statusFilter !== "all"
+                    ? `No ${active.label.toLowerCase()} bookings`
+                    : "No bookings yet"
+              }
+              description={
+                query
+                  ? "Try another name, email, or appointment title, or clear your search."
+                  : "Appointments matching this view will appear here."
+              }
+            />
           ) : (
             <div className="space-y-2">
-              {shownHistory.map((b) => (
+              {history.map((b) => (
                 <HistoryRow key={b.id} b={b} tz={tz} />
               ))}
             </div>

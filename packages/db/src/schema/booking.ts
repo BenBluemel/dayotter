@@ -111,6 +111,7 @@ export const bookings = pgTable(
     uniqueIndex("booking_creation_operation_idx").on(t.creationOperationKey),
     uniqueIndex("bookings_uid_idx").on(t.uid),
     uniqueIndex("bookings_id_org_event_idx").on(t.id, t.organizationId, t.eventTypeId),
+    index("bookings_title_search_trgm_idx").using("gin", sql`lower(${t.title}) gin_trgm_ops`),
     index("bookings_host_idx").on(t.hostId),
     index("bookings_org_idx").on(t.organizationId),
     index("bookings_starts_idx").on(t.startsAt),
@@ -146,7 +147,17 @@ export const bookingAttendees = pgTable(
     timezone: text("timezone"),
     ...timestamps,
   },
-  (t) => [index("booking_attendees_booking_idx").on(t.bookingId)],
+  (t) => [
+    index("booking_attendees_booking_idx").on(t.bookingId),
+    index("booking_attendees_name_search_trgm_idx").using(
+      "gin",
+      sql`lower(${t.name}) gin_trgm_ops`,
+    ),
+    index("booking_attendees_email_search_trgm_idx").using(
+      "gin",
+      sql`lower(${t.email}) gin_trgm_ops`,
+    ),
+  ],
 );
 
 /**

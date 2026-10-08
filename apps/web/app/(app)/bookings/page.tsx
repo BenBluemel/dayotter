@@ -1,20 +1,22 @@
 import { BookingsWorkspace, type HistoryBooking } from "@/components/bookings-workspace";
 import { PageHeader } from "@/components/page-header";
 import { getSession } from "@/lib/auth/session";
-import { desc, eq, getDb, schema } from "@dayotter/db";
+import { loadBookingHistory, normalizeHistoryStatus } from "@/lib/booking/booking-history";
 
 export const dynamic = "force-dynamic";
 
-export default async function BookingsPage() {
+export default async function BookingsPage({
+  searchParams,
+}: { searchParams: Promise<{ q?: string; status?: string }> }) {
   const session = await getSession();
   const tz = (session!.user as { timezone?: string }).timezone ?? "UTC";
 
-  const rows = await getDb().query.bookings.findMany({
-    where: eq(schema.bookings.hostId, session!.user.id),
-    orderBy: desc(schema.bookings.startsAt),
-    limit: 100,
-    with: { attendees: true, eventType: { columns: { color: true } } },
-  });
+  const params = await searchParams;
+  const { rows, query, status, hasMore } = await loadBookingHistory(
+    session!.user.id,
+    typeof params.q === "string" ? params.q : "",
+    normalizeHistoryStatus(typeof params.status === "string" ? params.status : undefined),
+  );
 
   const history: HistoryBooking[] = rows.map((b) => ({
     id: b.id,
@@ -34,7 +36,13 @@ export default async function BookingsPage() {
         title="Bookings"
         description="Everything scheduled with you."
       />
-      <BookingsWorkspace tz={tz} history={history} />
+      <BookingsWorkspace
+        tz={tz}
+        history={history}
+        query={query}
+        statusFilter={status}
+        hasMore={hasMore}
+      />
     </>
   );
 }
