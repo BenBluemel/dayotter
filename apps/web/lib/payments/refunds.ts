@@ -10,9 +10,13 @@ import {
   lte,
   ne,
   or,
+  releaseBookingResources,
   schema,
+  withResourceTransaction,
 } from "@dayotter/db";
+import { BookingError } from "../booking/booking-logic";
 import { restoreBookingCoupon } from "../booking/coupon-uses";
+import { lockPersonAdmission, lockServiceAdmission } from "../booking/resource-acceptance";
 import { restoreBookingCredit } from "../packages/credits";
 import { originalBookingRefundRoute } from "./booking-routing";
 import { validatePaymentIntentTerms } from "./payment-success";
@@ -46,13 +50,14 @@ export function publicRefundState(operation: RefundOperation): PublicRefundState
 }
 
 /** Existing authorization lives at the capability-UID/API callers. Lock order is
- * attempt -> booking -> operation, shared with fulfillment/finalization. No Stripe I/O here. */
+ * attempt -> service -> person -> booking -> financial -> resources, shared with fulfillment/finalization. No Stripe I/O here. */
 export async function decideBookingCancellation(
   uid: string,
   reason?: string,
   db: Database = getDb(),
+  declineHostId?: string,
 ) {
-  return db.transaction(async (tx) => {
+  return withResourceTransaction(db, async (tx) => {
     const candidate = await tx.query.bookings.findFirst({ where: eq(schema.bookings.uid, uid) });
     if (!candidate) return null;
     const [attempt] = await tx
@@ -60,13 +65,24 @@ export async function decideBookingCancellation(
       .from(schema.paymentAttempts)
       .where(eq(schema.paymentAttempts.bookingId, candidate.id))
       .for("update");
+    await lockServiceAdmission(tx, candidate.eventTypeId);
+    await lockPersonAdmission(
+      tx,
+      candidate.requiresHost && candidate.hostId ? [candidate.hostId] : [],
+    );
     const [booking] = await tx
       .select()
       .from(schema.bookings)
       .where(eq(schema.bookings.id, candidate.id))
       .for("update");
     if (!booking) return null;
-    const changed = booking.status !== "cancelled";
+    if (declineHostId && (booking.hostId !== declineHostId || booking.status !== "pending"))
+      return null;
+    if (declineHostId && booking.paymentStatus === "paid")
+      throw new BookingError("Cancel this paid booking through the refund path", 409);
+    const targetStatus = declineHostId ? "rejected" : "cancelled";
+    const changed =
+      booking.status !== "cancelled" && !(booking.schedulingPlan && booking.status === "rejected");
     // 0064 fulfilled attempts lack verified charge facts. They remain explicitly
     // legacy rather than inventing a RefundOperation snapshot from today's config.
     const durable = Boolean(attempt?.successFacts);
@@ -86,7 +102,7 @@ export async function decideBookingCancellation(
     if (changed)
       await tx
         .update(schema.bookings)
-        .set({ status: "cancelled", cancelledAt: new Date(), cancelReason: reason ?? null })
+        .set({ status: targetStatus, cancelledAt: new Date(), cancelReason: reason ?? null })
         .where(eq(schema.bookings.id, booking.id));
     const creditRestoration = await restoreBookingCredit(tx, booking);
     await restoreBookingCoupon(tx, booking);
@@ -140,6 +156,8 @@ export async function decideBookingCancellation(
           })
           .where(eq(schema.paymentAttempts.id, attempt.id));
     }
+    // Existing restoration/refund custody is complete before the full resource fence.
+    if (booking.schedulingPlan) await releaseBookingResources(tx, booking.id);
     return { booking, changed, durable, operation, creditRestoration };
   });
 }
@@ -283,11 +301,24 @@ export async function executeRefundOperation(
         .from(schema.paymentAttempts)
         .where(eq(schema.paymentAttempts.id, operation.attemptId))
         .for("update");
-      const [booking] = await tx
-        .select()
-        .from(schema.bookings)
-        .where(eq(schema.bookings.id, operation.bookingId))
-        .for("update");
+      const [booking] = operation.bookingId
+        ? await tx
+            .select()
+            .from(schema.bookings)
+            .where(eq(schema.bookings.id, operation.bookingId))
+            .for("update")
+        : [];
+      if (!operation.bookingId)
+        await tx
+          .select()
+          .from(schema.paymentReviewActions)
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, operation.attemptId),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          )
+          .for("update");
       const [current] = await tx
         .select()
         .from(schema.refundOperations)
@@ -295,7 +326,7 @@ export async function executeRefundOperation(
         .for("update");
       if (!current) throw new Error("Refund operation is missing");
       const status = verifyRefundEvidence(current, evidence);
-      if (!booking || booking.status !== "cancelled")
+      if (current.purpose === "cancellation" && (!booking || booking.status !== "cancelled"))
         throw new PaymentContradictionError("Refund booking is not cancelled");
       if (current.state === "requires_review") return;
       // An older pending read must not overwrite another worker's success.
@@ -312,7 +343,29 @@ export async function executeRefundOperation(
           nextRecoveryAt: new Date(Date.now() + 60000),
         })
         .where(eq(schema.refundOperations.id, id));
-      if (status === "succeeded")
+      if (status === "succeeded" && current.purpose === "unbooked_obligation") {
+        await tx
+          .update(schema.paymentReviewActions)
+          .set({ state: "refunded", resolvedAt: new Date() })
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, operation.attemptId),
+              eq(schema.paymentReviewActions.method, "refund"),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          );
+        const [use] = await tx
+          .select()
+          .from(schema.appointmentCouponUses)
+          .where(eq(schema.appointmentCouponUses.paymentAttemptId, operation.attemptId))
+          .for("update");
+        if (use?.status === "reserved")
+          await tx
+            .update(schema.appointmentCouponUses)
+            .set({ status: "released" })
+            .where(eq(schema.appointmentCouponUses.id, use.id));
+      }
+      if (status === "succeeded" && booking)
         await tx
           .update(schema.bookings)
           .set({ paymentStatus: "refunded" })

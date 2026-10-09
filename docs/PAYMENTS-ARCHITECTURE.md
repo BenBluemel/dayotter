@@ -1290,3 +1290,29 @@ redemption, exactly-once cancellation restoration, immutable quote attribution,
 and owner/admin and customer UI. Staff coupon entry still depends on a safe
 authenticated-customer commercial booking flow. Ambiguous Stripe attempts hold
 reservations for review.
+
+
+## Resource R2: paid obligations without a booking
+
+Resource-enabled durable checkout captures immutable scheduling terms on the
+PaymentAttempt and makes no resource hold. Fulfillment atomically binds its original
+booking, claims, settlement and coupon redemption. Verified payment survives a lost
+resource race; ordinary recovery stops at `booking_obligation_requires_review`.
+Resource invariant diagnostics instead enter technical review and cannot be treated
+as routine scheduling contention.
+
+Authorized organization owners/admins inspect `GET /api/payments/review` and resolve
+via stable, evidence-bearing `POST` actions: retry the ORIGINAL accepted time or
+issue a full historical-route refund. `payment_review_actions` retains encrypted
+contact/consent and resolution history. A different time requires refund plus a new
+ordinary booking. The new `unbooked_obligation` refund purpose permits NULL booking
+only for a verified unresolved paid attempt and authorized refund action. Starting
+it prevents booking binding. Existing Stripe refund verification/idempotency/recovery
+is reused; success, action completion and coupon reservation release commit together.
+Pending/ambiguous money movement retains the reservation and review evidence. The
+existing cancellation-purpose refund still requires its cancelled booking.
+
+Kimberly/authorized staff monitor daily, contact the customer and escalate technical
+or unresolved paid cases to Ben within one business day. See
+[RESOURCE-SCHEDULING.md](RESOURCE-SCHEDULING.md) for the controlled procedure and
+legacy Redis drain requirement. No production resource activation occurs in R2.

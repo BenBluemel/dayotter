@@ -1,8 +1,9 @@
 import { logger } from "@dayotter/core";
 import { eq, getDb, schema } from "@dayotter/db";
 import type Stripe from "stripe";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import { BookingError, createBooking } from "../booking/create-booking";
-import { PAYMENT_ATTEMPT_ID_PATTERN, type PaymentAttempt, decodeAttempt } from "./attempt-terms";
+import { PAYMENT_ATTEMPT_ID_PATTERN, type PaymentAttempt, attemptRoute } from "./attempt-terms";
 import { reconcileSession } from "./payment-events";
 import { requirePaymentReview } from "./payment-work";
 import { claimPendingBooking } from "./pending";
@@ -24,7 +25,7 @@ export async function fulfillCheckout(
   const known = await db.query.paymentAttempts.findFirst({
     where: eq(schema.paymentAttempts.checkoutSessionId, sessionId),
   });
-  const session = await retrieveSession(sessionId, known ? decodeAttempt(known).route : undefined);
+  const session = await retrieveSession(sessionId, known ? attemptRoute(known) : undefined);
   const reference = session.metadata?.attemptId || session.client_reference_id;
   const referenced =
     !known && reference && PAYMENT_ATTEMPT_ID_PATTERN.test(reference)
@@ -36,9 +37,7 @@ export async function fulfillCheckout(
     const attempt = known ?? referenced;
     if (!attempt) throw new PaymentRoutingError("Durable checkout intent is missing");
     // Response-loss recovery must verify the saved credential/account even when no Session ID was bound.
-    const verified = known
-      ? session
-      : await retrieveSession(sessionId, decodeAttempt(attempt).route);
+    const verified = known ? session : await retrieveSession(sessionId, attemptRoute(attempt));
     return fulfillDurableAppointment(attempt, verified);
   }
   if (session.payment_status !== "paid") return { uid: null, pending: true };
@@ -66,6 +65,20 @@ export async function fulfillCheckout(
     return { uid: again?.uid ?? null, pending: !again };
   }
 
+  const resourceReview = async () => {
+    const service = await db.query.eventTypes.findFirst({
+      where: eq(schema.eventTypes.id, input.eventTypeId),
+    });
+    if (!service?.resourceAdmissionEpoch) return false;
+    logger.error("Legacy paid checkout requires operator reconciliation", {
+      event: "legacy_resource_payment_review",
+      paymentIntentId: pi,
+      eventTypeId: service.id,
+    });
+    return true;
+  };
+  if (await resourceReview())
+    return { uid: null, pending: true, state: "requires_review" as const };
   const destinationAccountId = session.metadata?.dest || undefined;
   try {
     const { uid } = await createBooking({
@@ -86,6 +99,10 @@ export async function fulfillCheckout(
         where: eq(schema.bookings.paymentIntentId, pi),
       });
       if (raced) return { uid: raced.uid, pending: false };
+      // Admission may have changed since the legacy preflight. Do not guess a
+      // refund route for a resource obligation lacking durable accepted terms.
+      if (await resourceReview())
+        return { uid: null, pending: true, state: "requires_review" as const };
       logger.error("paid booking failed after payment - refunding", {
         event: "paid_booking_refunded",
         paymentIntentId: pi,
@@ -117,8 +134,13 @@ async function fulfillDurableAppointment(
     }
     return { uid: null, pending: true, state };
   } catch (err) {
-    if (err instanceof PaymentContradictionError) {
-      await requirePaymentReview(attempt.id, "stripe_terms_contradiction");
+    if (err instanceof ResourceInvariantError || err instanceof PaymentContradictionError) {
+      await requirePaymentReview(
+        attempt.id,
+        err instanceof ResourceInvariantError
+          ? "resource_invariant_requires_review"
+          : "stripe_terms_contradiction",
+      );
       return { uid: null, pending: true, state: "requires_review" };
     }
     throw err;

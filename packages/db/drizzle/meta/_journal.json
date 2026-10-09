@@ -491,6 +491,48 @@
       "when": 1791008161971,
       "tag": "0069_appointment_coupons",
       "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1791058123500,
+      "tag": "0070_resource_allocation",
+      "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1791082040578,
+      "tag": "0071_resource_claim_diagnostics",
+      "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1791084786673,
+      "tag": "0072_resource_booking_acceptance",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1791236454621,
+      "tag": "0073_resource_availability",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1791249108575,
+      "tag": "0074_resource_decline_coupon_restoration",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1791261780044,
+      "tag": "0075_resource_only_services",
+      "breakpoints": true
     }
   ]
 }

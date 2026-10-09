@@ -1,4 +1,4 @@
-import { and, eq, getDb, gte, inArray, lte, schema } from "@dayotter/db";
+import { and, eq, getDb, gte, inArray, lte, schema, sql } from "@dayotter/db";
 
 export interface BusyInterval {
   start: Date;
@@ -47,6 +47,9 @@ export async function teamSchedule(
       ? db.query.busyBlocks.findMany({
           where: and(
             inArray(schema.busyBlocks.calendarId, calendarIds),
+            sql`NOT EXISTS (SELECT 1 FROM booking_references ref JOIN bookings b ON b.id=ref.booking_id
+              WHERE NOT b.requires_host AND ref.calendar_id=${schema.busyBlocks.calendarId}
+              AND ref.external_event_id=${schema.busyBlocks.externalEventId})`,
             lte(schema.busyBlocks.startsAt, rangeEnd),
             gte(schema.busyBlocks.endsAt, rangeStart),
           ),
@@ -56,6 +59,7 @@ export async function teamSchedule(
     db.query.bookings.findMany({
       where: and(
         inArray(schema.bookings.hostId, memberIds),
+        eq(schema.bookings.requiresHost, true),
         eq(schema.bookings.status, "confirmed"),
         lte(schema.bookings.startsAt, rangeEnd),
         gte(schema.bookings.endsAt, rangeStart),

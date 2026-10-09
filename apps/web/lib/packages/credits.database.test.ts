@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { createDatabase, eq, schema } from "@dayotter/db";
 import type Stripe from "stripe";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { withPreResourceSchedulingSchema } from "../payments/legacy-scheduling-fixture";
 const mock = vi.hoisted(() => ({
   db: null as ReturnType<typeof createDatabase> | null,
   finalize: vi.fn(),
@@ -145,44 +146,48 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
     ) as { entries: { tag: string }[] };
     for (const { tag } of journal.entries) {
       if (tag === "0067_package_integrity") {
-        await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
-          org,
-          "Package test",
-          randomUUID(),
-        ]);
-        await db
-          .insert(schema.users)
-          .values({ id: host, email: `${host}@example.test`, emailVerified: true });
-        await db.insert(schema.eventTypes).values({
-          id: event,
-          organizationId: org,
-          ownerId: host,
-          title: "Sessions",
-          slug: "sessions",
-          price: 5000,
-          currency: "usd",
-          durationMinutes: 30,
-          location: "in_person",
-          locationDetail: "Test",
+        await withPreResourceSchedulingSchema(async () => {
+          await db.$client.query("INSERT INTO organizations (id, name, slug) VALUES ($1,$2,$3)", [
+            org,
+            "Package test",
+            randomUUID(),
+          ]);
+          await db
+            .insert(schema.users)
+            .values({ id: host, email: `${host}@example.test`, emailVerified: true });
+          await db.insert(schema.eventTypes).values({
+            id: event,
+            organizationId: org,
+            ownerId: host,
+            title: "Sessions",
+            slug: "sessions",
+            price: 5000,
+            currency: "usd",
+            durationMinutes: 30,
+            location: "in_person",
+            locationDetail: "Test",
+          });
+          // Slice 4 schema: insert through SQL because new columns do not exist yet.
+          await db.$client.query(
+            "INSERT INTO package_credits(id,organization_id,event_type_id,client_email,total_credits,used_credits) VALUES($1,$2,$3,$4,5,2)",
+            [legacy, org, event, `${host}@example.test`],
+          );
         });
-        // Slice 4 schema: insert through SQL because new columns do not exist yet.
-        await db.$client.query(
-          "INSERT INTO package_credits(id,organization_id,event_type_id,client_email,total_credits,used_credits) VALUES($1,$2,$3,$4,5,2)",
-          [legacy, org, event, `${host}@example.test`],
-        );
       }
       if (tag === "0068_zero_cash_booking") {
-        await db.insert(schema.bookings).values({
-          id: legacyZero,
-          organizationId: org,
-          eventTypeId: event,
-          hostId: host,
-          title: "Legacy unpriced",
-          uid: randomUUID(),
-          startsAt: new Date("2050-01-01T12:00:00Z"),
-          endsAt: new Date("2050-01-01T12:30:00Z"),
-          timezone: "UTC",
-          allowOverlap: true,
+        await withPreResourceSchedulingSchema(async () => {
+          await db.insert(schema.bookings).values({
+            id: legacyZero,
+            organizationId: org,
+            eventTypeId: event,
+            hostId: host,
+            title: "Legacy unpriced",
+            uid: randomUUID(),
+            startsAt: new Date("2050-01-01T12:00:00Z"),
+            endsAt: new Date("2050-01-01T12:30:00Z"),
+            timezone: "UTC",
+            allowOverlap: true,
+          });
         });
       }
       const client = await db.$client.connect();
@@ -966,7 +971,7 @@ describe.skipIf(!url)("package integrity PostgreSQL", () => {
       let waiters = 0;
       for (let n = 0; n < 100 && waiters < 2; n++) {
         const { rows } = await db.$client.query(
-          "SELECT count(*)::int as n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%package_credits%'",
+          "SELECT count(*)::int as n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND (query LIKE '%package_credits%' OR query LIKE '%pg_advisory_xact_lock%')",
         );
         waiters = rows[0].n;
         if (waiters < 2) await new Promise((r) => setTimeout(r, 10));

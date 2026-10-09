@@ -1,5 +1,6 @@
 import { relations } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   date,
   index,
@@ -176,6 +177,15 @@ export const eventTypes = pgTable(
      * import cycle with schema/team.ts; integrity enforced in the app. */
     teamId: uuid("team_id"),
     scheduleId: uuid("schedule_id").references(() => schedules.id, { onDelete: "set null" }),
+
+    /** Inert foundation: activation remains unavailable before writer cutover. */
+    resourceConfigurationRevision: bigint("resource_configuration_revision", { mode: "number" })
+      .notNull()
+      .default(1),
+    resourceAdmissionEpoch: bigint("resource_admission_epoch", { mode: "number" })
+      .notNull()
+      .default(0),
+    requiresHost: boolean("requires_host").notNull().default(true),
 
     slug: text("slug").notNull(),
     title: text("title").notNull(),

@@ -1,5 +1,6 @@
 import {
   BookingError,
+  ResourceInvariantError,
   assertExclusiveSettlement,
   mapInsertError,
   validateResponses,
@@ -85,5 +86,33 @@ describe("mapInsertError", () => {
   it("rethrows unknown errors as-is", () => {
     const other = new Error("boom");
     expect(() => mapInsertError(other)).toThrow(other);
+  });
+});
+
+describe("Resource diagnostic application boundary", () => {
+  it.each([
+    "resource_plan_completeness_violation",
+    "resource_scope_violation",
+    "resource_claim_lifecycle_violation",
+  ])("wrapped %s remains invariant rather than slot contention", (constraint) => {
+    expect(() =>
+      mapInsertError(new Error("driver wrapper", { cause: { code: "23514", constraint } })),
+    ).toThrow(ResourceInvariantError);
+  });
+  it("wrapped valid capacity conflict is a scheduling conflict", () => {
+    try {
+      mapInsertError(
+        new Error("driver wrapper", {
+          cause: { code: "23P01", constraint: "resource_capacity_conflict" },
+        }),
+      );
+    } catch (error) {
+      expect(error).toBeInstanceOf(BookingError);
+      expect((error as BookingError).status).toBe(409);
+    }
+  });
+  it("retryable transaction failure remains available to whole-transaction retry", () => {
+    const original = new Error("driver wrapper", { cause: { code: "40P01" } });
+    expect(() => mapInsertError(original)).toThrow(original);
   });
 });

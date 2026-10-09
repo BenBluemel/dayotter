@@ -3,6 +3,7 @@ import { eq, getDb, schema } from "@dayotter/db";
 
 interface TravelContext {
   hostId: string;
+  requiresHost?: boolean;
   /** The booking these blocks belong to (so they clean up on cancel/reschedule). */
   bookingId: string;
   /** Event type location type (e.g. "in_person", "google_meet"). */
@@ -23,7 +24,7 @@ interface TravelContext {
  * never blocks or fails the booking.
  */
 export async function reserveTravelBlocks(ctx: TravelContext): Promise<void> {
-  if (ctx.location !== "in_person") return;
+  if (ctx.requiresHost === false || ctx.location !== "in_person") return;
   try {
     const db = getDb();
     const prefs = await db.query.userPreferences.findFirst({

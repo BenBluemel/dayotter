@@ -1,3 +1,4 @@
+import { classifyResourceError } from "@dayotter/db";
 /** Pure booking helpers - no I/O - so they can be unit-tested directly. */
 
 export class BookingError extends Error {
@@ -6,6 +7,15 @@ export class BookingError extends Error {
     readonly status: number,
   ) {
     super(message);
+  }
+}
+
+export class ResourceInvariantError extends Error {
+  constructor(
+    readonly identity: string,
+    cause: unknown,
+  ) {
+    super("Scheduling data requires technical review", { cause });
   }
 }
 
@@ -56,7 +66,16 @@ export function validateResponses(
  */
 export function mapInsertError(err: unknown): never {
   if (err instanceof BookingError) throw err;
-  const failure = err as { constraint?: string; cause?: { constraint?: string } };
+  const resource = classifyResourceError(err);
+  if (resource?.category === "invariant") throw new ResourceInvariantError(resource.identity, err);
+  if (resource?.category === "conflict")
+    throw new BookingError("That appointment is unavailable", 409);
+  if (resource?.category === "transient") throw err;
+  const failure = err as {
+    code?: string;
+    constraint?: string;
+    cause?: { code?: string; constraint?: string };
+  };
   if ((failure.cause ?? failure).constraint === "booking_settlement_claim_conflict")
     throw new BookingError(
       "This booking request already has a settlement; retry the original request",
@@ -64,7 +83,7 @@ export function mapInsertError(err: unknown): never {
     );
   // 23505 = unique_violation (same-instant race); 23P01 = exclusion_violation
   // (the bookings_no_overlap GiST constraint catching a cross-duration overlap).
-  const code = (err as { code?: string })?.code;
+  const code = (failure.cause ?? failure)?.code;
   if (code === "23505" || code === "23P01") {
     throw new BookingError("That time was just booked", 409);
   }

@@ -67,15 +67,18 @@ export async function notifyNextMeetingDelayed(
   const db = getDb();
   const current = await db.query.bookings.findFirst({
     where: eq(schema.bookings.uid, currentUid),
-    columns: { id: true, hostId: true, endsAt: true },
+    columns: { id: true, hostId: true, endsAt: true, requiresHost: true },
   });
   if (!current) return "not_found";
   if (current.hostId !== hostUserId) return "forbidden";
+
+  if (current.requiresHost === false) return "no_next";
 
   // The soonest confirmed meeting starting after this one ends, within the window.
   const next = await db.query.bookings.findFirst({
     where: and(
       eq(schema.bookings.hostId, hostUserId),
+      eq(schema.bookings.requiresHost, true),
       eq(schema.bookings.status, "confirmed"),
       gt(schema.bookings.startsAt, current.endsAt),
       lt(schema.bookings.startsAt, new Date(current.endsAt.getTime() + OVERFLOW_WINDOW_MS)),

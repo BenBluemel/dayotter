@@ -8,7 +8,18 @@ import {
 } from "@/lib/packages/credits";
 import { env } from "@/lib/server/env";
 import { type AppointmentPrice, logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
-import { and, eq, getDb, gte, inArray, lt, schema, sql } from "@dayotter/db";
+import {
+  allocateBookingResources,
+  and,
+  eq,
+  getDb,
+  gte,
+  inArray,
+  lt,
+  schema,
+  sql,
+  withResourceTransaction,
+} from "@dayotter/db";
 import { bookingRequested, newBookingRequest, sendEmail } from "@dayotter/emails";
 import { DateTime } from "luxon";
 import { canonicalJson, decodeAttempt } from "../payments/attempt-terms";
@@ -30,6 +41,13 @@ import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
 import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
 import { findZeroCashBooking, zeroCashBookingIdentity } from "./zero-cash";
+
+import {
+  captureSchedulingPlan,
+  lockPersonAdmission,
+  lockServiceAdmission,
+  rejectManagedRecurrence,
+} from "./resource-acceptance";
 
 export { BookingError } from "./booking-logic";
 
@@ -221,13 +239,31 @@ async function createBookingOnce(
   assertExclusiveSettlement(input);
   const db = getDb();
 
-  const eventType = await db.query.eventTypes.findFirst({
+  let eventType = await db.query.eventTypes.findFirst({
     where: eq(schema.eventTypes.id, input.eventTypeId),
   });
   if (!eventType || !eventType.isActive) {
     throw new BookingError("Event type not found", 404);
   }
 
+  const acceptedAttempt = input.paymentAttemptId
+    ? await db.query.paymentAttempts.findFirst({
+        where: eq(schema.paymentAttempts.id, input.paymentAttemptId),
+      })
+    : null;
+  const frozenScheduling = acceptedAttempt?.schedulingPlan;
+  if (frozenScheduling)
+    eventType = {
+      ...eventType,
+      ownerId: frozenScheduling.scheduleOwnerId,
+      requiresHost: frozenScheduling.requiresHost,
+      scheduleId: frozenScheduling.scheduleId,
+      durationMinutes: frozenScheduling.durationMinutes,
+      durationOptions: [frozenScheduling.durationMinutes],
+      bufferBeforeMinutes: frozenScheduling.bufferBeforeMinutes,
+      bufferAfterMinutes: frozenScheduling.bufferAfterMinutes,
+      minimumGapMinutes: frozenScheduling.minimumGapMinutes,
+    };
   if (input.redeemCredit && (eventType.recurringCount ?? 1) > 1)
     throw new BookingError("Recurring prepaid bookings are not supported yet", 409);
 
@@ -355,8 +391,7 @@ async function createBookingOnce(
   // (no calendar write, meeting link, reminders, or recurring occurrences) - the
   // host approves it later (see `approveBooking`), which finalizes it. Paid /
   // credit bookings skip the hold: payment is the commitment, and holding one
-  // would mean refunding on decline. The daily/weekly/focus caps below still
-  // count only `confirmed` rows, so a pending request never consumes a cap slot.
+  // would mean refunding on decline. Pending and confirmed bookings consume caps.
   const requiresConfirmation =
     Boolean(eventType.requiresConfirmation) && !input.payment && !input.redeemCredit;
   const initialStatus = requiresConfirmation ? "pending" : "confirmed";
@@ -368,7 +403,50 @@ async function createBookingOnce(
   let replayedBooking = false;
   let acceptedQuote = input.payment ? input.pricingQuote : undefined;
   try {
-    booking = await db.transaction(async (tx) => {
+    booking = await withResourceTransaction(db, async (tx) => {
+      let frozenPlan: (typeof schema.paymentAttempts.$inferSelect)["schedulingPlan"] = null;
+      if (input.paymentAttemptId) {
+        const [attempt] = await tx
+          .select()
+          .from(schema.paymentAttempts)
+          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId))
+          .for("update");
+        if (
+          !attempt ||
+          attempt.bookingId ||
+          !attempt.successFacts ||
+          !attempt.paymentSucceededAt ||
+          !["payment_succeeded", "fulfilling"].includes(attempt.state)
+        ) {
+          throw new BookingError("Payment attempt is not available for booking", 409);
+        }
+        await tx
+          .select()
+          .from(schema.paymentReviewActions)
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, attempt.id),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          )
+          .for("update");
+        const saved = decodeAttempt(attempt);
+        frozenPlan = saved.schedulingPlan;
+        const { payment, pricingQuote, paymentAttemptId, quotedDurationMinutes, ...bookingInput } =
+          input;
+        if (
+          !attempt.checkoutSessionId ||
+          attempt.successFacts?.amount !== payment?.amountPaid ||
+          attempt.successFacts?.currency !== payment?.currency ||
+          attempt.paymentIntentId !== payment?.paymentIntentId ||
+          canonicalJson(saved.input) !== canonicalJson(bookingInput) ||
+          canonicalJson(saved.quote) !== canonicalJson(pricingQuote) ||
+          saved.resolvedDurationMinutes !== quotedDurationMinutes ||
+          attempt.destinationAccountId !== (payment?.destinationAccountId ?? null)
+        ) {
+          throw new BookingError("Payment attempt does not match booking settlement", 409);
+        }
+      }
       if (!input.payment && !input.redeemCredit) {
         const identity = zeroCashBookingIdentity(input);
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
@@ -434,70 +512,95 @@ async function createBookingOnce(
         )
           throw new BookingError("Service configuration changed; retry your prepaid booking", 409);
       }
-      if (input.paymentAttemptId) {
-        const [attempt] = await tx
-          .select()
-          .from(schema.paymentAttempts)
-          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId))
-          .for("update");
-        if (
-          !attempt ||
-          attempt.bookingId ||
-          !attempt.successFacts ||
-          !attempt.paymentSucceededAt ||
-          !["payment_succeeded", "fulfilling"].includes(attempt.state)
-        ) {
-          throw new BookingError("Payment attempt is not available for booking", 409);
-        }
-        const saved = decodeAttempt(attempt);
-        const { payment, pricingQuote, paymentAttemptId, quotedDurationMinutes, ...bookingInput } =
-          input;
-        if (
-          !attempt.checkoutSessionId ||
-          attempt.successFacts?.amount !== payment?.amountPaid ||
-          attempt.successFacts?.currency !== payment?.currency ||
-          attempt.paymentIntentId !== payment?.paymentIntentId ||
-          canonicalJson(saved.input) !== canonicalJson(bookingInput) ||
-          canonicalJson(saved.quote) !== canonicalJson(pricingQuote) ||
-          saved.resolvedDurationMinutes !== quotedDurationMinutes ||
-          attempt.destinationAccountId !== (payment?.destinationAccountId ?? null)
-        ) {
-          throw new BookingError("Payment attempt does not match booking settlement", 409);
-        }
+      const service = await lockServiceAdmission(tx, eventType.id);
+      rejectManagedRecurrence(service, isRecurring);
+      if (
+        service.resourceAdmissionEpoch &&
+        !input.paymentAttemptId &&
+        service.resourceConfigurationRevision !== eventType.resourceConfigurationRevision
+      )
+        throw new BookingError("Service configuration changed; retry booking", 409);
+      if (service.resourceAdmissionEpoch && input.payment && !input.paymentAttemptId)
+        throw new BookingError("This service requires durable checkout", 409);
+      if (service.resourceAdmissionEpoch && input.paymentAttemptId && !frozenPlan)
+        throw new BookingError("This checkout requires scheduling review", 409);
+      const schedulingPlan = await captureSchedulingPlan(
+        tx,
+        service,
+        duration,
+        host.id,
+        frozenPlan,
+      );
+      await lockPersonAdmission(
+        tx,
+        (schedulingPlan?.requiresHost ?? true)
+          ? eventType.schedulingType === "collective"
+            ? hostIds
+            : [host.id]
+          : [],
+      );
+      // Public primary-person admission uses the same predicate after waiting
+      // for other creators, including ordinary bookings competing with managed ones.
+      const requiresHost = schedulingPlan?.requiresHost ?? true;
+      if (!isGroup && requiresHost) {
+        const before = schedulingPlan?.bufferBeforeMinutes ?? eventType.bufferBeforeMinutes;
+        const after = schedulingPlan?.bufferAfterMinutes ?? eventType.bufferAfterMinutes;
+        const candidateFrom = new Date(start.getTime() - before * 60_000);
+        const candidateTo = new Date(end.getTime() + after * 60_000);
+        const gap = schedulingPlan?.minimumGapMinutes ?? eventType.minimumGapMinutes;
+        const conflicts = await tx
+          .select({ id: schema.bookings.id })
+          .from(schema.bookings)
+          .where(
+            and(
+              eq(schema.bookings.hostId, host.id),
+              eq(schema.bookings.requiresHost, true),
+              inArray(schema.bookings.status, ["pending", "confirmed"]),
+              sql`${schema.bookings.startsAt} - ${gap} * interval '1 minute' < ${candidateTo}`,
+              sql`${schema.bookings.endsAt} + ${gap} * interval '1 minute' > ${candidateFrom}`,
+            ),
+          )
+          .limit(1);
+        if (conflicts.length) throw new BookingError("That time is no longer available", 409);
       }
-      // Serialize all cap-relevant bookings for this host within the host-local
-      // ISO week. The daily/weekly/focus checks below are count-then-insert, and
-      // the unique/no-overlap indexes only stop same-slot collisions - so without
-      // this lock two bookings on DIFFERENT slots of the same day/week could each
-      // read count < limit and both commit, exceeding the cap. Locking on
-      // host+week (a superset of host+day) closes that race with minimal
-      // contention; different weeks never block each other.
+      // Serialize every intersecting service period, plus the person focus day.
+      // Keep the existing host/week key so ordinary reschedules still coordinate
+      // with creation while managed rescheduling remains unsupported.
       const capApplies =
         eventType.dailyBookingLimit != null ||
         eventType.weeklyBookingLimit != null ||
         eventType.monthlyBookingLimit != null ||
         eventType.yearlyBookingLimit != null ||
-        (!isGroup && Boolean(focusPrefs?.adaptiveAvailability));
+        (!isGroup && requiresHost && Boolean(focusPrefs?.adaptiveAvailability));
       if (capApplies) {
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const at = DateTime.fromJSDate(start).setZone(zone);
-        // Serialize on the COARSEST active window, so every finer cap (a subset of
-        // it - day ⊂ week ⊂ month ⊂ year) is race-safe under the same lock.
-        // Different periods never block each other.
-        const lockKey =
-          eventType.yearlyBookingLimit != null
-            ? `y:${at.year}`
-            : eventType.monthlyBookingLimit != null
-              ? `m:${at.year}-${at.month}`
-              : `w:${at.startOf("week").toISODate()}`;
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`${host.id}:${lockKey}`}))`);
+        const legacyWeek = DateTime.fromJSDate(start)
+          .setZone(host.timezone || "UTC")
+          .startOf("week")
+          .toISODate();
+        const keys: string[] = requiresHost ? [`${host.id}:${legacyWeek}`] : [];
+        for (const [unit, limit] of [
+          ["day", eventType.dailyBookingLimit],
+          ["week", eventType.weeklyBookingLimit],
+          ["month", eventType.monthlyBookingLimit],
+          ["year", eventType.yearlyBookingLimit],
+        ] as const)
+          if (limit != null)
+            keys.push(
+              `service-cap:${eventType.id}:${zone}:${unit}:${at.startOf(unit).toISODate()}`,
+            );
+        if (!isGroup && requiresHost && focusPrefs?.adaptiveAvailability)
+          keys.push(`person-cap:${host.id}:${zone}:day:${at.startOf("day").toISODate()}`);
+        for (const key of keys.sort())
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${key}))`);
       }
 
       // Daily cap: count this event type's confirmed bookings on the same
       // host-local calendar day as the requested slot, inside the transaction so
       // concurrent bookings can't both slip past the limit.
       if (eventType.dailyBookingLimit != null) {
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const day = DateTime.fromJSDate(start).setZone(zone);
         const dayStart = day.startOf("day").toJSDate();
         const nextDay = day.startOf("day").plus({ days: 1 }).toJSDate();
@@ -522,9 +625,9 @@ async function createBookingOnce(
       // Focus protection (host-wide cap across all event types). Backstops the
       // availability-level slot hiding for group events / direct API / races, so
       // an overloaded day can't be pushed past the host's daily meeting limit.
-      if (!isGroup && focusPrefs?.adaptiveAvailability) {
+      if (!isGroup && requiresHost && focusPrefs?.adaptiveAvailability) {
         const cap = focusPrefs.maxMeetingsPerDay ?? 5;
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const day = DateTime.fromJSDate(start).setZone(zone);
         const dayStart = day.startOf("day").toJSDate();
         const nextDay = day.startOf("day").plus({ days: 1 }).toJSDate();
@@ -534,6 +637,7 @@ async function createBookingOnce(
           .where(
             and(
               eq(schema.bookings.hostId, host.id),
+              eq(schema.bookings.requiresHost, true),
               inArray(schema.bookings.status, ["confirmed", "pending"]),
               gte(schema.bookings.startsAt, dayStart),
               lt(schema.bookings.startsAt, nextDay),
@@ -549,7 +653,7 @@ async function createBookingOnce(
 
       // Weekly cap: same idea over the host-local ISO week containing the slot.
       if (eventType.weeklyBookingLimit != null) {
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const week = DateTime.fromJSDate(start).setZone(zone);
         const weekStart = week.startOf("week").toJSDate();
         const nextWeek = week.startOf("week").plus({ weeks: 1 }).toJSDate();
@@ -571,7 +675,7 @@ async function createBookingOnce(
 
       // Monthly cap: over the host-local calendar month containing the slot.
       if (eventType.monthlyBookingLimit != null) {
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const m = DateTime.fromJSDate(start).setZone(zone);
         const monthStart = m.startOf("month").toJSDate();
         const nextMonth = m.startOf("month").plus({ months: 1 }).toJSDate();
@@ -593,7 +697,7 @@ async function createBookingOnce(
 
       // Yearly cap: over the host-local calendar year.
       if (eventType.yearlyBookingLimit != null) {
-        const zone = host.timezone || "UTC";
+        const zone = schedulingPlan?.capTimezone ?? (host.timezone || "UTC");
         const y = DateTime.fromJSDate(start).setZone(zone);
         const yearStart = y.startOf("year").toJSDate();
         const nextYear = y.startOf("year").plus({ years: 1 }).toJSDate();
@@ -636,6 +740,37 @@ async function createBookingOnce(
         }
       }
 
+      const [row] = await tx
+        .insert(schema.bookings)
+        .values({
+          organizationId: eventType.organizationId,
+          eventTypeId: eventType.id,
+          hostId: host.id,
+          title: eventType.title,
+          description: input.notes,
+          startsAt: start,
+          endsAt: end,
+          timezone: input.attendee.timezone,
+          status: initialStatus,
+          isGroup,
+          location: finalLocation.detail ?? null,
+          locationType: finalLocation.type,
+          responses: input.responses,
+          uid,
+          recurrenceUid,
+          schedulingPlan,
+          allocationRevision: schedulingPlan ? 1 : null,
+          schedulingAttemptId: schedulingPlan ? input.paymentAttemptId : null,
+          paymentStatus: !input.pricingQuote && input.payment ? "paid" : "none",
+          paymentIntentId: input.pricingQuote ? undefined : input.payment?.paymentIntentId,
+          amountPaid: input.pricingQuote ? undefined : input.payment?.amountPaid,
+          paymentCurrency: input.pricingQuote ? undefined : input.payment?.currency,
+          destinationAccountId: input.pricingQuote
+            ? undefined
+            : input.payment?.destinationAccountId,
+        })
+        .returning();
+      if (!row) throw new BookingError("Failed to create booking", 500);
       // Consume a single-use / limited booking link atomically: only succeeds
       // while there are uses left and it hasn't expired.
       if (input.linkToken) {
@@ -656,34 +791,6 @@ async function createBookingOnce(
         }
       }
 
-      const [row] = await tx
-        .insert(schema.bookings)
-        .values({
-          organizationId: eventType.organizationId,
-          eventTypeId: eventType.id,
-          hostId: host.id,
-          title: eventType.title,
-          description: input.notes,
-          startsAt: start,
-          endsAt: end,
-          timezone: input.attendee.timezone,
-          status: initialStatus,
-          isGroup,
-          location: finalLocation.detail ?? null,
-          locationType: finalLocation.type,
-          responses: input.responses,
-          uid,
-          recurrenceUid,
-          paymentStatus: !input.pricingQuote && input.payment ? "paid" : "none",
-          paymentIntentId: input.pricingQuote ? undefined : input.payment?.paymentIntentId,
-          amountPaid: input.pricingQuote ? undefined : input.payment?.amountPaid,
-          paymentCurrency: input.pricingQuote ? undefined : input.payment?.currency,
-          destinationAccountId: input.pricingQuote
-            ? undefined
-            : input.payment?.destinationAccountId,
-        })
-        .returning();
-      if (!row) throw new BookingError("Failed to create booking", 500);
       if (acceptedQuote) {
         await persistBookingPricingSnapshot(row.id, acceptedQuote, tx);
         if (input.paymentAttemptId && acceptedQuote.coupon)
@@ -708,17 +815,6 @@ async function createBookingOnce(
             .returning();
           Object.assign(row, settled);
         }
-      }
-      if (input.paymentAttemptId) {
-        await bindPaidBooking(tx, input.paymentAttemptId, {
-          booking: row,
-          eventType,
-          host,
-          attendee: input.attendee,
-          guests,
-          notes: input.notes,
-          appUrl,
-        });
       }
 
       await tx.insert(schema.bookingAttendees).values([
@@ -767,6 +863,30 @@ async function createBookingOnce(
           .values(hostIds.map((userId) => ({ bookingId: row.id, userId })))
           .onConflictDoNothing();
       }
+      if (schedulingPlan) await allocateBookingResources(tx, row.id, "booking_creation");
+      if (input.paymentAttemptId) {
+        await bindPaidBooking(tx, input.paymentAttemptId, {
+          booking: row,
+          eventType,
+          host,
+          attendee: input.attendee,
+          guests,
+          notes: input.notes,
+          appUrl,
+        });
+      }
+
+      if (input.paymentAttemptId)
+        await tx
+          .update(schema.paymentReviewActions)
+          .set({ state: "booked", resolvedAt: new Date() })
+          .where(
+            and(
+              eq(schema.paymentReviewActions.attemptId, input.paymentAttemptId),
+              eq(schema.paymentReviewActions.method, "retry"),
+              eq(schema.paymentReviewActions.state, "active"),
+            ),
+          );
       return row;
     });
   } catch (err) {

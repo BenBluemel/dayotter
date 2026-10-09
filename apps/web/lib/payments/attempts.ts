@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { encryptJson, sha256hex } from "@dayotter/core";
-import { type Database, and, eq, getDb, schema, sql } from "@dayotter/db";
+import { type Database, and, classifyResourceError, eq, getDb, schema, sql } from "@dayotter/db";
 import type Stripe from "stripe";
-import { BookingError } from "../booking/booking-logic";
+import { BookingError, mapInsertError } from "../booking/booking-logic";
 import { reserveCouponUse } from "../booking/coupon-uses";
 import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import type { CreateBookingInput } from "../booking/create-booking";
 import { quoteAppointmentPrice } from "../booking/pricing";
+import {
+  captureSchedulingPlan,
+  lockServiceAdmission,
+  rejectManagedRecurrence,
+} from "../booking/resource-acceptance";
 import { env } from "../server/env";
 import {
   CHECKOUT_LIFETIME_SECONDS,
@@ -63,17 +68,8 @@ export async function prepareAppointmentAttempt(
             };
           // Coupon capacity uses a locked definition row and READ COMMITTED count.
           // Hold the service row too so its price/owner cannot change mid-prepare.
-          const event = input.couponCode
-            ? (
-                await tx
-                  .select()
-                  .from(schema.eventTypes)
-                  .where(eq(schema.eventTypes.id, input.eventTypeId))
-                  .for("share")
-              )[0]
-            : await tx.query.eventTypes.findFirst({
-                where: eq(schema.eventTypes.id, input.eventTypeId),
-              });
+          const event = await lockServiceAdmission(tx, input.eventTypeId);
+          rejectManagedRecurrence(event, event.recurringCount > 1);
           if (!event?.isActive) throw new BookingError("Event type not found", 404);
           const quote = await quoteAppointmentPrice(
             {
@@ -100,6 +96,12 @@ export async function prepareAppointmentAttempt(
               : input.durationMinutes === event.durationMinutes)
               ? input.durationMinutes
               : event.durationMinutes;
+          const schedulingPlan = await captureSchedulingPlan(
+            tx,
+            event,
+            durationMinutes,
+            event.ownerId!,
+          );
           if (quote.amountToCollect === 0) return { quote, attempt: null, durationMinutes };
           const route = await checkoutRouteForOrganization(
             event.organizationId,
@@ -123,6 +125,8 @@ export async function prepareAppointmentAttempt(
               }),
               quote,
               quoteHash: sha256hex(canonicalJson(quote)),
+              schedulingPlan,
+              schedulingDurationMinutes: schedulingPlan ? durationMinutes : null,
               amount: quote.amountToCollect,
               currency: quote.currency,
               paymentMode: route.mode,
@@ -168,10 +172,11 @@ export async function prepareAppointmentAttempt(
         );
       if (
         retry < 2 &&
-        (detail.code === "40001" ||
+        (classifyResourceError(err)?.category === "transient" ||
           (detail.code === "23505" && detail.constraint === "payment_attempt_request_key_idx"))
       )
         continue;
+      if (classifyResourceError(err)) mapInsertError(err);
       throw err;
     }
   }

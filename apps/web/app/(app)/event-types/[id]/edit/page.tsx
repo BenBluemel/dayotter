@@ -1,8 +1,10 @@
 import { EventTypeForm } from "@/components/event-type-form";
 import { PageHeader } from "@/components/page-header";
+import { ResourceRequirementsEditor } from "@/components/resource-requirements-editor";
 import { getSession } from "@/lib/auth/session";
 import { paymentsEnabled } from "@/lib/payments/stripe";
-import { and, eq, getDb, schema } from "@dayotter/db";
+import { listResourceConfiguration } from "@/lib/resources/configuration";
+import { and, eq, getDb, inArray, schema } from "@dayotter/db";
 import { notFound } from "next/navigation";
 
 export const dynamic = "force-dynamic";
@@ -19,6 +21,18 @@ export default async function EditEventTypePage({
     where: and(eq(schema.eventTypes.id, id), eq(schema.eventTypes.ownerId, session!.user.id)),
   });
   if (!eventType) notFound();
+
+  const administrator = await getDb().query.memberships.findFirst({
+    where: and(
+      eq(schema.memberships.userId, session!.user.id),
+      eq(schema.memberships.organizationId, eventType.organizationId),
+      inArray(schema.memberships.role, ["owner", "admin"]),
+    ),
+  });
+  const resources = administrator
+    ? await listResourceConfiguration(getDb(), session!.user.id, eventType.organizationId)
+    : null;
+  const service = resources?.services.find((s) => s.id === eventType.id);
 
   return (
     <>
@@ -62,6 +76,15 @@ export default async function EditEventTypePage({
           scheduleId: eventType.scheduleId,
         }}
       />
+      {resources && service && (
+        <div className="mt-6">
+          <ResourceRequirementsEditor
+            organizationId={eventType.organizationId}
+            service={service}
+            resources={resources.resources}
+          />
+        </div>
+      )}
     </>
   );
 }

@@ -6,6 +6,7 @@ import { and, eq, getDb, schema } from "@dayotter/db";
 import { BookingError } from "./booking-logic";
 import { getOrCreatePersonalEventType } from "./host-booking";
 import { reminderOffsetsForHost, scheduleBookingReminders } from "./reminders";
+import { lockPersonAdmission } from "./resource-acceptance";
 import { teamSchedule } from "./team-schedule";
 
 export interface InternalTeamBookingInput {
@@ -134,6 +135,9 @@ export async function createInternalTeamBooking(
       service.isActive
     )
       throw new BookingError("Personal booking configuration requires review", 409);
+    if (service.resourceAdmissionEpoch)
+      throw new BookingError("Resource services are not supported for internal team meetings", 409);
+    await lockPersonAdmission(tx, [input.organizerId]);
     const [row] = await tx
       .insert(schema.bookings)
       .values({

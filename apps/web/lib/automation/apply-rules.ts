@@ -4,6 +4,7 @@ import { scheduleBookingFollowUp } from "../booking/reminders";
 
 interface BookingContext {
   bookingId: string;
+  requiresHost?: boolean;
   hostId: string;
   title: string;
   startsAt: Date;
@@ -17,6 +18,7 @@ interface BookingContext {
  * re-firing follow-up emails. Best-effort.
  */
 export async function reserveRuleBlocks(ctx: BookingContext): Promise<number> {
+  if (ctx.requiresHost === false) return 0;
   const db = getDb();
   const rules = await db.query.automationRules.findMany({
     where: and(

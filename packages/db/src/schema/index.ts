@@ -26,3 +26,7 @@ export * from "./payment-attempts";
 export * from "./refund-operations";
 
 export * from "./package-integrity";
+
+export * from "./resources";
+
+export * from "./payment-review-actions";

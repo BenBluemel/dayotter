@@ -201,3 +201,16 @@ cancellation/refund policy.
   are explicit instants. Coupon management uses the organization business timezone.
 - Remaining-balance collection and recurring/package refund policies described
   above. None is implicitly authorized by documenting the current rules.
+
+
+### Resource-enabled payment review (R2 foundation; rollout inactive)
+
+Checkout without a resource hold does not guarantee equipment capacity until the
+booking commits. A verified payment whose original appointment cannot be allocated
+remains owed, with its coupon reservation preserved. Authorized staff contact the
+customer and either retry that exact accepted appointment or refund through the
+historical payment route. A different appointment requires refund plus a new booking;
+accepted price, routing, coupon and resource history are never rewritten. Verified full
+unbooked refund releases its coupon reservation exactly once. Technical resource
+invariants require technical review, not an ordinary scheduling retry. Resources are
+not enabled on real services until the coordinated lifecycle/availability rollout.

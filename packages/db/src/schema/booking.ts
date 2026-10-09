@@ -1,6 +1,9 @@
 import { relations, sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
+  bigint,
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -19,6 +22,8 @@ import {
 } from "./_shared";
 import { calendars } from "./calendar";
 import { organizations, users } from "./orgs";
+import { paymentAttempts } from "./payment-attempts";
+import type { AcceptedSchedulingPlan } from "./resources";
 import { eventTypes } from "./scheduling";
 
 /** A scheduled meeting instance. */
@@ -73,6 +78,18 @@ export const bookings = pgTable(
     /** Why the booking was last moved (shown to the host on the booking page). */
     rescheduleReason: text("reschedule_reason"),
 
+    /** Frozen capacity participation; hostId remains the responsible provider. */
+    requiresHost: boolean("requires_host").notNull().default(true),
+    /** Null retains unknown scheduling history on legacy/unmanaged rows. */
+    schedulingPlan: jsonb("scheduling_plan").$type<AcceptedSchedulingPlan>(),
+    allocationRevision: bigint("allocation_revision", { mode: "number" }),
+    schedulingAttemptId: uuid("scheduling_attempt_id").references(
+      (): AnyPgColumn => paymentAttempts.id,
+      { onDelete: "restrict" },
+    ),
+    creationOperationKey: text("creation_operation_key"),
+    creationFingerprint: text("creation_fingerprint"),
+
     // Payments (Stripe). paymentStatus="none" for free event types.
     paymentStatus: paymentStatus("payment_status").notNull().default("none"),
     /** Stripe PaymentIntent id - used to issue refunds on cancel. */
@@ -87,6 +104,11 @@ export const bookings = pgTable(
     ...timestamps,
   },
   (t) => [
+    check(
+      "booking_creation_identity_check",
+      sql`(${t.creationOperationKey} IS NULL AND ${t.creationFingerprint} IS NULL) OR (${t.schedulingPlan} IS NOT NULL AND ${t.creationOperationKey} IS NOT NULL AND ${t.creationFingerprint} ~ '^[a-f0-9]{64}$' AND ${t.creationOperationKey} LIKE 'host-booking:' || ${t.hostId}::text || ':%') IS TRUE`,
+    ),
+    uniqueIndex("booking_creation_operation_idx").on(t.creationOperationKey),
     uniqueIndex("bookings_uid_idx").on(t.uid),
     uniqueIndex("bookings_id_org_event_idx").on(t.id, t.organizationId, t.eventTypeId),
     index("bookings_host_idx").on(t.hostId),
@@ -106,7 +128,7 @@ export const bookings = pgTable(
     uniqueIndex("bookings_host_slot_active_idx")
       .on(t.hostId, t.startsAt)
       .where(
-        sql`${t.status} IN ('confirmed', 'pending') AND ${t.isGroup} = false AND ${t.allowOverlap} = false`,
+        sql`${t.status} IN ('confirmed', 'pending') AND ${t.isGroup} = false AND ${t.allowOverlap} = false AND ${t.requiresHost} = true`,
       ),
   ],
 );

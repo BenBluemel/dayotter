@@ -1,4 +1,5 @@
 import { type Database, and, eq, getDb, inArray, lte, schema, sql } from "@dayotter/db";
+import { ResourceInvariantError } from "../booking/booking-logic";
 import { releaseTerminalCouponReservation } from "../booking/coupon-uses";
 import { decodeAttempt } from "./attempt-terms";
 import { appointmentCheckout } from "./attempts";
@@ -76,8 +77,14 @@ export async function recoverAppointmentPayments(limit = 25, db: Database = getD
           .set({ nextRecoveryAt: new Date(Date.now() + 60000) })
           .where(eq(schema.paymentAttempts.id, current.id));
     } catch (err) {
-      if (err instanceof PaymentContradictionError)
-        await requirePaymentReview(attempt.id, "stripe_terms_contradiction", db);
+      if (err instanceof ResourceInvariantError || err instanceof PaymentContradictionError)
+        await requirePaymentReview(
+          attempt.id,
+          err instanceof ResourceInvariantError
+            ? "resource_invariant_requires_review"
+            : "stripe_terms_contradiction",
+          db,
+        );
       else
         await db
           .update(schema.paymentAttempts)

@@ -1,6 +1,6 @@
 import type { CalendarInvite, InviteResponse } from "@dayotter/calendar";
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, gte, inArray, lte, schema } from "@dayotter/db";
+import { and, eq, getDb, gte, inArray, lte, schema, sql } from "@dayotter/db";
 import { adapterForConnection } from "@dayotter/integrations";
 
 export interface PendingInvite extends CalendarInvite {
@@ -62,6 +62,9 @@ export async function listPendingInvites(userId: string, days = 30): Promise<Pen
       ? db.query.busyBlocks.findMany({
           where: and(
             inArray(schema.busyBlocks.calendarId, calendarIds),
+            sql`NOT EXISTS (SELECT 1 FROM booking_references ref JOIN bookings b ON b.id=ref.booking_id
+              WHERE NOT b.requires_host AND ref.calendar_id=${schema.busyBlocks.calendarId}
+              AND ref.external_event_id=${schema.busyBlocks.externalEventId})`,
             lte(schema.busyBlocks.startsAt, end),
             gte(schema.busyBlocks.endsAt, now),
           ),
@@ -71,6 +74,7 @@ export async function listPendingInvites(userId: string, days = 30): Promise<Pen
     db.query.bookings.findMany({
       where: and(
         eq(schema.bookings.hostId, userId),
+        eq(schema.bookings.requiresHost, true),
         eq(schema.bookings.status, "confirmed"),
         lte(schema.bookings.startsAt, end),
         gte(schema.bookings.endsAt, now),

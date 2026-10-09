@@ -21,13 +21,14 @@ export const refundOperations = pgTable(
     organizationId: uuid("organization_id")
       .notNull()
       .references(() => organizations.id, { onDelete: "restrict" }),
-    bookingId: uuid("booking_id")
-      .notNull()
-      .references(() => bookings.id, { onDelete: "restrict" }),
+    bookingId: uuid("booking_id").references(() => bookings.id, { onDelete: "restrict" }),
     attemptId: uuid("attempt_id")
       .notNull()
       .references(() => paymentAttempts.id, { onDelete: "restrict" }),
-    purpose: text("purpose").$type<"cancellation">().notNull().default("cancellation"),
+    purpose: text("purpose")
+      .$type<"cancellation" | "unbooked_obligation">()
+      .notNull()
+      .default("cancellation"),
     paymentIntentId: text("payment_intent_id").notNull(),
     chargeId: text("charge_id").notNull(),
     amount: integer("amount").notNull(),
@@ -65,7 +66,7 @@ export const refundOperations = pgTable(
     index("refund_operation_recovery_idx").on(t.state, t.nextRecoveryAt),
     check(
       "refund_operation_terms_check",
-      sql`${t.purpose} = 'cancellation' AND ${t.amount} > 0 AND ${t.currency} ~ '^[a-z]{3}$'
+      sql`((${t.purpose} = 'cancellation' AND ${t.bookingId} IS NOT NULL) OR (${t.purpose} = 'unbooked_obligation' AND ${t.bookingId} IS NULL)) AND ${t.amount} > 0 AND ${t.currency} ~ '^[a-z]{3}$'
     AND ${t.paymentIntentId} ~ '^pi_[A-Za-z0-9]+$' AND ${t.chargeId} ~ '^ch_[A-Za-z0-9]+$'
     AND ${t.environment} IN ('test', 'live') AND ${t.chargeAccountId} ~ '^acct_[A-Za-z0-9]+$' AND ${t.credentialContext} = 'primary'
     AND ${t.applicationFeeAmount} BETWEEN 0 AND ${t.amount}

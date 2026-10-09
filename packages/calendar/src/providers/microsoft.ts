@@ -302,6 +302,7 @@ export class MicrosoftCalendarAdapter implements CalendarAdapter {
   private toGraphEvent(event: NewCalendarEvent): Record<string, unknown> {
     return {
       subject: event.title,
+      showAs: event.transparency === "transparent" ? "free" : "busy",
       body: { contentType: "HTML", content: event.description ?? "" },
       start: { dateTime: event.start.toISOString(), timeZone: "UTC" },
       end: { dateTime: event.end.toISOString(), timeZone: "UTC" },

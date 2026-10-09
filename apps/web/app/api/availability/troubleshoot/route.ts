@@ -76,7 +76,7 @@ export const GET = withUser(async (u, request) => {
     targets.map(async (t) => ({
       hostId: t.userId,
       hostName: t.name,
-      diagnosis: await troubleshootHostDay(t.userId, t.scheduleId, constraints, date, gap),
+      diagnosis: await troubleshootHostDay(t.userId, t.scheduleId, constraints, date, gap, et),
     })),
   );
 

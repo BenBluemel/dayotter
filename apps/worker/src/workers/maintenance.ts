@@ -1,5 +1,5 @@
 import { logger } from "@dayotter/core";
-import { and, eq, getDb, lt, schema } from "@dayotter/db";
+import { and, eq, getDb, lt, schema, withResourceTransaction } from "@dayotter/db";
 import { QUEUE_NAMES, connection, enqueueSync } from "@dayotter/jobs";
 import { Worker } from "bullmq";
 import { materializeWeeklyBlocks } from "./automation-weekly";
@@ -18,11 +18,36 @@ import { sendDueTeamBriefings } from "./team-briefing";
  * override to `no_show` afterwards. Idempotent.
  */
 export async function markPastBookingsCompleted(): Promise<void> {
-  const updated = await getDb()
-    .update(schema.bookings)
-    .set({ status: "completed" })
-    .where(and(eq(schema.bookings.status, "confirmed"), lt(schema.bookings.endsAt, new Date())))
-    .returning({ id: schema.bookings.id });
+  const db = getDb();
+  const cutoff = new Date();
+  const services = await db
+    .selectDistinct({ id: schema.bookings.eventTypeId })
+    .from(schema.bookings)
+    .where(and(eq(schema.bookings.status, "confirmed"), lt(schema.bookings.endsAt, cutoff)));
+  const updated: { id: string }[] = [];
+  for (const service of services) {
+    const rows = await withResourceTransaction(db, async (tx) => {
+      // Service admission precedes any booking row lock, including completion.
+      // Historical finite claims remain in place; completion never releases them.
+      await tx
+        .select()
+        .from(schema.eventTypes)
+        .where(eq(schema.eventTypes.id, service.id))
+        .for("share");
+      return tx
+        .update(schema.bookings)
+        .set({ status: "completed" })
+        .where(
+          and(
+            eq(schema.bookings.eventTypeId, service.id),
+            eq(schema.bookings.status, "confirmed"),
+            lt(schema.bookings.endsAt, cutoff),
+          ),
+        )
+        .returning({ id: schema.bookings.id });
+    });
+    updated.push(...rows);
+  }
   if (updated.length > 0) {
     logger.info("bookings auto-completed", {
       event: "bookings_auto_completed",

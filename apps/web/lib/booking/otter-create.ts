@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { writeBookingToCalendar } from "@/lib/calendar/host-calendar";
 import { type RecurrenceFreq, seriesOccurrences } from "@/lib/calendar/recurrence";
-import { getDb, schema } from "@dayotter/db";
+import { and, eq, getDb, schema } from "@dayotter/db";
+import { BookingError } from "./booking-logic";
 import type { LocationTypeValue } from "./event-type-input";
 import { createHostBooking } from "./host-booking";
 
 export interface OtterCreateInput {
   userId: string;
+  requestId?: string;
   title: string;
   /** First occurrence. A recurring/batch create expands forward from here. */
   start: Date;
@@ -50,6 +52,28 @@ export async function createOtterEvent(input: OtterCreateInput): Promise<OtterCr
     timezone: input.timezone,
   });
   const isSeries = occurrences.length > 1;
+  if (input.eventTypeSlug)
+    await getDb().transaction(async (tx) => {
+      const [service] = await tx
+        .select()
+        .from(schema.eventTypes)
+        .where(
+          and(
+            eq(schema.eventTypes.ownerId, input.userId),
+            eq(schema.eventTypes.slug, input.eventTypeSlug!),
+          ),
+        )
+        .for("share");
+      if (
+        service?.resourceAdmissionEpoch &&
+        (isSeries ||
+          (input.recurrenceFreq != null && input.recurrenceFreq !== "none") ||
+          (input.recurrenceCount ?? 1) > 1 ||
+          input.kind === "focus" ||
+          input.kind === "reminder")
+      )
+        throw new BookingError("Recurring or personal holds cannot book this service", 409);
+    });
 
   // Personal holds: one time_block per occurrence (shared seriesId when recurring),
   // best-effort mirrored to the calendar - no attendees/invite/reminders.
@@ -87,6 +111,7 @@ export async function createOtterEvent(input: OtterCreateInput): Promise<OtterCr
   for (const o of occurrences) {
     const result = await createHostBooking({
       userId: input.userId,
+      requestId: input.requestId ? `${input.requestId}:${created}` : undefined,
       title: input.title,
       start: o.startsAt,
       end: o.endsAt,

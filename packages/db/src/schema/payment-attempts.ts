@@ -13,6 +13,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { bookings } from "./booking";
 import { organizations } from "./orgs";
+import type { AcceptedSchedulingPlan } from "./resources";
 import { eventTypes } from "./scheduling";
 
 export interface PaymentSuccessFacts {
@@ -46,6 +47,8 @@ export const paymentAttempts = pgTable(
     bookingIntent: text("booking_intent").notNull(),
     quote: jsonb("quote").$type<unknown>().notNull(),
     quoteHash: text("quote_hash").notNull(),
+    schedulingPlan: jsonb("scheduling_plan").$type<AcceptedSchedulingPlan>(),
+    schedulingDurationMinutes: integer("scheduling_duration_minutes"),
     amount: integer("amount").notNull(),
     currency: text("currency").notNull(),
     settlement: text("settlement").$type<"cash">().notNull().default("cash"),
