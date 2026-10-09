@@ -533,6 +533,13 @@
       "when": 1791261780044,
       "tag": "0075_resource_only_services",
       "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1791494425197,
+      "tag": "0076_booking_history_search",
+      "breakpoints": true
     }
   ]
 }
