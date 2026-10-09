@@ -1,5 +1,5 @@
 import { withdrawMinimum } from "@/lib/booking/money";
-import { connectedBalances, createConnectedPayout } from "@/lib/payments/stripe";
+import { connectEnabled, connectedBalances, createConnectedPayout } from "@/lib/payments/stripe";
 import { jsonError, withUser } from "@/lib/server/http";
 import { logger } from "@dayotter/core";
 import { eq, getDb, schema } from "@dayotter/db";
@@ -12,6 +12,7 @@ export const dynamic = "force-dynamic";
  *  the minimum. Pays out EVERY currency bucket that clears the minimum, so a host
  *  taking multiple currencies isn't left with stranded funds. */
 export const POST = withUser(async (u) => {
+  if (!connectEnabled) return jsonError("Connect withdrawals are disabled", 503);
   const db = getDb();
   const user = await db.query.users.findFirst({
     where: eq(schema.users.id, u.id),

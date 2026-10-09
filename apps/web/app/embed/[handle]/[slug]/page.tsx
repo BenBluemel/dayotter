@@ -1,6 +1,7 @@
 import { EmbedBridge } from "@/components/embed-bridge";
 import { SlotPicker } from "@/components/slot-picker";
 import { aiEnabled } from "@/lib/ai/llm";
+import { getSession } from "@/lib/auth/session";
 import { brandStyle, getHostBranding } from "@/lib/booking/branding";
 import { LOCATION_LABELS, offeredLocations } from "@/lib/booking/event-type-input";
 import { chargeFor, formatMoney } from "@/lib/booking/money";
@@ -30,6 +31,7 @@ export default async function EmbedBookingPage({
   const { handle, slug } = await params;
   const sp = await searchParams;
   const db = getDb();
+  const signedIn = Boolean((await getSession())?.user?.id);
 
   const host = await db.query.users.findFirst({ where: eq(schema.users.handle, handle) });
   if (!host) notFound();
@@ -90,6 +92,7 @@ export default async function EmbedBookingPage({
           </div>
         )}
         <SlotPicker
+          signedIn={signedIn}
           embed
           eventTypeId={eventType.id}
           questions={eventType.questions}

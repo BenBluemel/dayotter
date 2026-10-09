@@ -62,6 +62,7 @@ export default function SettingsScreen() {
   const [bookingAssistant, setBookingAssistant] = useState(true);
   const [welcomeMessage, setWelcomeMessage] = useState("");
   const [brandColor, setBrandColor] = useState<string | null>(null);
+  const [connectEnabled, setConnectEnabled] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -72,11 +73,15 @@ export default function SettingsScreen() {
     Promise.all([
       api.get<{ preferences: UserPreferences }>("/api/settings/preferences"),
       api
-        .get<{ branding: { brandColor: string | null; welcomeMessage: string | null } }>("/api/me")
+        .get<{
+          connectEnabled?: boolean;
+          branding: { brandColor: string | null; welcomeMessage: string | null };
+        }>("/api/me")
         .catch(() => null),
     ])
       .then(([{ preferences: p }, me]) => {
         if (!active) return;
+        setConnectEnabled(Boolean(me?.connectEnabled));
         setTimeFormat(p.timeFormat);
         setWeekStartsOn(p.weekStartsOn);
         setLocale(p.locale ?? "en");
@@ -457,14 +462,16 @@ export default function SettingsScreen() {
           <Text style={styles.navText}>Plan &amp; billing</Text>
           <Ionicons name="chevron-forward" size={18} color={colors.faint} />
         </Pressable>
-        <Pressable
-          style={[styles.navRow, { marginTop: 10 }]}
-          onPress={() => router.push("/payouts")}
-        >
-          <Ionicons name="cash-outline" size={18} color={colors.muted} />
-          <Text style={styles.navText}>Payouts</Text>
-          <Ionicons name="chevron-forward" size={18} color={colors.faint} />
-        </Pressable>
+        {connectEnabled && (
+          <Pressable
+            style={[styles.navRow, { marginTop: 10 }]}
+            onPress={() => router.push("/payouts")}
+          >
+            <Ionicons name="cash-outline" size={18} color={colors.muted} />
+            <Text style={styles.navText}>Payouts</Text>
+            <Ionicons name="chevron-forward" size={18} color={colors.faint} />
+          </Pressable>
+        )}
         <Pressable
           style={[styles.navRow, { marginTop: 10 }]}
           onPress={() => router.push("/packages")}

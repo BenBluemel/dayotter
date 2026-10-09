@@ -9,6 +9,19 @@ export class BookingError extends Error {
   }
 }
 
+/** Public routes cannot send payment facts, but internal callers must also fail closed. */
+export function assertExclusiveSettlement(input: {
+  payment?: unknown;
+  redeemCredit?: boolean;
+}): void {
+  if (input.payment != null && input.redeemCredit) {
+    throw new BookingError(
+      "A booking cannot both redeem a package credit and take a cash payment",
+      400,
+    );
+  }
+}
+
 interface IntakeQuestion {
   id: string;
   label: string;
@@ -43,6 +56,12 @@ export function validateResponses(
  */
 export function mapInsertError(err: unknown): never {
   if (err instanceof BookingError) throw err;
+  const failure = err as { constraint?: string; cause?: { constraint?: string } };
+  if ((failure.cause ?? failure).constraint === "booking_settlement_claim_conflict")
+    throw new BookingError(
+      "This booking request already has a settlement; retry the original request",
+      409,
+    );
   // 23505 = unique_violation (same-instant race); 23P01 = exclusion_violation
   // (the bookings_no_overlap GiST constraint catching a cross-duration overlap).
   const code = (err as { code?: string })?.code;

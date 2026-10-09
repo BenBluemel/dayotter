@@ -4,6 +4,9 @@ export * from "./auth";
 export * from "./calendar";
 export * from "./scheduling";
 export * from "./booking";
+export * from "./promotions";
+export * from "./coupons";
+export * from "./booking-pricing";
 export * from "./team";
 export * from "./workflow";
 export * from "./preferences";
@@ -18,3 +21,8 @@ export * from "./crm";
 export * from "./plugins";
 export * from "./security";
 export * from "./support";
+
+export * from "./payment-attempts";
+export * from "./refund-operations";
+
+export * from "./package-integrity";

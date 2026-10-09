@@ -1,4 +1,5 @@
 import { eq, getDb, schema } from "@dayotter/db";
+import { connectEnabled } from "../payments/stripe";
 import { APPS, type ConnectionState, isConfigured, isConnected } from "./registry";
 
 export interface AppStatus {
@@ -38,12 +39,15 @@ export async function resolveAppStatuses(userId: string): Promise<Record<string,
     calendars: new Set(calendars.map((c) => c.provider)),
     crm: new Set(crm.map((c) => c.provider)),
     conferencing: new Set(conferencing.map((c) => c.provider)),
-    stripe: Boolean(user?.stripeAccountId),
+    stripe: connectEnabled && Boolean(user?.stripeAccountId),
   };
 
   const out: Record<string, AppStatus> = {};
   for (const app of APPS) {
-    out[app.id] = { configured: isConfigured(app), connected: isConnected(app, state) };
+    out[app.id] = {
+      configured: app.connection?.kind === "stripe" ? connectEnabled : isConfigured(app),
+      connected: isConnected(app, state),
+    };
   }
   return out;
 }

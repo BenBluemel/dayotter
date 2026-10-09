@@ -1,43 +1,31 @@
-import { grantCredits } from "@/lib/packages/credits";
+import { BookingError } from "@/lib/booking/booking-logic";
+import { grantPackageToCustomer } from "@/lib/packages/credits";
 import { jsonError, withUser } from "@/lib/server/http";
-import { and, eq, getDb, schema } from "@dayotter/db";
 import { NextResponse } from "next/server";
 import { z } from "zod";
-
 export const dynamic = "force-dynamic";
-
 const bodySchema = z.object({
   packageId: z.string().uuid(),
   clientEmail: z.string().email(),
+  operationId: z
+    .string()
+    .min(16)
+    .max(100)
+    .regex(/^[A-Za-z0-9:_-]+$/),
 });
-
-/**
- * Manually grant a package's credits to a client - for hosts who sell offline
- * (invoice, in person) or want to comp a client, without going through Stripe.
- */
-export const POST = withUser(async (u, request) => {
+export const POST = withUser(async (user, request) => {
   const parsed = bodySchema.safeParse(await request.json().catch(() => null));
-  if (!parsed.success) return jsonError("Check the details", 400);
-  const { packageId, clientEmail } = parsed.data;
-
-  // The package must belong to one of the host's event types.
-  const pkg = await getDb().query.sessionPackages.findFirst({
-    where: eq(schema.sessionPackages.id, packageId),
-  });
-  if (!pkg) return jsonError("Package not found", 404);
-  const owns = await getDb().query.eventTypes.findFirst({
-    where: and(eq(schema.eventTypes.id, pkg.eventTypeId), eq(schema.eventTypes.ownerId, u.id)),
-    columns: { id: true },
-  });
-  if (!owns) return jsonError("Package not found", 404);
-
-  await grantCredits({
-    organizationId: pkg.organizationId,
-    eventTypeId: pkg.eventTypeId,
-    clientEmail,
-    totalCredits: pkg.sessionCount,
-    packageId: pkg.id,
-  });
-
+  if (!parsed.success) return jsonError("Check the details and grant request ID", 400);
+  try {
+    await grantPackageToCustomer(
+      user.id,
+      parsed.data.packageId,
+      parsed.data.clientEmail,
+      parsed.data.operationId,
+    );
+  } catch (err) {
+    if (err instanceof BookingError) return jsonError(err.message, err.status);
+    throw err;
+  }
   return NextResponse.json({ ok: true });
 });

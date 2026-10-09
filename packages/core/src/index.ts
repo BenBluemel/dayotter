@@ -14,6 +14,20 @@ export {
   verifyAccessCode,
 } from "./crypto";
 export { roundRobinPick } from "./round-robin";
+export {
+  calculateAppointmentPrice,
+  selectBestDiscount,
+  normalizeCouponCode,
+  type DiscountRule,
+  type DiscountCandidate,
+  type AppointmentPrice,
+  type AppointmentPricingInput,
+  type AppointmentPromotion,
+  type AppointmentCoupon,
+  type AppliedPromotion,
+  type AppliedCoupon,
+  type PromotionDiscount,
+} from "./pricing";
 export { DEFAULT_REMINDER_OFFSETS } from "./constants";
 export { logger, type LogContext } from "./logger";
 export {

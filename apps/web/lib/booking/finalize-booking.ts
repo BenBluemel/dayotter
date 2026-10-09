@@ -7,8 +7,10 @@ import { applyBookingRules } from "../automation/apply-rules";
 import { writeBookingToCalendar } from "../calendar/host-calendar";
 import { jitsiRoomUrl } from "../integrations/jitsi";
 import { createZoomMeeting } from "../integrations/zoom";
+import { BookingError } from "./booking-logic";
 import { AUTO_CONFERENCE } from "./event-type-input";
 import { fanOutBookingLifecycle } from "./lifecycle";
+import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
 import {
   hostBookingPrefs,
   scheduleBookingReminders,
@@ -269,42 +271,57 @@ export async function finalizeConfirmedBooking(ctx: FinalizeContext): Promise<vo
             : base.plus({ weeks: i }).toJSDate();
       const occEnd = new Date(occStart.getTime() + duration * 60_000);
       try {
-        const [occ] = await db
-          .insert(schema.bookings)
-          .values({
-            organizationId: eventType.organizationId,
-            eventTypeId: eventType.id,
-            hostId: host.id,
-            title: eventType.title,
-            description: notes,
-            startsAt: occStart,
-            endsAt: occEnd,
-            timezone: attendee.timezone,
-            status: "confirmed",
-            isGroup: false,
-            location: eventType.locationDetail,
-            locationType: booking.locationType ?? eventType.location,
-            responses: booking.responses,
-            uid: randomUUID(),
-            recurrenceUid,
-          })
-          .returning();
-        if (!occ) return;
+        const occ = await db.transaction(async (tx) => {
+          const quote = await quoteAppointmentPrice(
+            {
+              organizationId: eventType.organizationId,
+              eventTypeId: eventType.id,
+              appointmentStartsAt: occStart,
+              settlement: "cash",
+            },
+            tx,
+          );
+          if (quote.basePrice > 0 || quote.amountToCollect > 0)
+            throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+          const [row] = await tx
+            .insert(schema.bookings)
+            .values({
+              organizationId: eventType.organizationId,
+              eventTypeId: eventType.id,
+              hostId: host.id,
+              title: eventType.title,
+              description: notes,
+              startsAt: occStart,
+              endsAt: occEnd,
+              timezone: attendee.timezone,
+              status: "confirmed",
+              isGroup: false,
+              location: eventType.locationDetail,
+              locationType: booking.locationType ?? eventType.location,
+              responses: booking.responses,
+              uid: randomUUID(),
+              recurrenceUid,
+            })
+            .returning();
+          if (!row) throw new BookingError("Couldn't create occurrence", 500);
+          await persistBookingPricingSnapshot(row.id, quote, tx);
+          await tx.insert(schema.bookingAttendees).values([
+            {
+              bookingId: row.id,
+              name: attendee.name,
+              email: attendee.email,
+              timezone: attendee.timezone,
+            },
+            ...guests.map((email) => ({ bookingId: row.id, email })),
+          ]);
+          if (collectiveHosts.length > 0) {
+            await tx
+              .insert(schema.bookingHosts)
+              .values(collectiveHosts.map(({ userId }) => ({ bookingId: row.id, userId })));
+          }
+          return row;
+        });
         const occJitsi = eventType.location === "jitsi" ? jitsiRoomUrl(occ.uid) : null;
-        await db.insert(schema.bookingAttendees).values([
-          {
-            bookingId: occ.id,
-            name: attendee.name,
-            email: attendee.email,
-            timezone: attendee.timezone,
-          },
-          ...guests.map((email) => ({ bookingId: occ.id, email })),
-        ]);
-        if (collectiveHosts.length > 0) {
-          await db
-            .insert(schema.bookingHosts)
-            .values(collectiveHosts.map(({ userId }) => ({ bookingId: occ.id, userId })));
-        }
         await scheduleBookingReminders(occ.id, occStart, reminderOffsets);
         const written = await writeBookingToCalendar(host.id, {
           title: eventType.title,

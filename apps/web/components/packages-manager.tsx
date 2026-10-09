@@ -28,6 +28,7 @@ interface CreditRow {
   total: number;
   used: number;
   remaining: number;
+  ownership: "verified_account" | "legacy_requires_review";
 }
 
 function money(minor: number, currency: string): string {
@@ -116,15 +117,19 @@ export function PackagesManager({ eventTypes }: { eventTypes: EventTypeOpt[] }) 
     if (!email) return;
     setError(null);
     try {
+      const storageKey = `dayotter-package-grant:${packageId}:${email.toLowerCase()}`;
+      const operationId = localStorage.getItem(storageKey) ?? crypto.randomUUID();
+      localStorage.setItem(storageKey, operationId);
       const res = await fetch("/api/packages/grant", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ packageId, clientEmail: email }),
+        body: JSON.stringify({ packageId, clientEmail: email, operationId }),
       });
       if (!res.ok) {
         const d = await res.json().catch(() => ({}));
         throw new Error(typeof d.error === "string" ? d.error : "Couldn't grant credits");
       }
+      localStorage.removeItem(storageKey);
       setGrantEmail((m) => ({ ...m, [packageId]: "" }));
       await load();
     } catch (e) {
@@ -274,6 +279,11 @@ export function PackagesManager({ eventTypes }: { eventTypes: EventTypeOpt[] }) 
                     <span className="block text-xs text-[var(--color-faint)]">
                       {titleFor(c.eventTypeId)}
                     </span>
+                    {c.ownership === "legacy_requires_review" && (
+                      <span className="block text-xs text-[var(--color-muted)]">
+                        Ownership review required
+                      </span>
+                    )}
                   </span>
                   <span className={c.remaining === 0 ? "text-[var(--color-faint)]" : ""}>
                     {c.used} of {c.total} used

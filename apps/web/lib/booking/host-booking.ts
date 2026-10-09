@@ -3,9 +3,11 @@ import { primaryOrg } from "@/lib/billing/entitlements";
 import { writeBookingToCalendar } from "@/lib/calendar/host-calendar";
 import { logger } from "@dayotter/core";
 import { and, eq, getDb, schema } from "@dayotter/db";
+import { BookingError } from "./booking-logic";
 import { calendarLocationFields } from "./event-type-input";
 import type { LocationTypeValue } from "./event-type-input";
 import { PERSONAL_EVENT_TYPE_SLUG } from "./personal-event-type";
+import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
 import {
   hostWantsOverflowNotice,
   hostWantsScribe,
@@ -24,9 +26,18 @@ export async function getOrCreatePersonalEventType(
   const db = getDb();
   const existing = await db.query.eventTypes.findFirst({
     where: and(eq(schema.eventTypes.ownerId, userId), eq(schema.eventTypes.slug, PERSONAL_SLUG)),
-    columns: { id: true },
+    columns: { id: true, organizationId: true, price: true, isPrivate: true, isActive: true },
   });
-  if (existing) return existing.id;
+  if (existing) {
+    if (
+      existing.organizationId !== organizationId ||
+      (existing.price ?? 0) !== 0 ||
+      !existing.isPrivate ||
+      existing.isActive
+    )
+      throw new BookingError("Personal booking configuration requires review", 409);
+    return existing.id;
+  }
   const [row] = await db
     .insert(schema.eventTypes)
     .values({
@@ -86,50 +97,81 @@ export async function createHostBooking(
   // Resolve the event type: a real matched one (so its workflows apply), else a
   // hidden per-user Personal type.
   let eventTypeId: string | null = null;
-  if (input.eventTypeSlug && input.eventTypeSlug !== PERSONAL_SLUG) {
+  const commercial = Boolean(input.eventTypeSlug && input.eventTypeSlug !== PERSONAL_SLUG);
+  if (commercial) {
     const et = await db.query.eventTypes.findFirst({
       where: and(
         eq(schema.eventTypes.ownerId, input.userId),
-        eq(schema.eventTypes.slug, input.eventTypeSlug),
+        eq(schema.eventTypes.slug, input.eventTypeSlug!),
+        eq(schema.eventTypes.organizationId, org.id),
       ),
       columns: { id: true },
     });
-    eventTypeId = et?.id ?? null;
+    if (!et) throw new BookingError("Event type not found", 404);
+    eventTypeId = et.id;
   }
   if (!eventTypeId) eventTypeId = await getOrCreatePersonalEventType(input.userId, org.id);
 
   const uid = randomUUID();
-  const [booking] = await db
-    .insert(schema.bookings)
-    .values({
-      organizationId: org.id,
-      eventTypeId,
-      hostId: input.userId,
-      title: input.title,
-      description: input.notes,
-      startsAt: input.start,
-      endsAt: input.end,
-      timezone: input.timezone,
-      status: "confirmed",
-      locationType: input.location ?? null,
-      location: input.locationDetail ?? null,
-      recurrenceUid: input.recurrenceUid ?? null,
-      uid,
-    })
-    .returning();
-  if (!booking) return null;
-
   const attendees = (input.attendees ?? []).filter((a) => a.email.includes("@"));
-  if (attendees.length > 0) {
-    await db.insert(schema.bookingAttendees).values(
-      attendees.map((a) => ({
-        bookingId: booking.id,
-        email: a.email,
-        name: a.name ?? null,
+  const booking = await db.transaction(async (tx) => {
+    // Host creation has no payment collection workflow. A commercial service
+    // must have an authoritative zero-cash quote, just like the public path.
+    const [service] = await tx
+      .select()
+      .from(schema.eventTypes)
+      .where(eq(schema.eventTypes.id, eventTypeId!))
+      .for("share");
+    if (!service || service.organizationId !== org.id || service.ownerId !== input.userId)
+      throw new BookingError("Event type not found", 404);
+    if (!commercial && ((service.price ?? 0) !== 0 || !service.isPrivate || service.isActive))
+      throw new BookingError("Personal booking configuration requires review", 409);
+    const quote = commercial
+      ? await quoteAppointmentPrice(
+          {
+            organizationId: org.id,
+            eventTypeId: service.id,
+            appointmentStartsAt: input.start,
+            settlement: "cash",
+          },
+          tx,
+        )
+      : null;
+    if (quote && quote.amountToCollect > 0)
+      throw new BookingError("A payment is required; book through the public checkout", 402);
+    if (quote && quote.basePrice > 0 && input.recurrenceUid)
+      throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+    const [row] = await tx
+      .insert(schema.bookings)
+      .values({
+        organizationId: org.id,
+        eventTypeId: service.id,
+        hostId: input.userId,
+        title: input.title,
+        description: input.notes,
+        startsAt: input.start,
+        endsAt: input.end,
         timezone: input.timezone,
-      })),
-    );
-  }
+        status: "confirmed",
+        locationType: input.location ?? null,
+        location: input.locationDetail ?? null,
+        recurrenceUid: input.recurrenceUid ?? null,
+        uid,
+      })
+      .returning();
+    if (!row) throw new BookingError("Couldn't create booking", 500);
+    if (quote) await persistBookingPricingSnapshot(row.id, quote, tx);
+    if (attendees.length)
+      await tx.insert(schema.bookingAttendees).values(
+        attendees.map((a) => ({
+          bookingId: row.id,
+          email: a.email,
+          name: a.name ?? null,
+          timezone: input.timezone,
+        })),
+      );
+    return row;
+  });
 
   // Calendar write (best-effort) + record the reference for later move/delete.
   let meetingUrl: string | undefined;

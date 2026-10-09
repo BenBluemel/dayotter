@@ -1,7 +1,16 @@
-import { relations } from "drizzle-orm";
-import { boolean, index, integer, pgTable, text, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { relations, sql } from "drizzle-orm";
+import {
+  boolean,
+  check,
+  index,
+  integer,
+  pgTable,
+  text,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { timestamps } from "./_shared";
-import { organizations } from "./orgs";
+import { organizations, users } from "./orgs";
 import { eventTypes } from "./scheduling";
 
 /**
@@ -46,7 +55,13 @@ export const packageCredits = pgTable(
     eventTypeId: uuid("event_type_id")
       .notNull()
       .references(() => eventTypes.id, { onDelete: "cascade" }),
-    /** The client this balance belongs to (matched on booking email). */
+    /** Authoritative internal owner; historical email-only rows remain unclaimed. */
+    ownerUserId: uuid("owner_user_id").references(() => users.id, { onDelete: "restrict" }),
+    /** Migration default classifies old rows; new inserts must explicitly use version 1. */
+    integrityVersion: integer("integrity_version").notNull().default(0),
+    openingTotalCredits: integer("opening_total_credits").notNull().default(0),
+    openingUsedCredits: integer("opening_used_credits").notNull().default(0),
+    /** Contact only. Email never authorizes spending. */
     clientEmail: text("client_email").notNull(),
     totalCredits: integer("total_credits").notNull(),
     usedCredits: integer("used_credits").notNull().default(0),
@@ -55,6 +70,11 @@ export const packageCredits = pgTable(
     ...timestamps,
   },
   (t) => [
+    check(
+      "package_credit_integrity_check",
+      sql`${t.integrityVersion} = 0 OR (${t.integrityVersion} = 1 AND ${t.ownerUserId} IS NOT NULL AND ${t.totalCredits} >= 0 AND ${t.usedCredits} BETWEEN 0 AND ${t.totalCredits} AND ${t.openingTotalCredits} = 0 AND ${t.openingUsedCredits} = 0)`,
+    ),
+    index("package_credits_owner_idx").on(t.ownerUserId, t.eventTypeId),
     index("package_credits_lookup_idx").on(t.eventTypeId, t.clientEmail),
     uniqueIndex("package_credits_pi_idx").on(t.stripePaymentIntentId),
   ],

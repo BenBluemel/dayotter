@@ -1,11 +1,15 @@
+import { getSession } from "@/lib/auth/session";
 import { BookingError, type CreateBookingInput, createBooking } from "@/lib/booking/create-booking";
-import { chargeFor } from "@/lib/booking/money";
-import { creditBalance } from "@/lib/packages/credits";
-import { hostDestinationAccount } from "@/lib/payments/connect";
-import { stashPendingBooking } from "@/lib/payments/pending";
-import { createCheckoutSession, paymentsEnabled } from "@/lib/payments/stripe";
-import { env } from "@/lib/server/env";
+import { findZeroCashBooking } from "@/lib/booking/zero-cash";
+import { creditBalance, findCreditBooking, requirePackageOwner } from "@/lib/packages/credits";
+import {
+  appointmentCheckout,
+  findAppointmentAttempt,
+  prepareAppointmentAttempt,
+} from "@/lib/payments/attempts";
+import { PaymentRoutingError } from "@/lib/payments/routing";
 import { clientIp, enforceRateLimit, verifyCaptcha } from "@/lib/server/rate-limit";
+import { normalizeCouponCode } from "@dayotter/core";
 import { schema as db, eq, getDb } from "@dayotter/db";
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -44,6 +48,10 @@ const schema = z.object({
   accessCode: z.string().max(64).optional(),
   /** Where to send the booker if they abandon Stripe Checkout. */
   returnPath: z.string().max(400).optional(),
+  /** Stable browser operation identity; its booking input is bound on first use. */
+  redeemCredit: z.boolean().optional(),
+  checkoutRequestId: z.string().uuid().optional(),
+  couponCode: z.string().trim().min(1).max(64).optional(),
 });
 
 export async function POST(request: Request) {
@@ -71,6 +79,14 @@ export async function POST(request: Request) {
   });
   if (cooldown) return cooldown;
 
+  const couponSession = parsed.data.couponCode ? await getSession() : null;
+  if (parsed.data.couponCode && !couponSession?.user?.id)
+    return NextResponse.json({ error: "Sign in to use a coupon" }, { status: 401 });
+  if (parsed.data.couponCode && parsed.data.redeemCredit)
+    return NextResponse.json(
+      { error: "Choose either a coupon or a prepaid session" },
+      { status: 400 },
+    );
   const input: CreateBookingInput = {
     eventTypeId: parsed.data.eventTypeId,
     start: parsed.data.start,
@@ -83,78 +99,96 @@ export async function POST(request: Request) {
     location: parsed.data.location ?? undefined,
     linkToken: parsed.data.linkToken,
     accessCode: parsed.data.accessCode,
+    couponCode: parsed.data.couponCode ? normalizeCouponCode(parsed.data.couponCode) : undefined,
+    couponCustomerUserId: parsed.data.couponCode ? couponSession!.user.id : undefined,
   };
 
-  // Paid event type → collect payment via Stripe Checkout first; the booking is
-  // only created once the payment succeeds (in /booking/paid + the webhook).
-  if (paymentsEnabled) {
-    const et = await getDb().query.eventTypes.findFirst({
-      where: eq(db.eventTypes.id, parsed.data.eventTypeId),
-      columns: {
-        title: true,
-        price: true,
-        currency: true,
-        depositAmount: true,
-        isActive: true,
-        ownerId: true,
-      },
-    });
-    const amount = chargeFor(et?.price ?? null, et?.depositAmount ?? null);
-    if (et?.isActive && amount > 0) {
-      // Prepaid package: if the booker holds a credit for this event type, spend
-      // one and book directly instead of sending them to Stripe Checkout.
-      const credits = await creditBalance(parsed.data.eventTypeId, parsed.data.attendee.email);
-      if (credits > 0) {
-        try {
-          const { uid, redirectUrl } = await createBooking({ ...input, redeemCredit: true });
-          return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
-        } catch (err) {
-          if (err instanceof BookingError) {
-            return NextResponse.json({ error: err.message }, { status: err.status });
-          }
-          console.error("[api/book] credit booking error:", err);
-          return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
-        }
-      }
+  const requestedPath = parsed.data.returnPath;
+  const returnPath =
+    requestedPath?.startsWith("/") && !requestedPath.startsWith("//") ? requestedPath : "/";
+  try {
+    const zeroInput = {
+      ...input,
+      bookingRequestId: parsed.data.checkoutRequestId,
+      bookingReturnPath: returnPath,
+    };
+    const previousZero = await findZeroCashBooking(zeroInput);
+    if (previousZero)
+      return NextResponse.json({
+        uid: previousZero.uid,
+        url: `/booking/${previousZero.uid}`,
+        redirectUrl: null,
+      });
+    const session = couponSession ?? (await getSession());
+    let ownerId: string | undefined;
+    if (session?.user?.id) {
       try {
-        const token = await stashPendingBooking(input);
-        const appUrl = env.APP_URL;
-        const returnPath = parsed.data.returnPath?.startsWith("/") ? parsed.data.returnPath : "/";
-        const destinationAccountId = await hostDestinationAccount(et.ownerId);
-        const { url } = await createCheckoutSession({
-          amount,
-          currency: et.currency ?? "usd",
-          productName: et.title,
-          successUrl: `${appUrl}/booking/paid?session_id={CHECKOUT_SESSION_ID}`,
-          cancelUrl: `${appUrl}${returnPath}`,
-          customerEmail: parsed.data.attendee.email,
-          // Echo the destination account back on the session so fulfillment can
-          // record it on the booking (needed for reverse-transfer refunds).
-          metadata: { token, ...(destinationAccountId ? { dest: destinationAccountId } : {}) },
-          destinationAccountId,
-        });
-        // Funnel: record that a paid checkout was started (best-effort), so
-        // analytics can show the paid-step drop-off, not just page→booking.
-        await getDb()
-          .insert(db.bookingPageViews)
-          .values({ eventTypeId: parsed.data.eventTypeId, kind: "checkout" })
-          .catch(() => {});
-        return NextResponse.json({ checkoutUrl: url });
+        ownerId = (await requirePackageOwner(session.user.id, input.attendee.email)).id;
       } catch (err) {
-        console.error("[api/book] checkout error:", err);
-        return NextResponse.json({ error: "Couldn't start checkout" }, { status: 502 });
+        if (parsed.data.redeemCredit) throw err;
       }
     }
-  }
-
-  try {
-    const { uid, redirectUrl } = await createBooking(input);
+    if (parsed.data.redeemCredit && !ownerId) await requirePackageOwner(undefined);
+    const creditInput = {
+      ...input,
+      redeemCredit: true,
+      creditOwnerUserId: ownerId,
+      creditRequestId: parsed.data.checkoutRequestId,
+      creditReturnPath: returnPath,
+    };
+    if (ownerId) {
+      const previousCredit = await findCreditBooking(creditInput);
+      if (previousCredit)
+        return NextResponse.json({
+          uid: previousCredit.uid,
+          url: `/booking/${previousCredit.uid}`,
+          redirectUrl: null,
+        });
+    }
+    // Resume an existing cash operation before consulting mutable prices or credits.
+    const previous = await findAppointmentAttempt(input, returnPath, parsed.data.checkoutRequestId);
+    if (previous) return NextResponse.json(await appointmentCheckout(previous));
+    const et = await getDb().query.eventTypes.findFirst({
+      where: eq(db.eventTypes.id, input.eventTypeId),
+      columns: { price: true, isActive: true },
+    });
+    if (
+      !input.couponCode &&
+      ownerId &&
+      et?.isActive &&
+      ((et.price ?? 0) > 0 || parsed.data.redeemCredit)
+    ) {
+      const credits = await creditBalance(input.eventTypeId, ownerId);
+      if (credits > 0) {
+        const { uid, redirectUrl } = await createBooking(creditInput);
+        return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
+      }
+    }
+    if (parsed.data.redeemCredit)
+      throw new BookingError("No prepaid session is available for this account", 402);
+    const prepared = await prepareAppointmentAttempt(
+      input,
+      returnPath,
+      parsed.data.checkoutRequestId,
+    );
+    if (prepared.attempt) {
+      const checkout = await appointmentCheckout(prepared.attempt);
+      await getDb()
+        .insert(db.bookingPageViews)
+        .values({ eventTypeId: input.eventTypeId, kind: "checkout" })
+        .catch(() => {});
+      return NextResponse.json(checkout);
+    }
+    // Zero-cash quotes do not create a Stripe Session. Preserve existing approval policy.
+    const { uid, redirectUrl } = await createBooking({
+      ...zeroInput,
+      quotedDurationMinutes: prepared.durationMinutes,
+    });
     return NextResponse.json({ uid, url: `/booking/${uid}`, redirectUrl });
   } catch (err) {
-    if (err instanceof BookingError) {
+    if (err instanceof BookingError || err instanceof PaymentRoutingError)
       return NextResponse.json({ error: err.message }, { status: err.status });
-    }
-    console.error("[api/book] unexpected error:", err);
-    return NextResponse.json({ error: "Something went wrong" }, { status: 500 });
+    console.error("[api/book] checkout error:", err);
+    return NextResponse.json({ error: "Couldn't start booking checkout" }, { status: 502 });
   }
 }

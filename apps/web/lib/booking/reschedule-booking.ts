@@ -111,6 +111,28 @@ export async function rescheduleBooking(
         sql`select pg_advisory_xact_lock(hashtext(${`${booking.hostId}:${weekStartD.toISODate()}`}))`,
       );
 
+      const [current] = await tx
+        .select()
+        .from(schema.bookings)
+        .where(eq(schema.bookings.id, booking.id))
+        .for("update");
+      if (!current || current.status === "cancelled")
+        throw new RescheduleError("Booking is not available for rescheduling", 409);
+      const redemption = await tx.query.packageCreditMutations.findFirst({
+        where: and(
+          eq(schema.packageCreditMutations.bookingId, booking.id),
+          eq(schema.packageCreditMutations.kind, "redemption"),
+        ),
+      });
+      if (
+        redemption &&
+        ["pending", "running", "requires_review"].includes(redemption.finalizationState ?? "")
+      )
+        throw new RescheduleError(
+          "This prepaid booking needs finalization review before rescheduling",
+          409,
+        );
+
       const countOnDay = async (byEventType: boolean) => {
         const [{ count } = { count: 0 }] = await tx
           .select({ count: sql<number>`count(*)::int` })

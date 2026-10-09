@@ -1,5 +1,5 @@
 import { jsonError, withUser } from "@/lib/server/http";
-import { and, eq, getDb, inArray, schema } from "@dayotter/db";
+import { and, eq, getDb, inArray, schema, sql } from "@dayotter/db";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
@@ -22,11 +22,21 @@ export const GET = withUser(async (u) => {
 
   const [packages, credits] = await Promise.all([
     db.query.sessionPackages.findMany({
-      where: inArray(schema.sessionPackages.eventTypeId, etIds),
+      where: and(
+        inArray(schema.sessionPackages.eventTypeId, etIds),
+        sql`exists (
+        select 1 from event_types e where e.id = ${schema.sessionPackages.eventTypeId}
+        and e.organization_id = ${schema.sessionPackages.organizationId} and e.owner_id = ${u.id})`,
+      ),
       orderBy: (p, { desc }) => desc(p.createdAt),
     }),
     db.query.packageCredits.findMany({
-      where: inArray(schema.packageCredits.eventTypeId, etIds),
+      where: and(
+        inArray(schema.packageCredits.eventTypeId, etIds),
+        sql`exists (
+        select 1 from event_types e where e.id = ${schema.packageCredits.eventTypeId}
+        and e.organization_id = ${schema.packageCredits.organizationId} and e.owner_id = ${u.id})`,
+      ),
       orderBy: (c, { desc }) => desc(c.createdAt),
     }),
   ]);
@@ -40,6 +50,7 @@ export const GET = withUser(async (u) => {
       total: c.totalCredits,
       used: c.usedCredits,
       remaining: c.totalCredits - c.usedCredits,
+      ownership: c.integrityVersion === 1 ? "verified_account" : "legacy_requires_review",
     })),
   });
 });

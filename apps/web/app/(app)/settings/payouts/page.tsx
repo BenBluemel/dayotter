@@ -5,7 +5,7 @@ import { getSession } from "@/lib/auth/session";
 import {
   type CurrencyBalance,
   connectedBalances,
-  paymentsEnabled,
+  connectEnabled,
   platformFeePercent,
   retrieveConnectStatus,
 } from "@/lib/payments/stripe";
@@ -17,15 +17,14 @@ export default async function PayoutsSettingsPage() {
   const session = await getSession();
   const userId = session!.user.id;
 
-  if (!paymentsEnabled) {
+  if (!connectEnabled) {
     return (
       <div>
         <PageHeader eyebrow="Payments" title="Payouts" />
         <Card className="max-w-2xl">
           <CardBody className="p-6 text-sm text-[var(--color-muted)]">
-            Payments aren't configured on this server. Set <code>STRIPE_SECRET_KEY</code> (and
-            enable Connect in your Stripe Dashboard) to let hosts get paid for bookings and
-            packages.
+            Connect payouts are unavailable in this payment mode. The business manages
+            ordinary Stripe payouts in its Stripe Dashboard.
           </CardBody>
         </Card>
       </div>

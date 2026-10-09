@@ -442,6 +442,55 @@
       "when": 1788433718026,
       "tag": "0062_fresh_psynapse",
       "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1790835090730,
+      "tag": "0063_appointment_promotions",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1790869710372,
+      "tag": "0064_payment_attempts",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1790898380740,
+      "tag": "0065_payment_fulfillment",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1790906199363,
+      "tag": "0066_refund_operations",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1790961159412,
+      "tag": "0067_package_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1791004773431,
+      "tag": "0068_zero_cash_booking",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1791008161971,
+      "tag": "0069_appointment_coupons",
+      "breakpoints": true
     }
   ]
 }

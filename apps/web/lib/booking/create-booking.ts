@@ -1,19 +1,35 @@
 import { randomUUID } from "node:crypto";
-import { consumeCredit } from "@/lib/packages/credits";
+import {
+  creditBookingIdentity,
+  findCreditBooking,
+  markCreditFinalization,
+  redeemBookingCredit,
+  requirePackageOwner,
+} from "@/lib/packages/credits";
 import { env } from "@/lib/server/env";
-import { logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
+import { type AppointmentPrice, logger, roundRobinPick, verifyAccessCode } from "@dayotter/core";
 import { and, eq, getDb, gte, inArray, lt, schema, sql } from "@dayotter/db";
 import { bookingRequested, newBookingRequest, sendEmail } from "@dayotter/emails";
 import { DateTime } from "luxon";
+import { canonicalJson, decodeAttempt } from "../payments/attempt-terms";
+import { bindPaidBooking } from "../payments/payment-finalization";
 import {
   SLOT_REVALIDATION_WINDOW_MS,
   combineHostSlots,
   eventTypeHostSlots,
   isAllowedDuration,
 } from "./availability";
-import { BookingError, mapInsertError, validateResponses } from "./booking-logic";
+import {
+  BookingError,
+  assertExclusiveSettlement,
+  mapInsertError,
+  validateResponses,
+} from "./booking-logic";
+import { redeemReservedCouponUse, reserveCouponUse } from "./coupon-uses";
 import { resolveChosenLocation } from "./event-type-input";
 import { finalizeConfirmedBooking } from "./finalize-booking";
+import { persistBookingPricingSnapshot, quoteAppointmentPrice } from "./pricing";
+import { findZeroCashBooking, zeroCashBookingIdentity } from "./zero-cash";
 
 export { BookingError } from "./booking-logic";
 
@@ -150,11 +166,59 @@ export interface CreateBookingInput {
   /** Redeem one prepaid package credit for the attendee instead of charging.
    * Consumed atomically inside the booking transaction (restored on rollback). */
   redeemCredit?: boolean;
+  /** Internal authenticated identity, never copied from HTTP JSON. */
+  creditOwnerUserId?: string;
+  creditRequestId?: string;
+  creditReturnPath?: string;
+  /** Internal server-owned frozen terms; never accepted from public HTTP input. */
+  pricingQuote?: AppointmentPrice;
+  paymentAttemptId?: string;
+  quotedDurationMinutes?: number;
+  /** Internal operation identity shared by cash, credits, and zero-cash booking. */
+  bookingRequestId?: string;
+  bookingReturnPath?: string;
+  /** Canonical customer-entered code; public routes derive the identity below from session. */
+  couponCode?: string;
+  couponCustomerUserId?: string;
 }
 
 export async function createBooking(
   input: CreateBookingInput,
 ): Promise<{ uid: string; redirectUrl: string | null }> {
+  if (input.couponCode && (!input.couponCustomerUserId || input.redeemCredit))
+    throw new BookingError("Sign in to use a coupon with cash pricing", 401);
+  if (input.couponCode && input.payment && !input.paymentAttemptId)
+    throw new BookingError("Coupon payment requires its saved checkout", 409);
+  if (!input.redeemCredit) {
+    if (input.payment) return createBookingOnce(input); // Explicit historical/durable payment paths.
+    const existing = await findZeroCashBooking(input);
+    if (existing) return { uid: existing.uid, redirectUrl: null };
+    try {
+      return await createBookingOnce(input);
+    } catch (err) {
+      const committed = await findZeroCashBooking(input);
+      if (committed) return { uid: committed.uid, redirectUrl: null };
+      throw err;
+    }
+  }
+  assertExclusiveSettlement(input);
+  await requirePackageOwner(input.creditOwnerUserId, input.attendee.email);
+  const existing = await findCreditBooking(input);
+  if (existing) return { uid: existing.uid, redirectUrl: null };
+  try {
+    return await createBookingOnce(input);
+  } catch (err) {
+    // Another instance may have committed this operation while availability was checked.
+    const committed = await findCreditBooking(input);
+    if (committed) return { uid: committed.uid, redirectUrl: null };
+    throw err;
+  }
+}
+
+async function createBookingOnce(
+  input: CreateBookingInput,
+): Promise<{ uid: string; redirectUrl: string | null }> {
+  assertExclusiveSettlement(input);
   const db = getDb();
 
   const eventType = await db.query.eventTypes.findFirst({
@@ -163,6 +227,9 @@ export async function createBooking(
   if (!eventType || !eventType.isActive) {
     throw new BookingError("Event type not found", 404);
   }
+
+  if (input.redeemCredit && (eventType.recurringCount ?? 1) > 1)
+    throw new BookingError("Recurring prepaid bookings are not supported yet", 409);
 
   // Resolve the booker's chosen location against the event type's menu. This is the
   // source of truth persisted on the booking (see the insert below) so it survives
@@ -183,15 +250,45 @@ export async function createBooking(
 
   validateResponses(eventType.questions, input.responses);
 
+  if (input.paymentAttemptId && (!input.payment || !input.pricingQuote)) {
+    throw new BookingError("A durable payment requires its saved pricing terms", 409);
+  }
+  const quote = input.pricingQuote;
+  if (
+    quote &&
+    (quote.organizationId !== eventType.organizationId ||
+      quote.eventTypeId !== eventType.id ||
+      quote.appointmentStartsAt !== new Date(input.start).toISOString() ||
+      quote.settlement !== "cash" ||
+      input.redeemCredit ||
+      (input.payment
+        ? input.payment.amountPaid !== quote.amountToCollect ||
+          input.payment.currency !== quote.currency
+        : quote.amountToCollect !== 0))
+  ) {
+    throw new BookingError("Booking settlement does not match its saved quote", 409);
+  }
+  if (
+    quote &&
+    quote.basePrice > 0 &&
+    (eventType.recurringCount ?? 1) > 1 &&
+    ((eventType.maxAttendees ?? 1) <= 1 || !eventType.ownerId)
+  ) {
+    throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+  }
   const start = new Date(input.start);
   if (Number.isNaN(start.getTime())) throw new BookingError("Invalid start time", 400);
 
   // Multiple durations: honor the booker's chosen length only if the event type
   // allows it; otherwise fall back to the default duration.
+  if (input.quotedDurationMinutes && !isAllowedDuration(eventType, input.quotedDurationMinutes)) {
+    throw new BookingError("The quoted appointment duration is no longer supported", 409);
+  }
   const duration =
-    input.durationMinutes && isAllowedDuration(eventType, input.durationMinutes)
+    input.quotedDurationMinutes ??
+    (input.durationMinutes && isAllowedDuration(eventType, input.durationMinutes)
       ? input.durationMinutes
-      : eventType.durationMinutes;
+      : eventType.durationMinutes);
   const end = new Date(start.getTime() + duration * 60_000);
 
   // Group event: many bookers share one slot (capacity = maxAttendees). Only
@@ -268,8 +365,106 @@ export async function createBooking(
   // (hostId, startsAt) guards against a concurrent double-book: a request that
   // wins the availability check but loses the insert raises a 23505 → 409.
   let booking: typeof schema.bookings.$inferSelect;
+  let replayedBooking = false;
+  let acceptedQuote = input.payment ? input.pricingQuote : undefined;
   try {
     booking = await db.transaction(async (tx) => {
+      if (!input.payment && !input.redeemCredit) {
+        const identity = zeroCashBookingIdentity(input);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
+        const previous = await findZeroCashBooking(input, tx);
+        if (previous) {
+          replayedBooking = true;
+          return previous;
+        }
+        const [current] = await tx
+          .select()
+          .from(schema.eventTypes)
+          .where(eq(schema.eventTypes.id, eventType.id))
+          .for("share");
+        if (
+          !current?.isActive ||
+          current.organizationId !== eventType.organizationId ||
+          current.ownerId !== eventType.ownerId ||
+          current.durationMinutes !== eventType.durationMinutes ||
+          JSON.stringify(current.durationOptions) !== JSON.stringify(eventType.durationOptions) ||
+          current.recurringCount !== eventType.recurringCount ||
+          current.maxAttendees !== eventType.maxAttendees
+        )
+          throw new BookingError("Service configuration changed; retry booking", 409);
+        // A prepared free preview is not an accepted quote. Promotion or service
+        // terms may change before this transaction commits the booking.
+        acceptedQuote = await quoteAppointmentPrice(
+          {
+            organizationId: current.organizationId,
+            eventTypeId: current.id,
+            appointmentStartsAt: start,
+            settlement: "cash",
+            couponCode: input.couponCode,
+            couponCustomerUserId: input.couponCustomerUserId,
+          },
+          tx,
+        );
+        if (acceptedQuote.amountToCollect > 0)
+          throw new BookingError("A payment is required; book through the public checkout", 402);
+        if (acceptedQuote.basePrice > 0 && isRecurring)
+          throw new BookingError("Commercial recurring checkout is not supported yet", 409);
+      }
+      if (input.redeemCredit) {
+        const identity = creditBookingIdentity(input);
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${identity.key}))`);
+        const previous = await findCreditBooking(input, tx);
+        if (previous) {
+          replayedBooking = true;
+          return previous;
+        }
+        const [currentService] = await tx
+          .select()
+          .from(schema.eventTypes)
+          .where(eq(schema.eventTypes.id, eventType.id))
+          .for("share");
+        if (
+          !currentService?.isActive ||
+          currentService.organizationId !== eventType.organizationId ||
+          currentService.ownerId !== eventType.ownerId ||
+          currentService.durationMinutes !== eventType.durationMinutes ||
+          JSON.stringify(currentService.durationOptions) !==
+            JSON.stringify(eventType.durationOptions) ||
+          (currentService.recurringCount ?? 1) > 1
+        )
+          throw new BookingError("Service configuration changed; retry your prepaid booking", 409);
+      }
+      if (input.paymentAttemptId) {
+        const [attempt] = await tx
+          .select()
+          .from(schema.paymentAttempts)
+          .where(eq(schema.paymentAttempts.id, input.paymentAttemptId))
+          .for("update");
+        if (
+          !attempt ||
+          attempt.bookingId ||
+          !attempt.successFacts ||
+          !attempt.paymentSucceededAt ||
+          !["payment_succeeded", "fulfilling"].includes(attempt.state)
+        ) {
+          throw new BookingError("Payment attempt is not available for booking", 409);
+        }
+        const saved = decodeAttempt(attempt);
+        const { payment, pricingQuote, paymentAttemptId, quotedDurationMinutes, ...bookingInput } =
+          input;
+        if (
+          !attempt.checkoutSessionId ||
+          attempt.successFacts?.amount !== payment?.amountPaid ||
+          attempt.successFacts?.currency !== payment?.currency ||
+          attempt.paymentIntentId !== payment?.paymentIntentId ||
+          canonicalJson(saved.input) !== canonicalJson(bookingInput) ||
+          canonicalJson(saved.quote) !== canonicalJson(pricingQuote) ||
+          saved.resolvedDurationMinutes !== quotedDurationMinutes ||
+          attempt.destinationAccountId !== (payment?.destinationAccountId ?? null)
+        ) {
+          throw new BookingError("Payment attempt does not match booking settlement", 409);
+        }
+      }
       // Serialize all cap-relevant bookings for this host within the host-local
       // ISO week. The daily/weekly/focus checks below are count-then-insert, and
       // the unique/no-overlap indexes only stop same-slot collisions - so without
@@ -461,15 +656,6 @@ export async function createBooking(
         }
       }
 
-      // Prepaid package: spend one credit atomically as the payment method.
-      // Done inside the tx so a lost double-book race rolls the credit back too.
-      if (input.redeemCredit) {
-        const spent = await consumeCredit(eventType.id, input.attendee.email, tx);
-        if (!spent) {
-          throw new BookingError("You have no prepaid sessions left for this event.", 402);
-        }
-      }
-
       const [row] = await tx
         .insert(schema.bookings)
         .values({
@@ -488,14 +674,52 @@ export async function createBooking(
           responses: input.responses,
           uid,
           recurrenceUid,
-          paymentStatus: input.payment || input.redeemCredit ? "paid" : "none",
-          paymentIntentId: input.payment?.paymentIntentId,
-          amountPaid: input.payment?.amountPaid,
-          paymentCurrency: input.payment?.currency,
-          destinationAccountId: input.payment?.destinationAccountId,
+          paymentStatus: !input.pricingQuote && input.payment ? "paid" : "none",
+          paymentIntentId: input.pricingQuote ? undefined : input.payment?.paymentIntentId,
+          amountPaid: input.pricingQuote ? undefined : input.payment?.amountPaid,
+          paymentCurrency: input.pricingQuote ? undefined : input.payment?.currency,
+          destinationAccountId: input.pricingQuote
+            ? undefined
+            : input.payment?.destinationAccountId,
         })
         .returning();
       if (!row) throw new BookingError("Failed to create booking", 500);
+      if (acceptedQuote) {
+        await persistBookingPricingSnapshot(row.id, acceptedQuote, tx);
+        if (input.paymentAttemptId && acceptedQuote.coupon)
+          await redeemReservedCouponUse(
+            tx,
+            input.paymentAttemptId,
+            row.id,
+            acceptedQuote,
+            input.couponCustomerUserId!,
+          );
+        if (input.payment) {
+          const [settled] = await tx
+            .update(schema.bookings)
+            .set({
+              paymentStatus: "paid",
+              paymentIntentId: input.payment.paymentIntentId,
+              amountPaid: input.payment.amountPaid,
+              paymentCurrency: input.payment.currency,
+              destinationAccountId: input.payment.destinationAccountId,
+            })
+            .where(eq(schema.bookings.id, row.id))
+            .returning();
+          Object.assign(row, settled);
+        }
+      }
+      if (input.paymentAttemptId) {
+        await bindPaidBooking(tx, input.paymentAttemptId, {
+          booking: row,
+          eventType,
+          host,
+          attendee: input.attendee,
+          guests,
+          notes: input.notes,
+          appUrl,
+        });
+      }
 
       await tx.insert(schema.bookingAttendees).values([
         {
@@ -506,6 +730,35 @@ export async function createBooking(
         },
         ...guests.map((email) => ({ bookingId: row.id, email })),
       ]);
+      if (!input.payment && !input.redeemCredit) {
+        const identity = zeroCashBookingIdentity(input);
+        await tx.execute(
+          sql`select claim_booking_settlement(${identity.key},'zero_cash',${row.id}::uuid,${identity.fingerprint})`,
+        );
+        if (acceptedQuote?.coupon)
+          await reserveCouponUse(
+            tx,
+            acceptedQuote,
+            input.couponCustomerUserId!,
+            identity.key,
+            identity.fingerprint,
+            { bookingId: row.id },
+          );
+      }
+      if (input.redeemCredit) {
+        const creditQuote = await quoteAppointmentPrice(
+          {
+            organizationId: eventType.organizationId,
+            eventTypeId: eventType.id,
+            appointmentStartsAt: start,
+            settlement: "package_credit",
+          },
+          tx,
+        );
+        await persistBookingPricingSnapshot(row.id, creditQuote, tx);
+        await redeemBookingCredit(tx, input, row);
+        row.paymentStatus = "paid";
+      }
       // Record every host of a collective booking explicitly (primary + co-hosts),
       // so "who's hosting this" is first-class rather than inferred from attendees.
       if (eventType.schedulingType === "collective" && hostIds.length > 0) {
@@ -519,6 +772,8 @@ export async function createBooking(
   } catch (err) {
     mapInsertError(err);
   }
+
+  if (replayedBooking) return { uid: booking.uid, redirectUrl: null };
 
   logger.info("booking created", {
     event: "booking_created",
@@ -588,18 +843,33 @@ export async function createBooking(
     return { uid, redirectUrl: eventType.redirectUrl ?? null };
   }
 
+  if (input.paymentAttemptId) return { uid, redirectUrl: eventType.redirectUrl ?? null };
+
   // Confirmed immediately: run every confirmed-booking side-effect (meeting link,
   // host calendar, reminders, workflows, travel, confirmation emails, recurring
   // occurrences). Shared verbatim with the host-approval path.
-  await finalizeConfirmedBooking({
-    booking,
-    eventType,
-    host,
-    attendee: input.attendee,
-    guests,
-    notes: input.notes,
-    appUrl,
-  });
+  if (input.redeemCredit && !(await markCreditFinalization(booking.id, "running")))
+    return { uid: booking.uid, redirectUrl: null };
+  try {
+    await finalizeConfirmedBooking({
+      booking,
+      eventType,
+      host,
+      attendee: input.attendee,
+      guests,
+      notes: input.notes,
+      appUrl,
+    });
+    if (input.redeemCredit) await markCreditFinalization(booking.id, "complete");
+  } catch (err) {
+    if (!input.redeemCredit) throw err;
+    await markCreditFinalization(booking.id, "requires_review");
+    logger.warn("Prepaid booking finalization requires review", {
+      event: "package_booking_finalization_review",
+      bookingId: booking.id,
+    });
+    // The confirmed booking + redemption remains durable. Do not spend again on retry.
+  }
 
   return { uid, redirectUrl: eventType.redirectUrl ?? null };
 }

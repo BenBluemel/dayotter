@@ -2,6 +2,7 @@
 import { FormError } from "@/components/ui/form";
 
 import { BookingAssistant } from "@/components/booking-assistant";
+import { BookingSubmitLabel, CouponCodeControls } from "@/components/booking-coupon-ui";
 import { type Slot, SlotGrid, useLocalZone } from "@/components/slot-grid";
 import { Turnstile, captchaEnabled } from "@/components/turnstile";
 import { Button } from "@/components/ui/button";
@@ -9,17 +10,18 @@ import { Input, Label } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { track } from "@/lib/analytics";
 import type { BookingQuestionInput } from "@/lib/booking/event-type-input";
+import { formatMoney } from "@/lib/booking/money";
 import { type Locale, t } from "@/lib/i18n/booking";
 import { useBookingLocale } from "@/lib/i18n/use-locale";
+import { canonicalJson } from "@/lib/payments/canonical-json";
 import { ArrowLeft, Check, Lock, Users } from "lucide-react";
 import { DateTime } from "luxon";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export function SlotPicker({
   eventTypeId,
   questions = [],
-  priceLabel = null,
   defaultDuration,
   durationOptions = [],
   linkToken,
@@ -28,6 +30,7 @@ export function SlotPicker({
   locations = [],
   embed = false,
   teamHosts = [],
+  signedIn = false,
 }: {
   eventTypeId: string;
   questions?: BookingQuestionInput[];
@@ -46,6 +49,7 @@ export function SlotPicker({
   embed?: boolean;
   /** Collective team event: hosts the booker may pick from. Empty = no picker. */
   teamHosts?: { id: string; name: string }[];
+  signedIn?: boolean;
 }) {
   const router = useRouter();
   const zone = useLocalZone();
@@ -63,7 +67,66 @@ export function SlotPicker({
   const [answers, setAnswers] = useState<Record<string, string | boolean>>({});
   const [captchaToken, setCaptchaToken] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const checkoutOperation = useRef<{ input: string; id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [couponInput, setCouponInput] = useState("");
+  const [appliedCoupon, setAppliedCoupon] = useState<string | null>(null);
+  const [pricePreview, setPricePreview] = useState<{
+    forIntent: string;
+    basePrice: number;
+    effectivePrice: number;
+    amountToCollect: number;
+    currency: string;
+    promotionLabel: string | null;
+    couponCode: string | null;
+    couponResult: string;
+  } | null>(null);
+  const [priceError, setPriceError] = useState<string | null>(null);
+  const [priceLoading, setPriceLoading] = useState(false);
+  useEffect(() => {
+    if (!selected) {
+      setPricePreview(null);
+      setPriceError(null);
+      return;
+    }
+    const controller = new AbortController();
+    setPriceLoading(true);
+    setPricePreview(null);
+    fetch("/api/coupons/preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        eventTypeId,
+        start: selected.start,
+        couponCode: appliedCoupon ?? undefined,
+      }),
+    })
+      .then(async (res) => {
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error ?? "Could not check price");
+        return body.quote;
+      })
+      .then((quote) => {
+        if (controller.signal.aborted) return;
+        setPricePreview({
+          ...quote,
+          forIntent: JSON.stringify([eventTypeId, selected.start, appliedCoupon]),
+        });
+        setPriceError(null);
+      })
+      .catch((err) => {
+        if (!controller.signal.aborted) setPriceError(err.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPriceLoading(false);
+      });
+    return () => controller.abort();
+  }, [selected, eventTypeId, appliedCoupon]);
+  const currentPricePreview =
+    pricePreview?.forIntent === JSON.stringify([eventTypeId, selected?.start, appliedCoupon])
+      ? pricePreview
+      : null;
   // Collective member-selection: everyone selected by default. Never empties
   // below one (unselecting the last host is a no-op).
   const [selectedHostIds, setSelectedHostIds] = useState<string[]>(() =>
@@ -95,7 +158,7 @@ export function SlotPicker({
 
   async function confirm(e: React.FormEvent) {
     e.preventDefault();
-    if (!selected) return;
+    if (!selected || !currentPricePreview || priceLoading || priceError) return;
 
     // Client-side required-answer check (server re-validates).
     const missing = questions.find((q) => {
@@ -110,26 +173,73 @@ export function SlotPicker({
 
     setSubmitting(true);
     setError(null);
-    const res = await fetch("/api/book", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        eventTypeId,
-        start: selected.start,
-        attendee: { name, email, timezone: zone },
-        guests: guests.length ? guests : undefined,
-        selectedHostIds: teamHosts.length ? selectedHostIds : undefined,
-        notes: notes || undefined,
-        responses: questions.length ? answers : undefined,
-        durationMinutes: hasDurations ? duration : undefined,
-        location: locations.length > 1 ? chosenLocation : undefined,
-        captchaToken: captchaToken || undefined,
-        linkToken: linkToken || undefined,
-        accessCode: accessCode || undefined,
-        returnPath: typeof window !== "undefined" ? window.location.pathname : undefined,
-      }),
-    });
+    const intent = {
+      eventTypeId,
+      start: selected.start,
+      attendee: { name, email, timezone: zone },
+      guests: guests.length ? guests : undefined,
+      selectedHostIds: teamHosts.length ? selectedHostIds : undefined,
+      notes: notes || undefined,
+      responses: questions.length ? answers : undefined,
+      durationMinutes: hasDurations ? duration : undefined,
+      location: locations.length > 1 ? chosenLocation : undefined,
+      linkToken: linkToken || undefined,
+      accessCode: accessCode || undefined,
+      returnPath: typeof window !== "undefined" ? window.location.pathname : undefined,
+      couponCode: appliedCoupon ?? undefined,
+    };
+    const encoded = new TextEncoder().encode(canonicalJson(intent));
+    const identity = Array.from(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", encoded)),
+      (b) => b.toString(16).padStart(2, "0"),
+    ).join("");
+    const storageKey = `dayotter:appointment-checkout:${eventTypeId}`;
+    if (!checkoutOperation.current) {
+      try {
+        const prior = JSON.parse(sessionStorage.getItem(storageKey) ?? "null") as {
+          input: string;
+          id: string;
+        } | null;
+        if (prior?.input === identity && typeof prior.id === "string")
+          checkoutOperation.current = prior;
+      } catch {
+        /* Storage is optional; the in-memory identity still handles request retries. */
+      }
+    }
+    if (checkoutOperation.current?.input !== identity) {
+      checkoutOperation.current = { input: identity, id: crypto.randomUUID() };
+      try {
+        sessionStorage.setItem(storageKey, JSON.stringify(checkoutOperation.current));
+      } catch {
+        /* Optional. */
+      }
+    }
+    let res: Response;
+    try {
+      res = await fetch("/api/book", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          ...intent,
+          checkoutRequestId: checkoutOperation.current.id,
+          captchaToken: captchaToken || undefined,
+        }),
+      });
+    } catch {
+      setSubmitting(false);
+      setError(t(locale, "bookingFailed"));
+      return;
+    }
     if (!res.ok) {
+      // Only a verified expired Checkout returns 410. The next submit is a new operation.
+      if (res.status === 410) {
+        checkoutOperation.current = null;
+        try {
+          sessionStorage.removeItem(storageKey);
+        } catch {
+          /* Optional. */
+        }
+      }
       const data = await res.json().catch(() => ({}));
       setSubmitting(false);
       track("Booking Failed", { eventTypeId, status: res.status });
@@ -268,6 +378,55 @@ export function SlotPicker({
         <span className="text-[var(--color-muted)]"> · {zone}</span>
       </div>
       <div className="space-y-4">
+        <CouponCodeControls
+          signedIn={signedIn}
+          value={couponInput}
+          appliedCoupon={appliedCoupon}
+          onChange={setCouponInput}
+          onApply={() => setAppliedCoupon(couponInput.trim())}
+          onRemove={() => {
+            setAppliedCoupon(null);
+            setCouponInput("");
+          }}
+        />
+        {priceLoading ? <p className="text-sm text-[var(--color-muted)]">Checking price…</p> : null}
+        {priceError ? (
+          <p role="alert" className="text-sm text-[var(--color-danger)]">
+            {priceError}
+          </p>
+        ) : null}
+        {currentPricePreview ? (
+          <div
+            className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface-2)] p-3 text-sm"
+            aria-live="polite"
+          >
+            <p>
+              Regular price:{" "}
+              {formatMoney(currentPricePreview.basePrice, currentPricePreview.currency)}
+            </p>
+            <p>
+              Booking price:{" "}
+              {formatMoney(currentPricePreview.effectivePrice, currentPricePreview.currency)}
+            </p>
+            {currentPricePreview.amountToCollect !== currentPricePreview.effectivePrice ? (
+              <p>
+                Due now:{" "}
+                {formatMoney(currentPricePreview.amountToCollect, currentPricePreview.currency)}
+              </p>
+            ) : null}
+            {currentPricePreview.couponResult === "applied" ? (
+              <p>Coupon {currentPricePreview.couponCode} applied.</p>
+            ) : null}
+            {currentPricePreview.couponResult === "promotion_preferred" ? (
+              <p>
+                Automatic promotion gives an equal or better price; your coupon will not be used.
+              </p>
+            ) : null}
+            {!appliedCoupon && currentPricePreview.promotionLabel ? (
+              <p>Promotion applied: {currentPricePreview.promotionLabel}</p>
+            ) : null}
+          </div>
+        ) : null}
         {locations.length > 1 ? (
           <div>
             <Label htmlFor="b-location">{t(locale, "location")}</Label>
@@ -421,13 +580,19 @@ export function SlotPicker({
         <Button
           type="submit"
           className="w-full"
-          disabled={submitting || (captchaEnabled && !captchaToken)}
+          disabled={
+            submitting ||
+            priceLoading ||
+            !currentPricePreview ||
+            !!priceError ||
+            (captchaEnabled && !captchaToken)
+          }
         >
-          {submitting
-            ? t(locale, "confirming")
-            : priceLabel
-              ? t(locale, "payAndBook", { price: priceLabel })
-              : t(locale, "confirmBooking")}
+          {submitting ? (
+            t(locale, "confirming")
+          ) : (
+            <BookingSubmitLabel quote={currentPricePreview} locale={locale} />
+          )}
         </Button>
       </div>
     </form>
@@ -449,6 +614,7 @@ function AccessGate({
 }) {
   const [code, setCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const checkoutOperation = useRef<{ input: string; id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {

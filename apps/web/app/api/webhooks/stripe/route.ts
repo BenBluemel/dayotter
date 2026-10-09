@@ -1,8 +1,10 @@
 import { syncOrgSubscription, syncSubscriptionById } from "@/lib/billing/subscription";
-import { fulfillPackagePurchase } from "@/lib/packages/fulfill";
+import { fulfillPackagePurchase, receivePackageEvent } from "@/lib/packages/fulfill";
 import { syncConnectAccountStatus } from "@/lib/payments/connect";
 import { fulfillCheckout } from "@/lib/payments/fulfill";
-import { constructWebhookEvent, paymentsEnabled } from "@/lib/payments/stripe";
+import { processAppointmentEvent, receiveAppointmentEvent } from "@/lib/payments/payment-events";
+import { PaymentRoutingError } from "@/lib/payments/routing";
+import { constructWebhookEvent, stripeConfigured } from "@/lib/payments/stripe";
 import { logger } from "@dayotter/core";
 import { NextResponse } from "next/server";
 import type Stripe from "stripe";
@@ -12,7 +14,8 @@ export const dynamic = "force-dynamic";
 /** Stripe webhook - the reliable backstop that confirms a paid booking even if
  *  the booker closes the success tab. Signature-verified; idempotent. */
 export async function POST(request: Request) {
-  if (!paymentsEnabled) return NextResponse.json({ ok: true });
+  if (!stripeConfigured)
+    return NextResponse.json({ error: "Stripe webhook intake is unavailable" }, { status: 503 });
 
   const signature = request.headers.get("stripe-signature");
   if (!signature) return NextResponse.json({ error: "Missing signature" }, { status: 400 });
@@ -27,6 +30,20 @@ export async function POST(request: Request) {
   }
 
   try {
+    const receiptId = await receiveAppointmentEvent(event);
+    if (receiptId) {
+      const result = await processAppointmentEvent(receiptId);
+      return NextResponse.json(
+        { received: result !== "retry", state: result },
+        { status: result === "retry" ? 500 : 200 },
+      );
+    }
+    const packageResult = await receivePackageEvent(event);
+    if (packageResult)
+      return NextResponse.json(
+        { received: packageResult !== "retry", state: packageResult },
+        { status: packageResult === "retry" ? 500 : 200 },
+      );
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object as Stripe.Checkout.Session;
@@ -57,6 +74,8 @@ export async function POST(request: Request) {
         break;
     }
   } catch (err) {
+    if (err instanceof PaymentRoutingError && err.status === 400)
+      return NextResponse.json({ error: "Invalid payment relationship" }, { status: 400 });
     logger.error("stripe webhook handler failed", {
       event: "stripe_webhook_handler_failed",
       type: event.type,
