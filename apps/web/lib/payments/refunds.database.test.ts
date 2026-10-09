@@ -462,6 +462,55 @@ describe.skipIf(!testUrl)("durable refunds PostgreSQL integration", () => {
       expect(mock.create).not.toHaveBeenCalled();
     },
   );
+  it.each([
+    ["succeeded", "succeeded", null, "refunded"],
+    ["pending", "pending", null, "processing"],
+    ["requires_action", "requires_review", "stripe_refund_requires_action", "requires_review"],
+    ["failed", "requires_review", "stripe_refund_failed", "requires_review"],
+    ["canceled", "requires_review", "stripe_refund_canceled", "requires_review"],
+  ] as const)("persists the exact %s outcome", async (status, state, reviewCode, publicState) => {
+    const { operation, booking } = await owed();
+    const evidence = fixtureRefundEvidence(operation, status);
+    refunds.set(operation.id, evidence);
+    expect(await executeRefundOperation(operation.id, db)).toBe(publicState);
+    const saved = await load(operation.id);
+    expect(saved).toMatchObject({
+      state,
+      stripeStatus: status,
+      reviewCode,
+      stripeRefundId: evidence.refund.id,
+    });
+    expect(saved.succeededAt).toEqual(status === "succeeded" ? expect.any(Date) : null);
+    expect(
+      (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, booking.id) }))!
+        .paymentStatus,
+    ).toBe(status === "succeeded" ? "refunded" : "paid");
+    expect(mock.create).not.toHaveBeenCalled();
+  });
+  it.each(["unknown", null, undefined, 42])(
+    "unexpected runtime status %j retains the ID and enters contradiction review",
+    async (status) => {
+      const { operation, booking } = await owed();
+      const evidence = fixtureRefundEvidence(operation);
+      Object.assign(evidence.refund, { status });
+      refunds.set(operation.id, evidence);
+      expect(await executeRefundOperation(operation.id, db)).toBe("requires_review");
+      expect(await load(operation.id)).toMatchObject({
+        state: "requires_review",
+        reviewCode: "refund_facts_or_creation_contradiction",
+        stripeRefundId: evidence.refund.id,
+        stripeStatus: null,
+        succeededAt: null,
+      });
+      expect(
+        (await db.query.bookings.findFirst({ where: eq(schema.bookings.id, booking.id) }))!
+          .paymentStatus,
+      ).toBe("paid");
+      expect(await executeRefundOperation(operation.id, db)).toBe("requires_review");
+      expect(mock.create).not.toHaveBeenCalled();
+      expect(mock.read).toHaveBeenCalledTimes(1);
+    },
+  );
   it("creation ambiguity beyond the replay window fails closed without a replacement key", async () => {
     const { operation } = await owed();
     await db

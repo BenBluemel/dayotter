@@ -4,7 +4,7 @@ import {
   fixtureRefundEvidence,
   fixtureRefundOperation,
 } from "./refund-fixtures";
-import { refundRoute, verifyRefundEvidence } from "./refund-terms";
+import { refundOutcome, refundRoute, verifyRefundEvidence } from "./refund-terms";
 import { refundRoutingParameters } from "./routing";
 
 const oldKey = process.env.ENCRYPTION_KEY;
@@ -37,6 +37,26 @@ describe("immutable refund verification", () => {
       expect(verifyRefundEvidence(operation, fixtureRefundEvidence(operation, status))).toBe(
         status,
       );
+    },
+  );
+  it.each([
+    ["succeeded", "succeeded", null],
+    ["pending", "pending", null],
+    ["requires_action", "requires_review", "stripe_refund_requires_action"],
+    ["failed", "requires_review", "stripe_refund_failed"],
+    ["canceled", "requires_review", "stripe_refund_canceled"],
+  ] as const)("maps verified %s to its durable outcome", (status, state, reviewCode) => {
+    const operation = fixtureRefundOperation();
+    const verified = verifyRefundEvidence(operation, fixtureRefundEvidence(operation, status));
+    expect(refundOutcome(verified)).toEqual({ state, reviewCode });
+  });
+  it.each(["unknown", "", null, undefined, 42, {}, "SUCCEEDED"])(
+    "rejects unexpected runtime status %j at the evidence boundary",
+    (status) => {
+      const operation = fixtureRefundOperation();
+      const evidence = fixtureRefundEvidence(operation);
+      Object.assign(evidence.refund, { status });
+      expect(() => verifyRefundEvidence(operation, evidence)).toThrow("Refund status is unknown");
     },
   );
   it.each([

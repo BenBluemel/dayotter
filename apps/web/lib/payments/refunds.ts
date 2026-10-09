@@ -21,6 +21,7 @@ import { retryAt } from "./recovery-backoff";
 import {
   REFUND_REPLAY_WINDOW_MS,
   type RefundOperation,
+  refundOutcome,
   refundRoute,
   verifyRefundCharge,
   verifyRefundEvidence,
@@ -300,15 +301,13 @@ export async function executeRefundOperation(
       if (current.state === "requires_review") return;
       // An older pending read must not overwrite another worker's success.
       if (current.state === "succeeded") return;
-      const state =
-        status === "succeeded" ? "succeeded" : status === "pending" ? "pending" : "requires_review";
+      const outcome = refundOutcome(status);
       await tx
         .update(schema.refundOperations)
         .set({
-          state,
+          ...outcome,
           stripeStatus: status,
           succeededAt: status === "succeeded" ? new Date() : null,
-          reviewCode: state === "requires_review" ? `stripe_refund_${status}` : null,
           nextRecoveryAt: new Date(Date.now() + 60000),
         })
         .where(eq(schema.refundOperations.id, id));

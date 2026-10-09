@@ -69,6 +69,20 @@ export function verifyRefundCharge(operation: RefundOperation, charge: Stripe.Ch
   }
 }
 
+// Stripe's SDK exposes string | null, so narrow runtime values before deciding an outcome.
+function verifiedRefundStatus(status: Stripe.Refund["status"]) {
+  switch (status) {
+    case "succeeded":
+    case "pending":
+    case "requires_action":
+    case "failed":
+    case "canceled":
+      return status;
+    default:
+      throw new PaymentContradictionError("Refund status is unknown");
+  }
+}
+
 /** Metadata is only correlation: account-scoped charge and reversal relationships also have to match. */
 export function verifyRefundEvidence(operation: RefundOperation, evidence: RefundEvidence) {
   const { refund, charge } = evidence;
@@ -87,16 +101,13 @@ export function verifyRefundEvidence(operation: RefundOperation, evidence: Refun
   ) {
     throw new PaymentContradictionError("Refund contradicts its durable operation");
   }
-  if (
-    !["pending", "requires_action", "succeeded", "failed", "canceled"].includes(refund.status ?? "")
-  )
-    throw new PaymentContradictionError("Refund status is unknown");
+  const status = verifiedRefundStatus(refund.status);
   if (
     operation.paymentMode === "direct" &&
     (refund.transfer_reversal || refund.source_transfer_reversal)
   )
     throw new PaymentContradictionError("Direct refund contains an unexpected reversal");
-  if (refund.status !== "succeeded") return refund.status!;
+  if (status !== "succeeded") return status;
   if (charge.amount_refunded !== operation.amount)
     throw new PaymentContradictionError("Refunded charge amount requires reconciliation");
   if (operation.paymentMode === "connect") {
@@ -128,5 +139,25 @@ export function verifyRefundEvidence(operation: RefundOperation, evidence: Refun
       }
     }
   }
-  return "succeeded";
+  return status;
+}
+
+/** A verified provider observation is not a committed transition; the caller retains its locks/guards. */
+export function refundOutcome(status: ReturnType<typeof verifyRefundEvidence>) {
+  switch (status) {
+    case "succeeded":
+      return { state: "succeeded", reviewCode: null } as const;
+    case "pending":
+      return { state: "pending", reviewCode: null } as const;
+    case "requires_action":
+      return { state: "requires_review", reviewCode: "stripe_refund_requires_action" } as const;
+    case "failed":
+      return { state: "requires_review", reviewCode: "stripe_refund_failed" } as const;
+    case "canceled":
+      return { state: "requires_review", reviewCode: "stripe_refund_canceled" } as const;
+    default: {
+      const unexpected: never = status;
+      throw new PaymentContradictionError(`Refund status is unknown: ${unexpected}`);
+    }
+  }
 }
