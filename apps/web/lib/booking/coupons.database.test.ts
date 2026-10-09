@@ -403,6 +403,233 @@ describe.skipIf(!testUrl)("coupons PostgreSQL integrity and lifecycle", () => {
       .set({ isActive: false })
       .where(eq(schema.appointmentPromotions.id, promoId));
   });
+  it("prepares one committed discount revision when coupon and promotion edits race", async () => {
+    const coupon = await createCoupon("COHERENT", {
+      discountKind: "fixed",
+      discountValue: 1000,
+      currency: "usd",
+      globalLimit: 1,
+    });
+    const promotionId = randomUUID();
+    await db.insert(schema.appointmentPromotions).values({
+      id: promotionId,
+      organizationId: org,
+      label: "Coherent revision",
+      startsAt: new Date("2026-10-01Z"),
+      endsAt: new Date("2026-11-01Z"),
+      discountKind: "fixed",
+      discountValue: 2000,
+      currency: "usd",
+    });
+    await db.insert(schema.appointmentPromotionEventTypes).values({
+      promotionId,
+      organizationId: org,
+      eventTypeId: event,
+    });
+    const quoteRequest = {
+      organizationId: org,
+      eventTypeId: event,
+      appointmentStartsAt: new Date(start),
+      settlement: "cash" as const,
+      couponCode: coupon.code,
+      couponCustomerUserId: alice,
+    };
+    const revisionA = await quoteAppointmentPrice(quoteRequest, db);
+    expect(revisionA).toMatchObject({
+      version: 1,
+      effectivePrice: 3000,
+      promotion: { id: promotionId, discount: { amount: 2000 } },
+    });
+    expect(revisionA.coupon).toBeUndefined();
+
+    // Give the real preparation transaction a dedicated pooled connection. Pause
+    // delivery of its first coupon-bearing SELECT only after PostgreSQL has read
+    // revision A; commit revision B on another connection before resuming. No
+    // values/rows are mocked, and no sleeps determine the interleaving.
+    const client = await db.$client.connect();
+    const originalQuery = client.query;
+    let editCommitted = false;
+    let readCommitted = false;
+    const reader = vi.spyOn(client, "query");
+    reader.mockImplementation((async (...args: Parameters<typeof originalQuery>) => {
+      const query = args[0] as string | { text: string };
+      const text = typeof query === "string" ? query : query.text;
+      if (text === "begin isolation level read committed") readCommitted = true;
+      const result = await Reflect.apply(originalQuery, client, args);
+      if (!editCommitted && text?.startsWith("select") && text.includes('"appointment_coupons"')) {
+        await db.transaction(async (tx) => {
+          await tx
+            .update(schema.appointmentCoupons)
+            .set({ discountValue: 4000 })
+            .where(eq(schema.appointmentCoupons.id, coupon.id));
+          await tx
+            .update(schema.appointmentPromotions)
+            .set({ discountValue: 3000 })
+            .where(eq(schema.appointmentPromotions.id, promotionId));
+        });
+        editCommitted = true;
+      }
+      return result;
+    }) as typeof originalQuery);
+    const connection = vi.spyOn(db.$client, "connect");
+    connection.mockImplementationOnce((async () => client) as typeof db.$client.connect);
+    try {
+      const prepared = await prepareAppointmentAttempt(
+        input(coupon.code, alice),
+        "/",
+        randomUUID(),
+        db,
+      );
+      expect(editCommitted).toBe(true);
+      expect(readCommitted).toBe(true);
+      expect(prepared.attempt).toBeTruthy();
+      expect(
+        await db.query.appointmentCouponUses.findMany({
+          where: eq(schema.appointmentCouponUses.couponId, coupon.id),
+        }),
+      ).toEqual([]);
+      reader.mockRestore();
+      expect(await quoteAppointmentPrice(quoteRequest, db)).toMatchObject({
+        version: 2,
+        effectivePrice: 1000,
+        promotion: null,
+        coupon: { id: coupon.id, discount: { amount: 4000 } },
+      });
+      // A mixed read chooses B's 3000 promotion, which wins in neither revision:
+      // A's winner is its 2000 promotion; B's winner is its 4000 coupon.
+      expect(prepared.quote).toEqual(revisionA);
+      expect(decodeAttempt(prepared.attempt!).quote).toEqual(revisionA);
+    } finally {
+      reader.mockRestore();
+      connection.mockRestore();
+      await db
+        .update(schema.appointmentPromotions)
+        .set({ isActive: false })
+        .where(eq(schema.appointmentPromotions.id, promotionId));
+    }
+  });
+  it("quotes service, coupon identity and applicability from the same revision", async () => {
+    const coupon = await createCoupon("COHERENT_SCOPE", {
+      discountKind: "fixed",
+      discountValue: 1000,
+      currency: "usd",
+    });
+    const promotionId = randomUUID();
+    const replacementId = randomUUID();
+    await db.insert(schema.appointmentPromotions).values({
+      id: promotionId,
+      organizationId: org,
+      label: "Coherent scope",
+      startsAt: new Date("2026-10-01Z"),
+      endsAt: new Date("2026-11-01Z"),
+      discountKind: "fixed",
+      discountValue: 2000,
+      currency: "usd",
+    });
+    await db.insert(schema.appointmentPromotionEventTypes).values({
+      promotionId,
+      organizationId: org,
+      eventTypeId: event,
+    });
+    const request = {
+      organizationId: org,
+      eventTypeId: event,
+      appointmentStartsAt: new Date(start),
+      settlement: "cash" as const,
+      couponCode: coupon.code,
+      couponCustomerUserId: alice,
+    };
+    const revisionA = await quoteAppointmentPrice(request, db);
+    expect(revisionA).toMatchObject({ basePrice: 5000, effectivePrice: 3000 });
+    const originalQuery = db.$client.query;
+    const reader = vi.spyOn(db.$client, "query");
+    let editCommitted = false;
+    // Pause the first real read. Replace the code's definition/applicability and
+    // change service/promotion terms atomically before any subsequent read.
+    reader.mockImplementationOnce((async (...args: Parameters<typeof originalQuery>) => {
+      const result = await Reflect.apply(originalQuery, db.$client, args);
+      await db.transaction(async (tx) => {
+        await tx
+          .update(schema.eventTypes)
+          .set({ price: 8000 })
+          .where(eq(schema.eventTypes.id, event));
+        await tx
+          .update(schema.appointmentPromotions)
+          .set({ discountValue: 3000 })
+          .where(eq(schema.appointmentPromotions.id, promotionId));
+        await tx
+          .update(schema.appointmentCoupons)
+          .set({ code: "COHERENT_SCOPE_OLD" })
+          .where(eq(schema.appointmentCoupons.id, coupon.id));
+        await tx
+          .delete(schema.appointmentCouponEventTypes)
+          .where(eq(schema.appointmentCouponEventTypes.couponId, coupon.id));
+        await tx.insert(schema.appointmentCoupons).values({
+          id: replacementId,
+          organizationId: org,
+          code: coupon.code,
+          startsAt: coupon.startsAt,
+          endsAt: coupon.endsAt,
+          validityTimezone: coupon.validityTimezone,
+          discountKind: "fixed",
+          discountValue: 4000,
+          currency: "usd",
+        });
+        await tx.insert(schema.appointmentCouponEventTypes).values({
+          couponId: replacementId,
+          eventTypeId: event,
+          organizationId: org,
+        });
+      });
+      editCommitted = true;
+      return result;
+    }) as typeof originalQuery);
+    try {
+      expect(await quoteAppointmentPrice(request, db)).toEqual(revisionA);
+      expect(editCommitted).toBe(true);
+      reader.mockRestore();
+      expect(await quoteAppointmentPrice(request, db)).toMatchObject({
+        version: 2,
+        basePrice: 8000,
+        effectivePrice: 4000,
+        amountToCollect: 4000,
+        promotion: null,
+        coupon: { id: replacementId, discount: { amount: 4000 } },
+      });
+    } finally {
+      reader.mockRestore();
+      await db.transaction(async (tx) => {
+        await tx
+          .update(schema.eventTypes)
+          .set({ price: 5000 })
+          .where(eq(schema.eventTypes.id, event));
+        await tx
+          .update(schema.appointmentPromotions)
+          .set({ isActive: false })
+          .where(eq(schema.appointmentPromotions.id, promotionId));
+      });
+    }
+  });
+  it("retains unknown-coupon and missing-service error precedence", async () => {
+    const coupon = await createCoupon("KNOWN_COUPON");
+    const request = {
+      organizationId: org,
+      eventTypeId: randomUUID(),
+      appointmentStartsAt: new Date(start),
+      settlement: "cash" as const,
+      couponCustomerUserId: alice,
+    };
+    await expect(
+      quoteAppointmentPrice({ ...request, couponCode: "UNKNOWN_COUPON" }, db),
+    ).rejects.toMatchObject({ message: "Coupon code not recognized", status: 400 });
+    await expect(
+      quoteAppointmentPrice({ ...request, couponCode: coupon.code }, db),
+    ).rejects.toMatchObject({ message: "Event type not found", status: 404 });
+    await expect(quoteAppointmentPrice(request, db)).rejects.toMatchObject({
+      message: "Event type not found",
+      status: 404,
+    });
+  });
   it("enforces per-customer and combined limits without a mutable counter", async () => {
     const c = await createCoupon("PERSON50", { globalLimit: 2, perCustomerLimit: 1 });
     const result = await Promise.allSettled([

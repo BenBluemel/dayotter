@@ -36,20 +36,29 @@ export async function quoteAppointmentPrice(
   if (input.couponCode && (!input.couponCustomerUserId || input.settlement !== "cash"))
     throw new BookingError("Sign in to use a coupon", 401);
   const normalizedCode = input.couponCode ? normalizeCouponCode(input.couponCode) : null;
-  const coupon = normalizedCode
-    ? await db.query.appointmentCoupons.findFirst({
-        where: and(
-          eq(schema.appointmentCoupons.organizationId, input.organizationId),
-          eq(schema.appointmentCoupons.code, normalizedCode),
-        ),
-      })
-    : null;
-  if (normalizedCode && !coupon) throw new BookingError("Coupon code not recognized", 400);
-  // One statement sees one PostgreSQL snapshot, even at READ COMMITTED. Separate
-  // reads could combine an old service price with newly committed promotion rules.
-  const rows = await db
-    .select({ eventType: schema.eventTypes, promotion: schema.appointmentPromotions })
-    .from(schema.eventTypes)
+  // All candidates and applicability share one statement snapshot, including a
+  // losing coupon (which never reaches reservation's locked terms check). Capacity
+  // is still checked separately under the coupon row lock at READ COMMITTED.
+  const candidates = db
+    .select({
+      eventType: schema.eventTypes,
+      promotion: schema.appointmentPromotions,
+      coupon: normalizedCode ? schema.appointmentCoupons : sql<null>`null`,
+      couponEventTypeId: normalizedCode
+        ? schema.appointmentCouponEventTypes.eventTypeId
+        : sql<null>`null`,
+    })
+    // Retain a result even without an active service so unknown coupon and missing
+    // service errors keep their existing precedence, without a separate read.
+    .from(sql`(select 1) as pricing_request`)
+    .leftJoin(
+      schema.eventTypes,
+      and(
+        eq(schema.eventTypes.id, input.eventTypeId),
+        eq(schema.eventTypes.organizationId, input.organizationId),
+        eq(schema.eventTypes.isActive, true),
+      ),
+    )
     .leftJoin(
       schema.appointmentPromotionEventTypes,
       and(
@@ -70,14 +79,28 @@ export async function quoteAppointmentPrice(
         lte(schema.appointmentPromotions.startsAt, input.appointmentStartsAt),
         gt(schema.appointmentPromotions.endsAt, input.appointmentStartsAt),
       ),
-    )
-    .where(
-      and(
-        eq(schema.eventTypes.id, input.eventTypeId),
-        eq(schema.eventTypes.organizationId, input.organizationId),
-        eq(schema.eventTypes.isActive, true),
-      ),
     );
+  // Keep no-code quotes independent of coupon tables; only submitted codes add joins.
+  const rows = normalizedCode
+    ? await candidates
+        .leftJoin(
+          schema.appointmentCoupons,
+          and(
+            eq(schema.appointmentCoupons.organizationId, input.organizationId),
+            eq(schema.appointmentCoupons.code, normalizedCode),
+          ),
+        )
+        .leftJoin(
+          schema.appointmentCouponEventTypes,
+          and(
+            eq(schema.appointmentCouponEventTypes.couponId, schema.appointmentCoupons.id),
+            eq(schema.appointmentCouponEventTypes.eventTypeId, schema.eventTypes.id),
+            eq(schema.appointmentCouponEventTypes.organizationId, input.organizationId),
+          ),
+        )
+    : await candidates;
+  const coupon = rows[0]?.coupon;
+  if (normalizedCode && !coupon) throw new BookingError("Coupon code not recognized", 400);
   const eventType = rows[0]?.eventType;
   if (!eventType) throw new BookingError("Event type not found", 404);
   const rules = rows.flatMap(({ promotion }) => (promotion ? [promotion] : []));
@@ -87,14 +110,8 @@ export async function quoteAppointmentPrice(
     if (!coupon.isActive) throw new BookingError("This coupon is inactive", 400);
     if (input.appointmentStartsAt < coupon.startsAt || input.appointmentStartsAt >= coupon.endsAt)
       throw new BookingError("This appointment is outside the coupon dates", 400);
-    const link = await db.query.appointmentCouponEventTypes.findFirst({
-      where: and(
-        eq(schema.appointmentCouponEventTypes.couponId, coupon.id),
-        eq(schema.appointmentCouponEventTypes.eventTypeId, eventType.id),
-        eq(schema.appointmentCouponEventTypes.organizationId, input.organizationId),
-      ),
-    });
-    if (!link) throw new BookingError("This coupon does not apply to this service", 400);
+    if (!rows[0]?.couponEventTypeId)
+      throw new BookingError("This coupon does not apply to this service", 400);
     if ((eventType.price ?? 0) < (coupon.minimumBasePrice ?? 0))
       throw new BookingError("The regular service price is below this coupon's minimum", 400);
     if (coupon.discountKind === "fixed" && coupon.currency !== (eventType.currency ?? "usd"))
